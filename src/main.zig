@@ -633,7 +633,7 @@ fn mainImpl() !void {
         // Output: a single line of JSON to stdout, e.g.
         //   {"op":"word","query":"useState","iters":100,"hits":50,"p50_ns":1234,"p99_ns":5678}
         if (args.len < cmd_args_start + 2) {
-            out.p("usage: codedb [root] bench-engine <word|word-fmt|search|search-fmt> <query> [iters]\n", .{});
+            out.p("usage: codedb [root] bench-engine <word|word-fmt|search|search-fmt|search-paths> <query> [iters]\n", .{});
             std.process.exit(1);
         }
         const op = args[cmd_args_start];
@@ -707,8 +707,29 @@ fn mainImpl() !void {
                 for (r) |item| {
                     w.print("  {s}:{d}: {s}\n", .{ item.path, item.line_num, item.line_text }) catch {};
                 }
+            } else if (std.mem.eql(u8, op, "search-paths")) {
+                // Matched-shape benchmark op: produce a deduped path set
+                // for the query — same shape FTS5 `SELECT path` returns,
+                // letting us compare engines on identical work.
+                const r = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
+                hits_seen = r.len;
+                defer {
+                    for (r) |item| { allocator.free(item.path); allocator.free(item.line_text); }
+                    allocator.free(r);
+                }
+                var seen = std.StringHashMap(void).init(allocator);
+                defer seen.deinit();
+                var scratch: std.ArrayList(u8) = .empty;
+                defer scratch.deinit(allocator);
+                scratch.ensureTotalCapacity(allocator, 256 + r.len * 80) catch {};
+                const w = cio.listWriter(&scratch, allocator);
+                for (r) |item| {
+                    const gop = seen.getOrPut(item.path) catch continue;
+                    if (gop.found_existing) continue;
+                    w.print("{s}\n", .{item.path}) catch {};
+                }
             } else {
-                out.p("error: unknown op '{s}' — use one of word|word-fmt|search|search-fmt\n", .{op});
+                out.p("error: unknown op '{s}' — use one of word|word-fmt|search|search-fmt|search-paths\n", .{op});
                 std.process.exit(1);
             }
 
