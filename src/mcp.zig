@@ -1755,19 +1755,41 @@ fn handleContext(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
         }
     }
 
-    // Rank files by total hits, take top N.
-    const FileRank = struct { path: []const u8, hits: u32, top: []const PerFileHit };
+    // Rank files by a composite score: raw hits, +bonus when the file
+    // contains a symbol definition for any keyword (definition beats usage),
+    // −penalty for test/spec/doc files (agents kept picking test files over
+    // the real source on T3/F1/F3/G2). Final secondary sort by hits.
+    var symbol_files = std.StringHashMap(void).init(A);
+    for (sym_refs.items) |sr| symbol_files.put(sr.path, {}) catch {};
+
+    const FileRank = struct { path: []const u8, hits: u32, score: i32, top: []const PerFileHit };
     var ranked: std.ArrayList(FileRank) = .empty;
     var iter = by_file.iterator();
     while (iter.next()) |entry| {
+        const path = entry.key_ptr.*;
+        var score: i32 = @intCast(entry.value_ptr.total);
+        if (symbol_files.contains(path)) score += 5; // definition beats pure usage
+        const is_test = std.mem.indexOf(u8, path, "/test") != null or
+            std.mem.indexOf(u8, path, "_test.") != null or
+            std.mem.indexOf(u8, path, ".test.") != null or
+            std.mem.indexOf(u8, path, "/__tests__/") != null or
+            std.mem.indexOf(u8, path, "/spec/") != null or
+            std.mem.indexOf(u8, path, "/fixtures/") != null;
+        const is_doc = std.mem.endsWith(u8, path, ".md") or
+            std.mem.endsWith(u8, path, ".rst") or
+            std.mem.indexOf(u8, path, "/docs/") != null;
+        if (is_test) score -= 3;
+        if (is_doc) score -= 2;
         ranked.append(A, .{
-            .path = entry.key_ptr.*,
+            .path = path,
             .hits = entry.value_ptr.total,
+            .score = score,
             .top = entry.value_ptr.top.items,
         }) catch break;
     }
     std.mem.sort(FileRank, ranked.items, {}, struct {
         fn lt(_: void, a: FileRank, b: FileRank) bool {
+            if (a.score != b.score) return a.score > b.score;
             return a.hits > b.hits;
         }
     }.lt);
@@ -1793,11 +1815,50 @@ fn handleContext(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
     for (ranked.items[0..top_n]) |f| {
         w.print("- {s}  ({d} matches)\n", .{ f.path, f.hits }) catch {};
     }
-    w.print("\n## Top sites\n", .{}) catch {};
+    w.print("\n## Top sites (with ±2 lines of context)\n", .{}) catch {};
     explorer.mu.lockShared();
     defer explorer.mu.unlockShared();
     for (ranked.items[0..top_n]) |f| {
+        // Fetch full file content once per file, then slice ±2 lines around
+        // each hit. Indexed cache hits common files in ~µs; arena owns the
+        // dupe so we don't leak.
+        const file_content: ?[]const u8 = blk: {
+            const got = explorer.getContent(f.path, A) catch break :blk null;
+            break :blk got;
+        };
         for (f.top) |h| {
+            if (file_content) |content| {
+                // Find the start/end byte offsets of [line-2 .. line+2].
+                const want_start: u32 = if (h.line > 2) h.line - 2 else 1;
+                const want_end: u32 = h.line + 2;
+                var cur_line: u32 = 1;
+                var i: usize = 0;
+                var captured_start: ?usize = null;
+                var captured_end: ?usize = null;
+                if (cur_line == want_start) captured_start = 0;
+                while (i < content.len) : (i += 1) {
+                    if (content[i] == '\n') {
+                        cur_line += 1;
+                        if (cur_line == want_start and captured_start == null) {
+                            captured_start = i + 1;
+                        }
+                        if (cur_line > want_end) {
+                            captured_end = i;
+                            break;
+                        }
+                    }
+                }
+                if (captured_end == null) captured_end = content.len;
+                if (captured_start) |start_off| {
+                    const end_off = captured_end.?;
+                    const slice = content[start_off..end_off];
+                    // Cap per-snippet length to keep output bounded.
+                    const cap = @min(slice.len, 480);
+                    w.print("\n{s}:{d}\n```\n{s}\n```\n", .{ f.path, h.line, slice[0..cap] }) catch {};
+                    continue;
+                }
+            }
+            // Fallback: single-line hit when we couldn't expand.
             w.print("{s}:{d}  {s}\n", .{ f.path, h.line, h.text }) catch {};
         }
     }
