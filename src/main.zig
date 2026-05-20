@@ -496,13 +496,22 @@ fn mainImpl() !void {
         }
     } else if (std.mem.eql(u8, cmd, "search")) {
         var use_regex = false;
+        var paths_only = false;
         var query_arg_start = cmd_args_start;
-        if (args.len > cmd_args_start and std.mem.eql(u8, args[cmd_args_start], "--regex")) {
-            use_regex = true;
-            query_arg_start = cmd_args_start + 1;
+        while (args.len > query_arg_start) {
+            const a = args[query_arg_start];
+            if (std.mem.eql(u8, a, "--regex")) {
+                use_regex = true;
+                query_arg_start += 1;
+            } else if (std.mem.eql(u8, a, "--paths-only")) {
+                paths_only = true;
+                query_arg_start += 1;
+            } else {
+                break;
+            }
         }
         const query = if (args.len > query_arg_start) args[query_arg_start] else {
-            out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] search [--regex] {s}<query>{s}\n", .{
+            out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] search [--regex] [--paths-only] {s}<query>{s}\n", .{
                 s.red, s.reset, s.cyan, s.reset,
             });
             std.process.exit(1);
@@ -541,11 +550,18 @@ fn mainImpl() !void {
                 });
             }
             for (results) |r| {
-                out.p("  {s}{s}{s}:{s}{d}{s}  {s}\n", .{
-                    s.cyan,      r.path,     s.reset,
-                    s.dim,       r.line_num, s.reset,
-                    r.line_text,
-                });
+                if (paths_only) {
+                    out.p("  {s}{s}{s}:{s}{d}{s}\n", .{
+                        s.cyan, r.path, s.reset,
+                        s.dim,  r.line_num, s.reset,
+                    });
+                } else {
+                    out.p("  {s}{s}{s}:{s}{d}{s}  {s}\n", .{
+                        s.cyan,      r.path,     s.reset,
+                        s.dim,       r.line_num, s.reset,
+                        r.line_text,
+                    });
+                }
             }
         }
     } else if (std.mem.eql(u8, cmd, "word")) {
