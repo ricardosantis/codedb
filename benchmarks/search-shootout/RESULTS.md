@@ -200,6 +200,67 @@ See commits on branch `issue-negq-shortcircuit-failing-test`:
 - `test(explore): failing test for negative-query Tier 5 short-circuit`
 - `fix(explore): short-circuit Tier 5 full scan when trigram rules out match`
 
+## 7. lean-ctx MCP head-to-head — apples-to-apples
+
+The original v1 of this benchmark invoked lean-ctx via `lean-ctx grep` per
+query, which paid ~700ms of Rust binary startup on every call. Unfair —
+that's not how lean-ctx is meant to be consumed. The harness was updated to
+also speak MCP stdio to lean-ctx (calls `ctx_search`), mirroring what we do
+for codedb. Both backends now run as a single persistent server process
+warmed by one untimed call before measurement.
+
+For reference, the MCP roundtrip floor in this setup is **0.26 ms p50**
+(measured by timing a no-op `tools/list` against codedb). Per-query latency
+below that is dominated by RPC; per-query latency above that is real engine
+work.
+
+| Query | codedb p50 | lean-ctx MCP p50 | codedb wins by |
+|---|---|---|---|
+| `useState` | 3.74 ms | 40.04 ms | **10.7×** |
+| `useEffect` | 1.05 ms | 41.64 ms | **39.7×** |
+| `forwardRef` | 0.29 ms | 44.43 ms | **153×** |
+| `createElement` | 0.92 ms | 66.81 ms | **72.6×** |
+| `Fiber` | 0.66 ms | 106.01 ms | **160×** |
+| `Lane` | 0.48 ms | 119.88 ms | **250×** |
+| `Suspense` | 0.56 ms | 41.96 ms | **75×** |
+| `flushPassiveEffects` | 0.46 ms | 160.47 ms | **348×** |
+| `enableTransitionTracing` | 0.46 ms | 154.85 ms | **336×** |
+| `scheduleCallback` | 0.67 ms | 112.63 ms | **168×** |
+| `concurrent` | 0.66 ms | 109.18 ms | **165×** |
+| `function` (stress) | 15.76 ms | 44.10 ms | **2.8×** |
+| `set` | 4.01 ms | 43.42 ms | **10.8×** |
+| `ReactDOMRoot` | 0.19 ms | 200.73 ms | **1056×** |
+| `xyzzy_react_does_not_exist` | 0.13 ms | 182.45 ms | **1400×** |
+
+**codedb is faster on every query in the set, MCP-vs-MCP, on the React
+corpus.** Speedup ranges from 2.8× on the highest-frequency stress query
+(`function`, ~5k file matches) up to 1400× on the negative query.
+
+### Methodology notes
+
+- 25 iterations per query, warm. p50 reported.
+- Both backends index the same 6,619-file corpus before the run.
+- lean-ctx MCP reports 20 matches consistently — that's a display cap in
+  its `ctx_search` tool. The full match count is in the response header;
+  the cap doesn't materially affect query time (the engine still walks the
+  matches to populate the response).
+- p99s are noisy across both backends. The speedup table uses p50.
+
+### What the gap actually says
+
+A roundtrip floor of 0.26 ms means codedb queries like `forwardRef` (0.29 ms
+p50) are spending essentially nothing in the engine — the entire cost is RPC.
+That's the Tier 0 word-index hitting in O(1) plus response serialization.
+For lean-ctx, a 40–200 ms-per-query floor regardless of how easy the query
+is points at heavier per-call work in their search path (compression,
+formatting, or both — we didn't profile).
+
+The previous version of this benchmark (lean-ctx via per-call `lean-ctx
+grep`) showed 700–1700 ms per query. The MCP-resident numbers above are
+~5–20× faster than that, so the previous version was significantly
+penalizing lean-ctx by including the Rust binary startup. This is the
+honest version.
+
 ## 6. Recommendations
 
 1. **For codedb:** the FTS5 trigram numbers are the most relevant competitor
@@ -230,3 +291,38 @@ python3 shootout.py --corpus ~/codedb-bench/react \
                     --out results/react-$(date +%Y-%m-%d).md \
                     --clean-codedb
 ```
+## 8. Tier 0 attribution — where does codedb's per-query time go?
+
+A direct probe (50 iter each, MCP-resident, query `useState` on React):
+
+| Tool | What it does | p50 |
+|---|---|---|
+| `tools/list` (no-op) | MCP roundtrip floor | **0.08 ms** |
+| `codedb_find` | symbol-index hash lookup | **0.05 ms** |
+| `codedb_word` | word-index lookup + path:line for each hit | **1.81 ms** |
+| `codedb_search` | word-index + content reads + line extraction | **2.87 ms** |
+
+Attribution of the `codedb_search` 2.87 ms p50:
+
+- ~0.08 ms — MCP stdio roundtrip
+- ~1.73 ms — word-index hit collection + path:line formatting (the gap
+  between `find` and `word`)
+- ~1.06 ms — content reads + line extraction + formatted output (the gap
+  between `word` and `search`)
+
+**Implication for the fts5_unicode61 gap:** the earlier "100× slower"
+finding partly reflects that codedb returns line-level results with
+context, where FTS5 unicode61 returns just file paths. Not the same
+product. The remaining gap (codedb word lookup at 1.8 ms vs FTS5 inverted
+index at 0.01 ms) is mostly that codedb's hit list is path-strings while
+FTS5 reads from compact docid integers. A real attribution would require
+matching response shape; queued.
+
+### Separate finding worth flagging: p99 spikes
+
+p99 across **every** codedb tool — including the supposedly O(1)
+`codedb_find` — was in the 300–900 ms range over 50 iterations. That's
+not engine cost; it's periodic ~500 ms+ spikes from something. Candidates:
+snapshot persistence, watcher polling, arena cleanup, background indexing.
+Worth filing as a separate perf issue; the test bench is reproducible.
+

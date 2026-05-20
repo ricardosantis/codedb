@@ -176,6 +176,103 @@ class CodedbMCP:
             self.proc.kill()
 
 
+class LeanCtxMCP:
+    """MCP stdio client for lean-ctx — mirrors CodedbMCP. Lets us compare
+    lean-ctx's actual search work without the per-call binary startup cost
+    of `lean-ctx grep` invoked from a shell."""
+    def __init__(self, bin_path, root):
+        # lean-ctx (no args) starts MCP stdio. cwd=root so it picks the project.
+        self.proc = subprocess.Popen(
+            [bin_path],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, bufsize=0, cwd=root,
+        )
+        self.id = 0
+        self.buf = b""
+        self._init()
+
+    def _send(self, obj):
+        line = json.dumps(obj) + NL
+        self.proc.stdin.write(line.encode())
+        self.proc.stdin.flush()
+
+    def _recv(self, timeout=60):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if select.select([self.proc.stdout], [], [], 0.1)[0]:
+                chunk = os.read(self.proc.stdout.fileno(), 1 << 16)
+                if chunk:
+                    self.buf += chunk
+            text = self.buf.decode(errors="replace")
+            while NL in text:
+                line, rest = text.split(NL, 1)
+                line = line.strip()
+                if not line:
+                    text = rest
+                    self.buf = rest.encode()
+                    continue
+                try:
+                    obj = json.loads(line)
+                    self.buf = rest.encode()
+                    return obj
+                except json.JSONDecodeError:
+                    text = rest
+                    self.buf = rest.encode()
+                    continue
+        return None
+
+    def _init(self):
+        self._send({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "shootout", "version": "1.0"}}
+        })
+        self._recv()
+        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        time.sleep(0.5)
+
+    def call(self, tool, args):
+        self.id += 1
+        self._send({
+            "jsonrpc": "2.0", "id": self.id, "method": "tools/call",
+            "params": {"name": tool, "arguments": args}
+        })
+        return self._recv()
+
+    def close(self):
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+        except Exception:
+            self.proc.kill()
+
+
+def leanctx_count_results(resp):
+    if not resp or "result" not in resp:
+        return 0
+    text = ""
+    for item in resp["result"].get("content", []):
+        if item.get("type") == "text":
+            text += item["text"]
+    m = re.search(r"(\d+)\s+matches\s+in\s+(\d+)\s+files", text)
+    if m:
+        return int(m.group(1))
+    if "no matches" in text.lower() or text.strip() == "":
+        return 0
+    return sum(1 for ln in text.splitlines() if ":" in ln)
+
+
+def query_leanctx_mcp(client, q, iters):
+    resp = client.call("ctx_search", {"pattern": q})
+    count = leanctx_count_results(resp)
+    times = []
+    for _ in range(iters):
+        s = time.perf_counter()
+        client.call("ctx_search", {"pattern": q})
+        times.append((time.perf_counter() - s) * 1000.0)
+    return times, count
+
+
 def codedb_count_results(resp):
     if not resp or "result" not in resp:
         return 0
@@ -363,6 +460,9 @@ def main():
     ap.add_argument("--leanctx-bin", default=DEFAULT_LEANCTX or "")
     ap.add_argument("--skip-codedb", action="store_true")
     ap.add_argument("--skip-leanctx", action="store_true")
+    ap.add_argument("--leanctx-cli", action="store_true",
+                    help="Use `lean-ctx grep` CLI (per-call spawn) instead of MCP stdio. "
+                         "CLI is what scripts feel; MCP is what an agent feels.")
     ap.add_argument("--skip-fts5", action="store_true")
     ap.add_argument("--clean-codedb", action="store_true")
     args = ap.parse_args()
@@ -417,14 +517,30 @@ def main():
         builds.append(("codedb", t, sz))
         backends.append("codedb")
         codedb_client = CodedbMCP(args.codedb_bin, str(corpus))
+        # MCP roundtrip baseline: time a no-op tools/list call to measure
+        # the floor cost of MCP stdio so we can attribute per-query latency.
+        rt_times = []
+        for _ in range(args.iters):
+            s = time.perf_counter()
+            codedb_client.id += 1
+            codedb_client._send({"jsonrpc":"2.0","id":codedb_client.id,
+                                 "method":"tools/list","params":{}})
+            codedb_client._recv()
+            rt_times.append((time.perf_counter() - s) * 1000.0)
+        print("        mcp roundtrip baseline: p50={:.2f}ms p99={:.2f}ms".format(
+            pct(rt_times, 0.5), pct(rt_times, 0.99)))
 
+    leanctx_client = None
     if not args.skip_leanctx and args.leanctx_bin:
         print("[build] lean-ctx ...", flush=True)
         try:
             t, sz, rc = leanctx_cold_index(args.leanctx_bin, str(corpus))
-            print("        {:.2f}s, ~{:.1f} MB".format(t, sz / 1e6))
+            mode = "cli" if args.leanctx_cli else "mcp"
+            print("        {:.2f}s, ~{:.1f} MB (query mode: {})".format(t, sz / 1e6, mode))
             builds.append(("lean-ctx", t, sz))
             backends.append("leanctx")
+            if not args.leanctx_cli:
+                leanctx_client = LeanCtxMCP(args.leanctx_bin, str(corpus))
         except subprocess.TimeoutExpired:
             print("        TIMED OUT")
             builds.append(("lean-ctx", None, None))
@@ -448,7 +564,10 @@ def main():
             elif b == "codedb":
                 times, count = query_codedb(codedb_client, q, args.iters)
             elif b == "leanctx":
-                times, count = query_leanctx(args.leanctx_bin, q, str(corpus), args.iters)
+                if leanctx_client is not None:
+                    times, count = query_leanctx_mcp(leanctx_client, q, args.iters)
+                else:
+                    times, count = query_leanctx(args.leanctx_bin, q, str(corpus), args.iters)
             else:
                 continue
             per_backend[b] = {
@@ -465,6 +584,8 @@ def main():
 
     if codedb_client:
         codedb_client.close()
+    if leanctx_client:
+        leanctx_client.close()
 
     if args.out:
         ctx = {
