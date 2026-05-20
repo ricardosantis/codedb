@@ -25,5 +25,17 @@
     "name": "lean-ctx (CLI)",
     "constraint_prompt": "Use ONLY via Bash (cd into corpus first):\n- cd /Users/blackfloofie/codedb-bench/react && lean-ctx grep <pattern>\n- cd /Users/blackfloofie/codedb-bench/react && lean-ctx find <pattern>\n- cd /Users/blackfloofie/codedb-bench/react && lean-ctx read <relpath>\n- cd /Users/blackfloofie/codedb-bench/react && lean-ctx read <relpath> -m signatures\n- cd /Users/blackfloofie/codedb-bench/react && lean-ctx ls <relpath>\nForbidden: Read, grep, rg, find, cat, ls, head, tail, sed, codedb, sqlite3, any mcp__*.",
     "env": {}
+  },
+  {
+    "id": "codedb_CONTEXT",
+    "name": "codedb_context (composer + read + symbol fallback)",
+    "constraint_prompt": "Use ONLY these MCP tools:\n- mcp__codedb__codedb_context  (PRIMARY \u2014 task-shaped composer)\n- mcp__codedb__codedb_read     (verbatim quoting fallback)\n- mcp__codedb__codedb_symbol   (definition lookup for verbatim source)\nSnippet fields must be literal copies of source \u2014 no paraphrasing.",
+    "env": {}
+  },
+  {
+    "id": "codegraph",
+    "name": "codegraph (MCP, knowledge-graph index)",
+    "constraint_prompt": "Use ONLY these MCP tools:\n- mcp__codegraph__codegraph_search\n- mcp__codegraph__codegraph_context  (PRIMARY composer)\n- mcp__codegraph__codegraph_callers / callees / impact / node / explore / files / status\nThe codegraph MCP auto-detects the project from cwd (looks for .codegraph/).",
+    "env": {}
   }
 ]
