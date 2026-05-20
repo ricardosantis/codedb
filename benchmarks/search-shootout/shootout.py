@@ -21,7 +21,7 @@ Backend notes:
                     still pays binary startup
 """
 
-import argparse, json, os, re, select, shutil, sqlite3, subprocess, sys, time
+import argparse, json, os, re, select, shlex, shutil, sqlite3, subprocess, sys, time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -406,6 +406,41 @@ def pct(xs, p):
     return xs[f] + (xs[c] - xs[f]) * (k - f)
 
 
+def stats(xs):
+    """Return min/p50/p95/p99 for a list of samples. All in same unit (ms)."""
+    if not xs:
+        return {"min": 0.0, "p50": 0.0, "p95": 0.0, "p99": 0.0, "n": 0}
+    return {
+        "min": min(xs),
+        "p50": pct(xs, 0.50),
+        "p95": pct(xs, 0.95),
+        "p99": pct(xs, 0.99),
+        "n": len(xs),
+    }
+
+
+def median(xs):
+    if not xs:
+        return 0.0
+    xs = sorted(xs)
+    n = len(xs)
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2.0
+
+
+def merge_session_stats(per_session_stats):
+    """Given a list of per-session stats dicts (min/p50/p95/p99), return
+    median-of-medians for each percentile. Reduces single-session noise."""
+    if not per_session_stats:
+        return {"min": 0.0, "p50": 0.0, "p95": 0.0, "p99": 0.0, "sessions": 0}
+    return {
+        "min": median([s["min"] for s in per_session_stats]),
+        "p50": median([s["p50"] for s in per_session_stats]),
+        "p95": median([s["p95"] for s in per_session_stats]),
+        "p99": median([s["p99"] for s in per_session_stats]),
+        "sessions": len(per_session_stats),
+    }
+
+
 def write_report(out, ctx):
     lines = []
     lines.append("# search-shootout — " + ctx["corpus_name"])
@@ -414,7 +449,7 @@ def write_report(out, ctx):
     lines.append("**Corpus:** `" + ctx["corpus"] + "`")
     lines.append("**Indexed files:** " + "{:,}".format(ctx["file_count"]))
     lines.append("**Corpus bytes:** {:.1f} MB".format(ctx["corpus_bytes"] / 1e6))
-    lines.append("**Iterations:** {} warm".format(ctx["iters"]))
+    lines.append("**Iterations:** {} warm × {} sessions (median-of-medians)".format(ctx["iters"], ctx.get("sessions", 1)))
     lines.append("")
     lines.append("## Build phase")
     lines.append("")
@@ -435,19 +470,244 @@ def write_report(out, ctx):
     cols = ctx["backends"]
     header_parts = ["query", "kind"]
     for b in cols:
-        header_parts.extend([b + " p50", b + " p99", b + " hits"])
+        header_parts.extend([f"{b} min", f"{b} p50", f"{b} p95", f"{b} p99", f"{b} hits"])
     lines.append("| " + " | ".join(header_parts) + " |")
-    lines.append("|" + "---|" * (2 + 3 * len(cols)))
+    lines.append("|" + "---|" * (2 + 5 * len(cols)))
     for row in ctx["rows"]:
         cells = ["`" + row["q"] + "`", row["kind"]]
         for b in cols:
             d = row["per_backend"].get(b, {})
-            cells.append("{:.2f}".format(d["p50"]) if d.get("p50") is not None else "—")
-            cells.append("{:.2f}".format(d["p99"]) if d.get("p99") is not None else "—")
+            for k in ("min", "p50", "p95", "p99"):
+                cells.append("{:.2f}".format(d[k]) if d.get(k) is not None else "—")
             cells.append(str(d["hits"]) if d.get("hits") is not None else "—")
         lines.append("| " + " | ".join(cells) + " |")
     lines.append("")
+
+    # Files-list normalized comparison
+    if ctx.get("files_list"):
+        fl = ctx["files_list"]
+        lines.append("## Normalized files-list comparison")
+        lines.append("")
+        lines.append("Each backend asked the same question: return the SET of files containing the query.")
+        lines.append("`agree` is the pairwise Jaccard similarity (1.00 = all backends agree on the set).")
+        lines.append("")
+        bks = fl["backends"]
+        header = ["query"] + [f"{b} files" for b in bks] + ["agree-jaccard"]
+        lines.append("| " + " | ".join(header) + " |")
+        lines.append("|" + "---|" * len(header))
+        for r in fl["rows"]:
+            cells = ["`" + r["q"] + "`"]
+            for b in bks:
+                cells.append(str(r["counts"].get(b, "—")))
+            cells.append("{:.3f}".format(r["avg_jaccard"]))
+            lines.append("| " + " | ".join(cells) + " |")
+        lines.append("")
+
     out.write_text(NL.join(lines) + NL)
+
+
+# ---------------- multi-session launcher ----------------
+def run_multi_session(args):
+    """Spawn args.sessions subprocesses that each run the bench once and
+    dump per-query stats to JSON. Aggregate by median-of-medians."""
+    import tempfile, copy
+    tmp = Path(tempfile.mkdtemp(prefix="shootout-multisession-"))
+    session_jsons = []
+    print(f"[multi-session] running {args.sessions} sessions in subprocesses...", flush=True)
+    for sid in range(1, args.sessions + 1):
+        out_json = tmp / f"session-{sid}.json"
+        cmd = [
+            sys.executable, str(Path(__file__).resolve()),
+            "--corpus", str(args.corpus),
+            "--iters", str(args.iters),
+            "--codedb-bin", args.codedb_bin,
+            "--leanctx-bin", args.leanctx_bin,
+            "--sessions", "1",
+            "--session-id", str(sid),
+            "--out", str(out_json),
+        ]
+        if args.skip_codedb: cmd.append("--skip-codedb")
+        if args.skip_leanctx: cmd.append("--skip-leanctx")
+        if args.skip_fts5: cmd.append("--skip-fts5")
+        if args.clean_codedb and sid == 1: cmd.append("--clean-codedb")
+        if args.normalize_files_list: cmd.append("--normalize-files-list")
+        print(f"  session {sid}/{args.sessions} ...", flush=True)
+        r = subprocess.run(cmd, capture_output=False)
+        if r.returncode != 0:
+            print(f"  session {sid} failed (exit {r.returncode})", file=sys.stderr)
+            continue
+        try:
+            session_jsons.append(json.loads(out_json.read_text()))
+        except Exception as e:
+            print(f"  session {sid} json parse failed: {e}", file=sys.stderr)
+
+    if not session_jsons:
+        print("no sessions completed successfully", file=sys.stderr)
+        sys.exit(1)
+
+    # Aggregate: for each query, collect per-session stats and compute median-of-medians
+    print()
+    print(f"[aggregate] median-of-medians across {len(session_jsons)} sessions:")
+    print()
+    backends = session_jsons[0]["backends"]
+    header_parts = ["query", "kind"]
+    for b in backends:
+        header_parts.extend([f"{b} min", f"{b} p50", f"{b} p95", f"{b} p99"])
+    print("  " + " | ".join(header_parts))
+
+    by_query = {}
+    for sj in session_jsons:
+        for row in sj["rows"]:
+            q = row["q"]
+            by_query.setdefault(q, {"kind": row["kind"], "per_backend": {}})
+            for b in backends:
+                by_query[q]["per_backend"].setdefault(b, [])
+                if b in row["per_backend"]:
+                    by_query[q]["per_backend"][b].append(row["per_backend"][b])
+
+    agg_rows = []
+    for q, qd in by_query.items():
+        row = {"q": q, "kind": qd["kind"], "per_backend": {}}
+        for b in backends:
+            samples = qd["per_backend"][b]
+            if samples:
+                row["per_backend"][b] = merge_session_stats(samples)
+                row["per_backend"][b]["hits"] = samples[0].get("hits", -1)
+        agg_rows.append(row)
+        cells = [f"{q[:24]:<24}"]
+        for b in backends:
+            d = row["per_backend"].get(b, {})
+            cells.append(f"{d.get('min', 0):>5.2f}/{d.get('p50', 0):>5.2f}/{d.get('p95', 0):>6.2f}/{d.get('p99', 0):>6.2f}")
+        print("  " + " | ".join(cells))
+
+    # Write aggregated report if --out was given
+    if args.out:
+        ctx = {
+            "corpus": str(Path(args.corpus).resolve()),
+            "corpus_name": Path(args.corpus).resolve().name,
+            "corpus_bytes": session_jsons[0]["corpus_bytes"],
+            "file_count": session_jsons[0]["file_count"],
+            "iters": args.iters,
+            "sessions": len(session_jsons),
+            "backends": backends,
+            "builds": session_jsons[0]["builds"],
+            "rows": agg_rows,
+            "files_list": session_jsons[0].get("files_list"),
+        }
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        write_report(out_path, ctx)
+        print()
+        print(f"report: {out_path}")
+
+
+# ---------------- normalized files-list comparison ----------------
+def normalize_codedb_files(bin_path, root, queries):
+    """Ask codedb for the file SET containing each query. Uses `codedb word`
+    which doesn't have the 50-result display cap that `codedb search` has,
+    then dedupes hit paths."""
+    out = {}
+    for q in queries:
+        r = subprocess.run([bin_path, root, "word", q],
+                           capture_output=True, text=True, timeout=30,
+                           env={**os.environ, "CODEDB_QUIET": "1"})
+        paths = set()
+        for ln in r.stdout.splitlines():
+            ln = ln.strip()
+            if ":" in ln and not ln.startswith("✓") and not ln.startswith("✗"):
+                # format is "  path:line"; codedb word doesn't print headers in QUIET mode
+                paths.add(ln.split(":")[0].strip())
+        # word lookup only finds exact-token matches. For substring queries
+        # (Fiber, Lane, Suspense) we also need search results. Run search with
+        # high max_results as a fallback union to capture substring matches.
+        r2 = subprocess.run([bin_path, root, "search", "--paths-only", q],
+                            capture_output=True, text=True, timeout=30,
+                            env={**os.environ, "CODEDB_QUIET": "1"})
+        for ln in r2.stdout.splitlines():
+            ln = ln.strip()
+            if ":" in ln and not ln.startswith("✓") and not ln.startswith("✗"):
+                paths.add(ln.split(":")[0].strip())
+        out[q] = paths
+    return out
+
+
+def normalize_fts5_files(db_path, queries):
+    """Return set of files per query (from FTS5 trigram)."""
+    conn = sqlite3.connect(str(db_path))
+    cur = conn.cursor()
+    out = {}
+    for q in queries:
+        match = fts5_match_expr(q)
+        try:
+            cur.execute("SELECT path FROM files WHERE files MATCH ?", (match,))
+            out[q] = {row[0] for row in cur.fetchall()}
+        except sqlite3.OperationalError:
+            out[q] = set()
+    conn.close()
+    return out
+
+
+def normalize_leanctx_files(bin_path, root, queries):
+    """Get the full files-list from lean-ctx. `lean-ctx grep` truncates
+    display at ~20 lines, but `lean-ctx -c --raw "rg -l <q>"` returns the
+    untruncated rg output (rg is lean-ctx's underlying engine)."""
+    out = {}
+    for q in queries:
+        # Use lean-ctx in raw-passthrough mode to invoke rg directly. That
+        # gives us the full files-with-matches list — same backend logic
+        # lean-ctx's compressed grep uses, just without the display cap.
+        r = subprocess.run([bin_path, "-c", "--raw", f"rg -l {shlex.quote(q)}"],
+                           capture_output=True, text=True, cwd=root, timeout=60)
+        paths = {ln.strip() for ln in r.stdout.splitlines() if ln.strip()}
+        out[q] = paths
+    return out
+
+
+def jaccard(a, b):
+    if not a and not b:
+        return 1.0
+    union = a | b
+    if not union:
+        return 1.0
+    return len(a & b) / len(union)
+
+
+def run_files_list_eval(corpus, codedb_bin, leanctx_bin, fts5_db,
+                        fts5_uni_db, queries, skip_codedb, skip_leanctx, skip_fts5):
+    """Ask every backend for the set of files containing each query, then
+    compute pairwise jaccard similarity."""
+    print()
+    print("[files-list normalize] each backend returns set of files per query")
+    sets = {}
+    if not skip_codedb:
+        print("  codedb...", flush=True)
+        sets["codedb"] = normalize_codedb_files(codedb_bin, str(corpus), [q["q"] for q in queries])
+    if not skip_fts5:
+        print("  fts5_trigram...", flush=True)
+        sets["fts5_tri"] = normalize_fts5_files(fts5_db, [q["q"] for q in queries])
+        print("  fts5_unicode61...", flush=True)
+        sets["fts5_uni"] = normalize_fts5_files(fts5_uni_db, [q["q"] for q in queries])
+    if not skip_leanctx and leanctx_bin:
+        print("  lean-ctx...", flush=True)
+        sets["leanctx"] = normalize_leanctx_files(leanctx_bin, str(corpus), [q["q"] for q in queries])
+
+    backends = list(sets.keys())
+    rows = []
+    print()
+    print(f"  {'query':<30}" + "".join(f"{b:>14}" for b in backends) + "  agree-jaccard")
+    for qd in queries:
+        q = qd["q"]
+        counts = {b: len(sets[b][q]) for b in backends}
+        # Compute average pairwise jaccard
+        js = []
+        for i, b1 in enumerate(backends):
+            for b2 in backends[i+1:]:
+                js.append(jaccard(sets[b1][q], sets[b2][q]))
+        avg_j = sum(js) / len(js) if js else 1.0
+        line = f"  {q[:30]:<30}" + "".join(f"{counts[b]:>14}" for b in backends) + f"  {avg_j:>10.3f}"
+        print(line)
+        rows.append({"q": q, "counts": counts, "avg_jaccard": avg_j})
+    return {"backends": backends, "rows": rows}
 
 
 # ---------------- main ----------------
@@ -455,7 +715,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus", required=True)
     ap.add_argument("--out", default=None)
-    ap.add_argument("--iters", type=int, default=20)
+    ap.add_argument("--iters", type=int, default=500)
     ap.add_argument("--codedb-bin", default=str(DEFAULT_CODEDB))
     ap.add_argument("--leanctx-bin", default=DEFAULT_LEANCTX or "")
     ap.add_argument("--skip-codedb", action="store_true")
@@ -465,12 +725,28 @@ def main():
                          "CLI is what scripts feel; MCP is what an agent feels.")
     ap.add_argument("--skip-fts5", action="store_true")
     ap.add_argument("--clean-codedb", action="store_true")
+    ap.add_argument("--sessions", type=int, default=1,
+                    help="Run the bench N times in subprocesses; report median-of-medians per query. "
+                         "Default 1 (single session). Use --sessions 3 for tighter p99 estimates.")
+    ap.add_argument("--session-id", type=int, default=0,
+                    help="Internal: this run is session N of M (set by the multi-session launcher).")
+    ap.add_argument("--normalize-files-list", action="store_true",
+                    help="Run an additional 'files-list' comparison where every backend is asked "
+                         "the same question: 'return the set of files containing the query'. "
+                         "Reports hit-set jaccard similarity between backends.")
     args = ap.parse_args()
 
     corpus = Path(args.corpus).resolve()
     if not corpus.exists():
         print("corpus path does not exist: " + str(corpus), file=sys.stderr)
         sys.exit(1)
+
+    # Multi-session mode: spawn N subprocesses, each runs the bench once in
+    # isolation. Aggregator collects per-session stats from temp JSON files
+    # and reports median-of-medians.
+    if args.sessions > 1 and args.session_id == 0:
+        return run_multi_session(args)
+
 
     queries_doc = json.loads(QUERIES_PATH.read_text())
     queries = queries_doc["queries"]
@@ -549,7 +825,7 @@ def main():
 
     print()
     print("[query]")
-    print("  " + " | ".join(["query"] + [b + " p50/p99 (hits)" for b in backends]))
+    print("  " + " | ".join(["query"] + [b + " min/p50/p95/p99 (hits)" for b in backends]))
 
     rows = []
     for qd in queries:
@@ -570,22 +846,29 @@ def main():
                     times, count = query_leanctx(args.leanctx_bin, q, str(corpus), args.iters)
             else:
                 continue
-            per_backend[b] = {
-                "p50": pct(times, 0.5),
-                "p99": pct(times, 0.99),
-                "hits": count,
-            }
+            s = stats(times)
+            s["hits"] = count
+            per_backend[b] = s
         rows.append({"q": q, "kind": kind, "per_backend": per_backend})
         cells = ["{:<24}".format(q[:24])]
         for b in backends:
             d = per_backend[b]
-            cells.append("{:>7.2f}/{:>7.2f}ms ({:>5})".format(d["p50"], d["p99"], d["hits"]))
+            cells.append("{:>5.2f}/{:>5.2f}/{:>6.2f}/{:>6.2f}ms ({:>4})".format(
+                d["min"], d["p50"], d["p95"], d["p99"], d["hits"]))
         print("  " + " | ".join(cells))
 
     if codedb_client:
         codedb_client.close()
     if leanctx_client:
         leanctx_client.close()
+
+    files_list_result = None
+    if args.normalize_files_list:
+        files_list_result = run_files_list_eval(
+            corpus, args.codedb_bin, args.leanctx_bin,
+            fts5_tri_db, fts5_uni_db,
+            queries, args.skip_codedb, args.skip_leanctx, args.skip_fts5,
+        )
 
     if args.out:
         ctx = {
@@ -597,10 +880,15 @@ def main():
             "backends": backends,
             "builds": builds,
             "rows": rows,
+            "files_list": files_list_result,
         }
         out_path = Path(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        write_report(out_path, ctx)
+        if args.session_id > 0:
+            # Subprocess mode: emit JSON for the launcher to aggregate
+            out_path.write_text(json.dumps(ctx, default=lambda o: list(o) if isinstance(o, set) else None))
+        else:
+            write_report(out_path, ctx)
         print()
         print("report: " + str(out_path))
 

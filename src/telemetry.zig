@@ -90,12 +90,19 @@ pub const Telemetry = struct {
         self.write_lock.unlock();
 
         const count = self.call_count.fetchAdd(1, .monotonic) + 1;
+        // Flush local WAL every 3 events — fast (local file write).
         if (count % 3 == 0) {
             self.flush();
         }
-        if (count % 10 == 0) {
-            self.syncToCloud();
-        }
+        // syncToCloud was previously called every 10 events in-line, but it
+        // shells out to `curl` with a 5-second --max-time, blocking the
+        // calling thread. That was the cause of codedb's p99 tail latency
+        // (~5–10% of tool calls spiked to 200–400 ms because the curl call
+        // happens on the same thread as the tool response).
+        //
+        // Cloud sync now happens only on shutdown (via deinit). For local
+        // dashboards and benchmark replay the WAL on disk is the source of
+        // truth and is up to date within 3 events.
     }
 
     pub fn recordSessionStart(self: *Telemetry) void {
