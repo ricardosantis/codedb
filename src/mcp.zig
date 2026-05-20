@@ -997,42 +997,52 @@ fn handleCall(
     }
     if (is_notification) return;
 
-    // Block 1: Human-readable colored summary (ANSI — preview pane always renders it)
+    const lean = mcpLeanMode();
+
+    // Block 1: Human-readable colored summary (ANSI — preview pane always
+    // renders it). Skipped in lean mode (agents don't render ANSI; the
+    // summary duplicates info that's already in Block 2).
     var summary: std.ArrayList(u8) = .empty;
     defer summary.deinit(alloc);
-    summary.ensureTotalCapacity(alloc, 256) catch {};
-    summary.appendSlice(alloc, if (is_error) MCP_RED ++ MCP_CROSS ++ " " ++ MCP_RESET else MCP_GREEN ++ MCP_CHECK ++ " " ++ MCP_RESET) catch {};
-    summary.appendSlice(alloc, mcpToolIcon(name)) catch {};
-    mcpGenerateSummary(alloc, name, args, out.items, is_error, &summary);
-    var dur_buf: [96]u8 = undefined;
-    summary.appendSlice(alloc, mcpFormatDuration(&dur_buf, elapsed)) catch {};
+    if (!lean) {
+        summary.ensureTotalCapacity(alloc, 256) catch {};
+        summary.appendSlice(alloc, if (is_error) MCP_RED ++ MCP_CROSS ++ " " ++ MCP_RESET else MCP_GREEN ++ MCP_CHECK ++ " " ++ MCP_RESET) catch {};
+        summary.appendSlice(alloc, mcpToolIcon(name)) catch {};
+        mcpGenerateSummary(alloc, name, args, out.items, is_error, &summary);
+        var dur_buf: [96]u8 = undefined;
+        summary.appendSlice(alloc, mcpFormatDuration(&dur_buf, elapsed)) catch {};
+    }
 
-    // Block 3: Guidance hints
+    // Block 3: Guidance hints. Skipped in lean mode for same reason.
     var guidance: std.ArrayList(u8) = .empty;
     defer guidance.deinit(alloc);
-    mcpGenerateGuidance(alloc, name, args, out.items, is_error, &guidance);
+    if (!lean) {
+        mcpGenerateGuidance(alloc, name, args, out.items, is_error, &guidance);
+    }
 
-    // Assemble 3-block MCP content envelope
+    // Assemble MCP content envelope (1 block in lean mode, up to 3 otherwise).
     var result: std.ArrayList(u8) = .empty;
     defer result.deinit(alloc);
     result.ensureTotalCapacity(alloc, out.items.len + summary.items.len + guidance.items.len + 256) catch {};
     result.appendSlice(alloc, "{\"content\":[") catch return;
 
-    // Block 1 (summary)
+    // Block 1 (summary — audience: user; spec-canonical signal that
+    // token-conscious clients can strip)
     if (summary.items.len > 0) {
-        result.appendSlice(alloc, "{\"type\":\"text\",\"text\":\"") catch return;
+        result.appendSlice(alloc, "{\"type\":\"text\",\"annotations\":{\"audience\":[\"user\"]},\"text\":\"") catch return;
         mcpj.writeEscaped(alloc, &result, summary.items);
         result.appendSlice(alloc, "\"},") catch return;
     }
 
-    // Block 2 (raw data — no colors, zero extra tokens to model)
-    result.appendSlice(alloc, "{\"type\":\"text\",\"text\":\"") catch return;
+    // Block 2 (raw data — audience: assistant; this is what the model
+    // actually consumes)
+    result.appendSlice(alloc, "{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"]},\"text\":\"") catch return;
     mcpj.writeEscaped(alloc, &result, out.items);
     result.appendSlice(alloc, "\"}") catch return;
 
-    // Block 3 (guidance)
+    // Block 3 (guidance — audience: user)
     if (guidance.items.len > 0) {
-        result.appendSlice(alloc, ",{\"type\":\"text\",\"text\":\"") catch return;
+        result.appendSlice(alloc, ",{\"type\":\"text\",\"annotations\":{\"audience\":[\"user\"]},\"text\":\"") catch return;
         mcpj.writeEscaped(alloc, &result, guidance.items);
         result.appendSlice(alloc, "\"}") catch return;
     }
@@ -3527,6 +3537,24 @@ pub fn appendId(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), id: ?std.json
 
 // ── MCP UX: 3-block response helpers ────────────────────────────────────────
 // Colors are always on — MCP preview pane always renders ANSI. No TTY check.
+
+var mcp_lean_mode_cached: ?bool = null;
+
+/// True when CODEDB_MCP_LEAN is set (any non-empty value). Cached on first
+/// read. When true, MCP responses omit Block 1 (colored summary header) and
+/// Block 3 (guidance hints) — emitting only Block 2 (raw data). Saves
+/// tokens for agent consumers that can't render ANSI and don't need the
+/// hints.
+fn mcpLeanMode() bool {
+    if (mcp_lean_mode_cached) |v| return v;
+    const v = cio.posixGetenv("CODEDB_MCP_LEAN") orelse {
+        mcp_lean_mode_cached = false;
+        return false;
+    };
+    const enabled = v.len > 0 and !std.mem.eql(u8, v, "0") and !std.mem.eql(u8, v, "false");
+    mcp_lean_mode_cached = enabled;
+    return enabled;
+}
 
 const MCP_RESET = "\x1b[0m";
 const MCP_BOLD = "\x1b[1m";

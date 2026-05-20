@@ -262,14 +262,16 @@ fn mainImpl() !void {
             } else if (std.mem.eql(u8, cmd, "word")) {
                 loadWordIndexFromDiskIfPresent(io, &explorer, data_dir, git_head, allocator);
             }
-            var dur_buf: [64]u8 = undefined;
-            out.p("{s}\xe2\x9c\x93{s} {s}loaded snapshot{s}  {s}{d} files{s}  {s}{s}{s}\n", .{
-                s.green,                                        s.reset,
-                s.bold,                                         s.reset,
-                s.dim,                                          explorer.outlines.count(),
-                s.reset,                                        sty.durationColor(s, snapshot_elapsed),
-                sty.formatDuration(&dur_buf, snapshot_elapsed), s.reset,
-            });
+            if (cio.posixGetenv("CODEDB_QUIET") == null) {
+                var dur_buf: [64]u8 = undefined;
+                out.p("{s}\xe2\x9c\x93{s} {s}loaded snapshot{s}  {s}{d} files{s}  {s}{s}{s}\n", .{
+                    s.green,                                        s.reset,
+                    s.bold,                                         s.reset,
+                    s.dim,                                          explorer.outlines.count(),
+                    s.reset,                                        sty.durationColor(s, snapshot_elapsed),
+                    sty.formatDuration(&dur_buf, snapshot_elapsed), s.reset,
+                });
+            }
         } else {
             const disk_hdr = TrigramIndex.readDiskHeader(io, data_dir, allocator) catch null;
             const heads_match = blk2: {
@@ -519,20 +521,25 @@ fn mainImpl() !void {
         }
         const elapsed = cio.nanoTimestamp() - t0;
         var dur_buf: [64]u8 = undefined;
+        const quiet = cio.posixGetenv("CODEDB_QUIET") != null;
         if (results.len == 0) {
-            out.p("{s}\xe2\x9c\x97{s} no results for {s}\"{s}\"{s}\n", .{
-                s.yellow, s.reset, s.bold, query, s.reset,
-            });
+            if (!quiet) {
+                out.p("{s}\xe2\x9c\x97{s} no results for {s}\"{s}\"{s}\n", .{
+                    s.yellow, s.reset, s.bold, query, s.reset,
+                });
+            }
         } else {
-            const mode_label: []const u8 = if (use_regex) " (regex)" else "";
-            out.p("{s}\xe2\x9c\x93{s} {s}{d}{s} results for {s}\"{s}\"{s}{s}  {s}{s}{s}\n", .{
-                s.green,                               s.reset,
-                s.bold,                                results.len,
-                s.reset,                               s.bold,
-                query,                                 s.reset,
-                mode_label,                            sty.durationColor(s, elapsed),
-                sty.formatDuration(&dur_buf, elapsed), s.reset,
-            });
+            if (!quiet) {
+                const mode_label: []const u8 = if (use_regex) " (regex)" else "";
+                out.p("{s}\xe2\x9c\x93{s} {s}{d}{s} results for {s}\"{s}\"{s}{s}  {s}{s}{s}\n", .{
+                    s.green,                               s.reset,
+                    s.bold,                                results.len,
+                    s.reset,                               s.bold,
+                    query,                                 s.reset,
+                    mode_label,                            sty.durationColor(s, elapsed),
+                    sty.formatDuration(&dur_buf, elapsed), s.reset,
+                });
+            }
             for (results) |r| {
                 out.p("  {s}{s}{s}:{s}{d}{s}  {s}\n", .{
                     s.cyan,      r.path,     s.reset,
