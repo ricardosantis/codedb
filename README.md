@@ -104,6 +104,14 @@ checksums for the uploaded binaries, not Git commit SHAs:
 If you installed `v0.2.579` before this hotfix, rerun the installer above so the
 binary matches the final uploaded checksum for your platform.
 
+## Documentation
+
+- **[MCP setup](docs/mcp.md)** — per-client configurations (Claude Desktop, Cursor, VS Code, Claude Code, Codex CLI, Gemini CLI), root resolution, troubleshooting
+- **[Skill base & context files](docs/skills.md)** — `agents.md` / `CLAUDE.md` / `GEMINI.md`, `.codedbrc`, per-developer memory
+- **[CLI reference](docs/cli.md)** — every command, every flag
+- **[Architecture](docs/architecture.md)** — engine internals, index layout
+- **[Benchmarks](docs/benchmarks.md)** — micro-benchmarks + agentic-eval results vs codegraph, FTS5, lean-ctx
+
 | Platform | Binary | Signed |
 |----------|--------|--------|
 | macOS ARM64 (Apple Silicon) | `codedb-darwin-arm64` | ✅ codesigned + notarized |
