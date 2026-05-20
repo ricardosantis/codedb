@@ -11510,7 +11510,7 @@ test "issue-negq: negative-query search short-circuits Tier 5 full scan" {
     // codebases (see benchmarks/search-shootout, react corpus).
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    var explorer = Explorer.init(arena.allocator());
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
 
     // Index enough files that Tier 5 would be observably wasteful if it ran.
     var i: usize = 0;
@@ -11543,7 +11543,7 @@ test "issue-471a: codedb_find accepts query/name/path/pattern/q aliases" {
     // "missing 'query'" because agents passed the search term under `name`,
     // `path`, `pattern`, or `q` (misled by the "FILE-NAME search" framing in
     // the tool description). Regression: every common alias must succeed.
-    var explorer = Explorer.init(testing.allocator);
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
     try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
     try explorer.indexFile("src/auth_middleware.go", "package auth\n");
@@ -11555,7 +11555,7 @@ test "issue-471a: codedb_find accepts query/name/path/pattern/q aliases" {
     defer agents.deinit();
     _ = try agents.register("__filesystem__");
 
-    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer bench_ctx.deinit();
 
     const aliases = [_][]const u8{ "query", "name", "path", "pattern", "q" };
@@ -11588,7 +11588,7 @@ test "issue-471b: codedb_find error message enumerates accepted aliases" {
     // If an agent calls codedb_find with no recognized key, the error message
     // must enumerate the accepted aliases so the agent can self-correct on
     // the next call instead of repeating the same broken call.
-    var explorer = Explorer.init(testing.allocator);
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
     try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
 
@@ -11599,7 +11599,7 @@ test "issue-471b: codedb_find error message enumerates accepted aliases" {
     defer agents.deinit();
     _ = try agents.register("__filesystem__");
 
-    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer bench_ctx.deinit();
 
     const bundle_json =
