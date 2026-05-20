@@ -23,15 +23,39 @@ const update_mod = @import("update.zig");
 const release_info = @import("release_info.zig");
 const Config = @import("config.zig").Config;
 
-/// Thin wrapper: format + write to a File via allocator.
+/// Buffered stdout wrapper. Formats into a 64KB stack-buffered window and
+/// flushes lazily; an explicit `flush()` runs from mainImpl's deferred cleanup.
+/// `word` on a high-count term (~2k hits) used to do 2k mallocs + 2k write()
+/// syscalls; this collapses that to a handful of batched writes.
 const Out = struct {
     file: cio.File,
     alloc: std.mem.Allocator,
+    buf: [65536]u8 = undefined,
+    used: usize = 0,
 
-    fn p(self: Out, comptime fmt: []const u8, args: anytype) void {
-        const str = std.fmt.allocPrint(self.alloc, fmt, args) catch return;
-        defer self.alloc.free(str);
-        self.file.writeAll(str) catch {};
+    fn p(self: *Out, comptime fmt: []const u8, args: anytype) void {
+        // Fast path: format directly into the remaining buffer window.
+        const remaining = self.buf[self.used..];
+        if (std.fmt.bufPrint(remaining, fmt, args)) |s| {
+            self.used += s.len;
+            return;
+        } else |_| {}
+        // Either doesn't fit OR remaining is too small. Flush, retry from start.
+        self.flush();
+        if (std.fmt.bufPrint(&self.buf, fmt, args)) |s| {
+            self.used = s.len;
+            return;
+        } else |_| {}
+        // Single message larger than 64KB — fall back to one-shot heap alloc.
+        const big = std.fmt.allocPrint(self.alloc, fmt, args) catch return;
+        defer self.alloc.free(big);
+        self.file.writeAll(big) catch {};
+    }
+
+    fn flush(self: *Out) void {
+        if (self.used == 0) return;
+        self.file.writeAll(self.buf[0..self.used]) catch {};
+        self.used = 0;
     }
 };
 
@@ -68,6 +92,7 @@ fn mainImpl() !void {
     const use_color = stdout.isTty();
     const s = sty.style(use_color);
     var out = Out{ .file = stdout, .alloc = allocator };
+    defer out.flush();
 
     const raw_args = try cio.argsAlloc(allocator);
     defer cio.argsFree(allocator, raw_args);
@@ -119,7 +144,7 @@ fn mainImpl() !void {
         cmd = args[1];
         cmd_args_start = 2;
     } else if (args.len < 2) {
-        printUsage(out, s);
+        printUsage(&out, s);
         std.process.exit(1);
     } else if (isCommand(args[1])) {
         root = ".";
@@ -131,7 +156,7 @@ fn mainImpl() !void {
         cmd_args_start = 3;
         root_is_explicit = true;
     } else {
-        printUsage(out, s);
+        printUsage(&out, s);
         std.process.exit(1);
     }
 
@@ -164,7 +189,7 @@ fn mainImpl() !void {
 
     // Handle --help early (no root needed)
     if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "help")) {
-        printUsage(out, s);
+        printUsage(&out, s);
         return;
     }
 
@@ -263,6 +288,14 @@ fn mainImpl() !void {
             }
             if (std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "bench-engine")) {
                 loadWordIndexFromDiskIfPresent(io, &explorer, data_dir, git_head, allocator);
+                // If the on-disk word index wasn't usable (missing or stale vs
+                // the loaded snapshot), eagerly rebuild + persist here so the
+                // next `codedb word X` invocation loads in ~1ms instead of
+                // re-paying the ~200ms rebuild cost every time.
+                if (!explorer.wordIndexIsComplete()) {
+                    explorer.rebuildWordIndex() catch {};
+                    persistWordIndexToDisk(io, &explorer, data_dir, git_head);
+                }
             }
             if (cio.posixGetenv("CODEDB_QUIET") == null) {
                 var dur_buf: [64]u8 = undefined;
@@ -1150,7 +1183,7 @@ fn saveProjectInfo(io: std.Io, allocator: std.mem.Allocator, data_dir: []const u
     try file.writeStreamingAll(io, abs_root);
 }
 
-fn printUsage(out: Out, s: sty.Style) void {
+fn printUsage(out: *Out, s: sty.Style) void {
     out.p(
         \\
         \\{s}codedb{s}  code intelligence server
