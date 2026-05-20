@@ -444,7 +444,12 @@ fn parseInitialScanEntry(io: std.Io, root: []const u8, entry: InitialScanEntry, 
     for (content[0..check_len]) |c| {
         if (c == 0) return null;
     }
-    const effective_skip_trigram = entry.skip_trigram or (content.len > 64 * 1024);
+    // Threshold for including a file in the trigram index. Bumped from 64KB to
+    // 1MB after the search-shootout bench (issue: large code files like
+    // ReactFiberCompleteWork.js at 77KB were invisible to substring search,
+    // causing agents to miss call sites in them). 1MB covers all reasonable
+    // code files; minified/generated bundles past 1MB are correctly skipped.
+    const effective_skip_trigram = entry.skip_trigram or (content.len > 1024 * 1024);
     const parsed = try explore_mod.Explorer.parseContentForIndexing(arena_alloc, entry.path, content);
     return .{
         .path = entry.path,
@@ -590,7 +595,7 @@ fn cachedTrigramExtractWorker(results: *TriExtractResults, entries: []const Cach
     defer local.deinit();
     local.ensureTotalCapacity(4096) catch {};
     for (entries) |entry| {
-        if (entry.content.len > 64 * 1024) continue;
+        if (entry.content.len > 1024 * 1024) continue;
         local.clearRetainingCapacity();
         if (entry.content.len >= 3) {
             for (0..entry.content.len - 2) |i| {
@@ -641,7 +646,7 @@ pub fn buildTrigramsFromCache(
     try entries.ensureTotalCapacity(allocator, contents.count());
     var iter = contents.iterator();
     while (iter.next()) |e| {
-        if (e.value_ptr.*.len > 64 * 1024) continue;
+        if (e.value_ptr.*.len > 1024 * 1024) continue;
         entries.appendAssumeCapacity(.{ .path = e.key_ptr.*, .content = e.value_ptr.* });
     }
     if (entries.items.len == 0) return tmp_tri;
@@ -693,7 +698,7 @@ fn trigramExtractWorker(io: std.Io, results: *TriExtractResults, root: []const u
     local.ensureTotalCapacity(4096) catch {};
     for (entries) |entry| {
         const r = readFileEntry(io, root, entry, alloc) orelse continue;
-        if (r.content.len > 64 * 1024) continue;
+        if (r.content.len > 1024 * 1024) continue;
         local.clearRetainingCapacity();
         if (r.content.len >= 3) {
             for (0..r.content.len - 2) |i| {
@@ -762,7 +767,7 @@ pub fn initialScanWithTrigrams(
                     explorer.commitParsedFileOwnedOutline(file.path, file.content, file.outline, true, true) catch continue;
                 }
                 // Build trigrams from same content — no re-read needed
-                if (file.content.len <= 64 * 1024) {
+                if (file.content.len <= 1024 * 1024) {
                     tmp_tri.indexFile(file.path, file.content) catch {};
                 }
             }
@@ -828,7 +833,7 @@ pub fn initialScanWithTrigrams(
         for (workers) |*worker| {
             for (worker.items.items) |file| {
                 explorer.commitParsedFileOwnedOutline(file.path, file.content, file.outline, true, true) catch continue;
-                if (file.content.len <= 64 * 1024) {
+                if (file.content.len <= 1024 * 1024) {
                     tmp_tri.indexFile(file.path, file.content) catch {};
                 }
             }
@@ -1178,7 +1183,7 @@ fn indexFileContent(io: std.Io, explorer: *Explorer, dir: std.Io.Dir, path: []co
         if (c == 0) return;
     }
     // Skip trigram indexing for files > 64KB to prevent OOM on large repos
-    const effective_skip_trigram = skip_trigram or (content.len > 64 * 1024);
+    const effective_skip_trigram = skip_trigram or (content.len > 1024 * 1024);
     if (effective_skip_trigram) {
         try explorer.indexFileSkipTrigram(path, content);
     } else {
