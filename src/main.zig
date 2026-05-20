@@ -4,6 +4,7 @@ const cio = @import("cio.zig");
 const Store = @import("store.zig").Store;
 const AgentRegistry = @import("agent.zig").AgentRegistry;
 const Explorer = @import("explore.zig").Explorer;
+const explore_mod = @import("explore.zig");
 const watcher = @import("watcher.zig");
 const server = @import("server.zig");
 const mcp_server = @import("mcp.zig");
@@ -255,11 +256,12 @@ fn mainImpl() !void {
         const snapshot_loaded = loadBestSnapshot(io, &explorer, &store, abs_root, data_dir, git_head, allocator);
         const snapshot_elapsed = cio.nanoTimestamp() - snapshot_t0;
 
-        const needs_word_index = std.mem.eql(u8, cmd, "word");
+        const needs_word_index = std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "bench-engine");
         if (snapshot_loaded) {
-            if (std.mem.eql(u8, cmd, "search")) {
+            if (std.mem.eql(u8, cmd, "search") or std.mem.eql(u8, cmd, "bench-engine")) {
                 loadTrigramFromDiskIfPresent(io, &explorer, data_dir, allocator);
-            } else if (std.mem.eql(u8, cmd, "word")) {
+            }
+            if (std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "bench-engine")) {
                 loadWordIndexFromDiskIfPresent(io, &explorer, data_dir, git_head, allocator);
             }
             if (cio.posixGetenv("CODEDB_QUIET") == null) {
@@ -619,6 +621,109 @@ fn mainImpl() !void {
                 s.cyan, path, s.reset,
             });
         }
+    } else if (std.mem.eql(u8, cmd, "bench-engine")) {
+        // Engine-vs-engine microbenchmark — bypasses MCP envelope, response
+        // formatting, and most of the CLI display path. Lets us compare
+        // codedb's pure engine cost against SQLite FTS5 head-to-head.
+        //
+        // Usage: codedb [root] bench-engine <op> <query> [iters]
+        //   op: word | word-fmt | search | search-fmt
+        //   iters defaults to 100.
+        //
+        // Output: a single line of JSON to stdout, e.g.
+        //   {"op":"word","query":"useState","iters":100,"hits":50,"p50_ns":1234,"p99_ns":5678}
+        if (args.len < cmd_args_start + 2) {
+            out.p("usage: codedb [root] bench-engine <word|word-fmt|search|search-fmt> <query> [iters]\n", .{});
+            std.process.exit(1);
+        }
+        const op = args[cmd_args_start];
+        const query = args[cmd_args_start + 1];
+        const iters: usize = if (args.len > cmd_args_start + 2)
+            std.fmt.parseInt(usize, args[cmd_args_start + 2], 10) catch 100
+        else
+            100;
+
+        // Warm once (mirrors how the Python bench harness measures latency).
+        if (std.mem.eql(u8, op, "word") or std.mem.eql(u8, op, "word-fmt")) {
+            const warm = explorer.searchWord(query, allocator) catch &[_]index_mod.WordHit{};
+            allocator.free(warm);
+        } else if (std.mem.eql(u8, op, "search") or std.mem.eql(u8, op, "search-fmt")) {
+            const warm = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
+            defer {
+                for (warm) |r| { allocator.free(r.path); allocator.free(r.line_text); }
+                allocator.free(warm);
+            }
+        }
+
+        var times = allocator.alloc(u64, iters) catch {
+            out.p("error: alloc failed\n", .{});
+            std.process.exit(1);
+        };
+        defer allocator.free(times);
+
+        var hits_seen: usize = 0;
+
+        var i: usize = 0;
+        while (i < iters) : (i += 1) {
+            const t0 = cio.nanoTimestamp();
+
+            if (std.mem.eql(u8, op, "word")) {
+                const hits = explorer.searchWord(query, allocator) catch &[_]index_mod.WordHit{};
+                hits_seen = hits.len;
+                allocator.free(hits);
+            } else if (std.mem.eql(u8, op, "word-fmt")) {
+                const hits = explorer.searchWord(query, allocator) catch &[_]index_mod.WordHit{};
+                hits_seen = hits.len;
+                defer allocator.free(hits);
+                // Mimic the MCP handleWord format loop into a scratch buffer
+                // so we measure the same work the agent pays for.
+                var scratch: std.ArrayList(u8) = .empty;
+                defer scratch.deinit(allocator);
+                scratch.ensureTotalCapacity(allocator, 256 + hits.len * 80) catch {};
+                const w = cio.listWriter(&scratch, allocator);
+                w.print("{d} hits for '{s}':\n", .{ hits.len, query }) catch {};
+                explorer.mu.lockShared();
+                for (hits) |h| {
+                    w.print("  {s}:{d}\n", .{ explorer.word_index.hitPath(h), h.line_num }) catch {};
+                }
+                explorer.mu.unlockShared();
+            } else if (std.mem.eql(u8, op, "search")) {
+                const r = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
+                hits_seen = r.len;
+                for (r) |item| { allocator.free(item.path); allocator.free(item.line_text); }
+                allocator.free(r);
+            } else if (std.mem.eql(u8, op, "search-fmt")) {
+                const r = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
+                hits_seen = r.len;
+                defer {
+                    for (r) |item| { allocator.free(item.path); allocator.free(item.line_text); }
+                    allocator.free(r);
+                }
+                var scratch: std.ArrayList(u8) = .empty;
+                defer scratch.deinit(allocator);
+                scratch.ensureTotalCapacity(allocator, 256 + r.len * 120) catch {};
+                const w = cio.listWriter(&scratch, allocator);
+                w.print("{d} results for '{s}':\n", .{ r.len, query }) catch {};
+                for (r) |item| {
+                    w.print("  {s}:{d}: {s}\n", .{ item.path, item.line_num, item.line_text }) catch {};
+                }
+            } else {
+                out.p("error: unknown op '{s}' — use one of word|word-fmt|search|search-fmt\n", .{op});
+                std.process.exit(1);
+            }
+
+            const elapsed_i128: i128 = cio.nanoTimestamp() - t0;
+            times[i] = if (elapsed_i128 > 0) @intCast(elapsed_i128) else 0;
+        }
+
+        std.mem.sort(u64, times, {}, std.sort.asc(u64));
+        const p50 = times[iters / 2];
+        const p99 = times[@min(iters - 1, (iters * 99) / 100)];
+        const p_min = times[0];
+        out.p(
+            "{{\"op\":\"{s}\",\"query\":\"{s}\",\"iters\":{d},\"hits\":{d},\"min_ns\":{d},\"p50_ns\":{d},\"p99_ns\":{d}}}\n",
+            .{ op, query, iters, hits_seen, p_min, p50, p99 },
+        );
     } else if (std.mem.eql(u8, cmd, "snapshot")) {
         const t0 = cio.nanoTimestamp();
         const output = if (args.len > cmd_args_start) args[cmd_args_start] else "codedb.snapshot";

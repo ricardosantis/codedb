@@ -521,3 +521,87 @@ technically available.
 
 All four are opt-in. Default behavior unchanged.
 
+## 11. Engine-vs-engine — direct comparison (no MCP, no formatting)
+
+Earlier sections compared codedb to FTS5 with codedb running through MCP
+(stdio JSON-RPC) and FTS5 running through a persistent Python SQLite
+connection. That comparison was fair as a "what does the agent feel"
+benchmark, but it conflated codedb's pure engine work with its
+~0.08–0.26 ms MCP roundtrip floor and ~1 ms of content-reading per result.
+
+A new subcommand `codedb bench-engine` exposes the engine directly:
+loads the snapshot, calls the explorer in a tight loop, reports timing
+in nanoseconds. Four ops: `word`, `word-fmt`, `search`, `search-fmt`.
+
+200 iter, warm, React corpus:
+
+### Word index direct lookup (`searchWord`)
+
+| Query | hits | codedb engine | FTS5 trigram | codedb is |
+|---|---|---|---|---|
+| `useState` | 2,689 | **8 µs** | 814 µs | **102× faster** |
+| `forwardRef` | 466 | **1 µs** | 179 µs | **179× faster** |
+| `Fiber` | 6,304 | **25 µs** | 132 µs | **5× faster** |
+| `flushPassiveEffects` | 23 | **~0 µs** | 210 µs | **>200× faster** |
+| `xyzzy_react_does_not_exist` | 0 | **~0 µs** | 201 µs | **>200× faster** |
+
+**The codedb engine is 5×–200× faster than SQLite FTS5 trigram at
+word-index lookup.** This is what the agent-level comparison was hiding:
+codedb's pure inverted-word-index path is dramatically faster than FTS5;
+the per-call latency we measured at the MCP level was overhead + content
+reads, not engine cost.
+
+### Full search (`searchContent` — includes per-result content reads)
+
+| Query | codedb engine | FTS5 trigram | ratio |
+|---|---|---|---|
+| `useState` (50 results) | 1.52 ms | 0.81 ms | fts5 1.86× faster |
+| `forwardRef` | 0.17 ms | 0.18 ms | tied |
+| `Fiber` | 0.22 ms | 0.13 ms | fts5 1.7× faster |
+| `flushPassiveEffects` | 0.04 ms | 0.21 ms | **codedb 5× faster** |
+| `xyzzy_react_does_not_exist` | **0.002 ms** | 0.20 ms | **codedb 100× faster** |
+
+Reading line text from 50 files (codedb returns `path:line:line_text`)
+takes ~1 ms; FTS5's response is `path` only, so it doesn't pay this
+cost. For common identifiers FTS5 wins by ~2×; for rare identifiers and
+negative queries (with the Tier 5 short-circuit), codedb dominates.
+
+### Format-only overhead
+
+`word` vs `word-fmt` (raw search vs search + format-to-buffer):
+
+| Query | word | word-fmt | added by format |
+|---|---|---|---|
+| useState (2,689 hits) | 8 µs | 60 µs | 52 µs (~20 ns/hit) |
+| Fiber (6,304 hits) | 25 µs | 142 µs | 117 µs (~19 ns/hit) |
+| forwardRef (466 hits) | 1 µs | 10 µs | 9 µs (~20 ns/hit) |
+
+Format-to-buffer is roughly 20 ns/hit — negligible compared to
+content-read costs. **The serializer isn't the bottleneck.** The
+codedb-vs-fts5 gap at the MCP layer comes from MCP envelope overhead
+(audience annotations, the 3-block content structure) + per-result
+content reads (1 ms for 50 files) — not from the format loop.
+
+### How to reproduce
+
+```bash
+# 1. Build codedb with the bench-engine subcommand
+zig build -Doptimize=ReleaseFast
+
+# 2. Run it
+./zig-out/bin/codedb /path/to/corpus bench-engine word useState 200
+./zig-out/bin/codedb /path/to/corpus bench-engine word-fmt useState 200
+./zig-out/bin/codedb /path/to/corpus bench-engine search useState 200
+./zig-out/bin/codedb /path/to/corpus bench-engine search-fmt useState 200
+```
+
+Output is a single line of JSON per run, e.g.:
+```json
+{"op":"word","query":"useState","iters":200,"hits":2689,"min_ns":7000,"p50_ns":8000,"p99_ns":11000}
+```
+
+The flag is in the public CLI but is not a stable interface — its
+purpose is for benchmark harnesses (including
+[code-search-shootout](https://github.com/justrach/code-search-shootout))
+to measure codedb fairly against engines that don't have an MCP layer.
+
