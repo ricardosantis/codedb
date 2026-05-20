@@ -1,6 +1,6 @@
 # QD Matrix — code-search-shootout
 
-Tasks: 8  ·  Backends: 4  ·  Filled cells: 27
+Tasks: 16  ·  Backends: 4  ·  Filled cells: 59
 
 ## Quality (out of 5) — mean per cell
 
@@ -14,6 +14,14 @@ Tasks: 8  ·  Backends: 4  ·  Filled cells: 27
 | `R1_pattern_compile_trace` | 4.50±0.71 (n=2) | — | 4.00 | 4.00 |
 | `R2_matchkind_all_sites` | 4.00±0.00 (n=2) | — | 3.00 | 3.00 |
 | `R3_pikevm_vs_backtrack` | 5.00 | — | 3.00 | 5.00 |
+| `F0_url_for` | — | — | — | — |
+| `F1_route_decorator_trace` | — | — | — | — |
+| `F2_before_request_sites` | — | — | — | — |
+| `F3_app_vs_blueprint` | — | — | — | — |
+| `G0_context_json` | — | — | — | — |
+| `G1_engine_run_trace` | — | — | — | — |
+| `G2_default_middleware_sites` | — | — | — | — |
+| `G3_bind_vs_shouldbind` | — | — | — | — |
 
 ### Per-backend averages (across all tasks where measured)
 
@@ -36,6 +44,14 @@ Tasks: 8  ·  Backends: 4  ·  Filled cells: 27
 | `R1_pattern_compile_trace` | 25,734±2,232 (n=2) | — | 22,645 | 32,596 |
 | `R2_matchkind_all_sites` | 15,251±3,371 (n=2) | — | 21,030 | 18,040 |
 | `R3_pikevm_vs_backtrack` | 19,467 | — | 15,844 | 24,645 |
+| `F0_url_for` | — | — | — | — |
+| `F1_route_decorator_trace` | — | — | — | — |
+| `F2_before_request_sites` | — | — | — | — |
+| `F3_app_vs_blueprint` | — | — | — | — |
+| `G0_context_json` | — | — | — | — |
+| `G1_engine_run_trace` | — | — | — | — |
+| `G2_default_middleware_sites` | — | — | — | — |
+| `G3_bind_vs_shouldbind` | — | — | — | — |
 
 ## Wall time (seconds) — mean per cell
 
@@ -49,6 +65,14 @@ Tasks: 8  ·  Backends: 4  ·  Filled cells: 27
 | `R1_pattern_compile_trace` | 29.5±27.6 (n=2) | — | 32.0 | 68.0 |
 | `R2_matchkind_all_sites` | 2.0±1.4 (n=2) | — | 28.0 | 28.0 |
 | `R3_pikevm_vs_backtrack` | 12.0 | — | 25.0 | 38.0 |
+| `F0_url_for` | — | — | — | — |
+| `F1_route_decorator_trace` | — | — | — | — |
+| `F2_before_request_sites` | — | — | — | — |
+| `F3_app_vs_blueprint` | — | — | — | — |
+| `G0_context_json` | — | — | — | — |
+| `G1_engine_run_trace` | — | — | — | — |
+| `G2_default_middleware_sites` | — | — | — | — |
+| `G3_bind_vs_shouldbind` | — | — | — | — |
 
 ## Pareto frontier
 
@@ -70,10 +94,10 @@ Each cell shows aggregated (quality / tokens / wall) over tasks in that niche.
 | niche | codedb | codedb_LEAN | fts5_trigram | leanctx |
 |---|---|---|---|---|
 | `uncategorized` (4 tasks) | **5.00** / 17,199 / 26.5s | 5.00 / 20,123 / 52.0s | 5.00 / *15,580* / 39.0s | 4.50 / 19,791 / 106.0s |
-| `symbol-lookup` (1 task) | **5.00** / *13,642* / 21.0s | — | 5.00 / 14,299 / 12.0s | 5.00 / 17,729 / 12.0s |
-| `trace` (1 task) | **4.50** / 25,734 / 29.5s | — | 4.00 / *22,645* / 32.0s | 4.00 / 32,596 / 68.0s |
-| `pattern-find` (1 task) | **4.00** / *15,251* / 2.0s | — | 3.00 / 21,030 / 28.0s | 3.00 / 18,040 / 28.0s |
-| `comparison` (1 task) | **5.00** / 19,467 / 12.0s | — | 3.00 / *15,844* / 25.0s | 5.00 / 24,645 / 38.0s |
+| `symbol-lookup` (3 tasks) | **5.00** / *13,642* / 21.0s | — | 5.00 / 14,299 / 12.0s | 5.00 / 17,729 / 12.0s |
+| `trace` (3 tasks) | **4.50** / 25,734 / 29.5s | — | 4.00 / *22,645* / 32.0s | 4.00 / 32,596 / 68.0s |
+| `pattern-find` (3 tasks) | **4.00** / *15,251* / 2.0s | — | 3.00 / 21,030 / 28.0s | 3.00 / 18,040 / 28.0s |
+| `comparison` (3 tasks) | **5.00** / 19,467 / 12.0s | — | 3.00 / *15,844* / 25.0s | 5.00 / 24,645 / 38.0s |
 
 ### Niche wins per backend
 

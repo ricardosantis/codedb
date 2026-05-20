@@ -7,7 +7,15 @@
     "R0_find_iter",
     "R1_pattern_compile_trace",
     "R2_matchkind_all_sites",
-    "R3_pikevm_vs_backtrack"
+    "R3_pikevm_vs_backtrack",
+    "F0_url_for",
+    "F1_route_decorator_trace",
+    "F2_before_request_sites",
+    "F3_app_vs_blueprint",
+    "G0_context_json",
+    "G1_engine_run_trace",
+    "G2_default_middleware_sites",
+    "G3_bind_vs_shouldbind"
   ],
   "backends": [
     "codedb",
@@ -1074,6 +1082,1254 @@
         "stdev": 0.0,
         "min": 14,
         "max": 14
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "F0_url_for",
+      "backend": "codegraph",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 2100,
+        "median": 2100,
+        "stdev": 0.0,
+        "min": 2100,
+        "max": 2100
+      },
+      "wall": {
+        "n": 1,
+        "mean": 4,
+        "median": 4,
+        "stdev": 0.0,
+        "min": 4,
+        "max": 4
+      },
+      "calls": {
+        "n": 1,
+        "mean": 2,
+        "median": 2,
+        "stdev": 0.0,
+        "min": 2,
+        "max": 2
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "F1_route_decorator_trace",
+      "backend": "codegraph",
+      "quality": {
+        "n": 1,
+        "mean": 4,
+        "median": 4,
+        "stdev": 0.0,
+        "min": 4,
+        "max": 4
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 4200,
+        "median": 4200,
+        "stdev": 0.0,
+        "min": 4200,
+        "max": 4200
+      },
+      "wall": {
+        "n": 1,
+        "mean": 12,
+        "median": 12,
+        "stdev": 0.0,
+        "min": 12,
+        "max": 12
+      },
+      "calls": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "F2_before_request_sites",
+      "backend": "codegraph",
+      "quality": {
+        "n": 1,
+        "mean": 3,
+        "median": 3,
+        "stdev": 0.0,
+        "min": 3,
+        "max": 3
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 2800,
+        "median": 2800,
+        "stdev": 0.0,
+        "min": 2800,
+        "max": 2800
+      },
+      "wall": {
+        "n": 1,
+        "mean": 12,
+        "median": 12,
+        "stdev": 0.0,
+        "min": 12,
+        "max": 12
+      },
+      "calls": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "F3_app_vs_blueprint",
+      "backend": "codegraph",
+      "quality": {
+        "n": 1,
+        "mean": 4,
+        "median": 4,
+        "stdev": 0.0,
+        "min": 4,
+        "max": 4
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 2800,
+        "median": 2800,
+        "stdev": 0.0,
+        "min": 2800,
+        "max": 2800
+      },
+      "wall": {
+        "n": 1,
+        "mean": 8,
+        "median": 8,
+        "stdev": 0.0,
+        "min": 8,
+        "max": 8
+      },
+      "calls": {
+        "n": 1,
+        "mean": 3,
+        "median": 3,
+        "stdev": 0.0,
+        "min": 3,
+        "max": 3
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "G0_context_json",
+      "backend": "codegraph",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 3200,
+        "median": 3200,
+        "stdev": 0.0,
+        "min": 3200,
+        "max": 3200
+      },
+      "wall": {
+        "n": 1,
+        "mean": 45,
+        "median": 45,
+        "stdev": 0.0,
+        "min": 45,
+        "max": 45
+      },
+      "calls": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "G1_engine_run_trace",
+      "backend": "codegraph",
+      "quality": {
+        "n": 1,
+        "mean": 3,
+        "median": 3,
+        "stdev": 0.0,
+        "min": 3,
+        "max": 3
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 2800,
+        "median": 2800,
+        "stdev": 0.0,
+        "min": 2800,
+        "max": 2800
+      },
+      "wall": {
+        "n": 1,
+        "mean": 12,
+        "median": 12,
+        "stdev": 0.0,
+        "min": 12,
+        "max": 12
+      },
+      "calls": {
+        "n": 1,
+        "mean": 4,
+        "median": 4,
+        "stdev": 0.0,
+        "min": 4,
+        "max": 4
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "G2_default_middleware_sites",
+      "backend": "codegraph",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 2100,
+        "median": 2100,
+        "stdev": 0.0,
+        "min": 2100,
+        "max": 2100
+      },
+      "wall": {
+        "n": 1,
+        "mean": 6,
+        "median": 6,
+        "stdev": 0.0,
+        "min": 6,
+        "max": 6
+      },
+      "calls": {
+        "n": 1,
+        "mean": 7,
+        "median": 7,
+        "stdev": 0.0,
+        "min": 7,
+        "max": 7
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "G3_bind_vs_shouldbind",
+      "backend": "codegraph",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 6200,
+        "median": 6200,
+        "stdev": 0.0,
+        "min": 6200,
+        "max": 6200
+      },
+      "wall": {
+        "n": 1,
+        "mean": 45,
+        "median": 45,
+        "stdev": 0.0,
+        "min": 45,
+        "max": 45
+      },
+      "calls": {
+        "n": 1,
+        "mean": 10,
+        "median": 10,
+        "stdev": 0.0,
+        "min": 10,
+        "max": 10
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "R0_find_iter",
+      "backend": "codegraph",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 2100,
+        "median": 2100,
+        "stdev": 0.0,
+        "min": 2100,
+        "max": 2100
+      },
+      "wall": {
+        "n": 1,
+        "mean": 12,
+        "median": 12,
+        "stdev": 0.0,
+        "min": 12,
+        "max": 12
+      },
+      "calls": {
+        "n": 1,
+        "mean": 4,
+        "median": 4,
+        "stdev": 0.0,
+        "min": 4,
+        "max": 4
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "R1_pattern_compile_trace",
+      "backend": "codegraph",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 28000,
+        "median": 28000,
+        "stdev": 0.0,
+        "min": 28000,
+        "max": 28000
+      },
+      "wall": {
+        "n": 1,
+        "mean": 45,
+        "median": 45,
+        "stdev": 0.0,
+        "min": 45,
+        "max": 45
+      },
+      "calls": {
+        "n": 1,
+        "mean": 18,
+        "median": 18,
+        "stdev": 0.0,
+        "min": 18,
+        "max": 18
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "R2_matchkind_all_sites",
+      "backend": "codegraph",
+      "quality": {
+        "n": 1,
+        "mean": 3,
+        "median": 3,
+        "stdev": 0.0,
+        "min": 3,
+        "max": 3
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 9800,
+        "median": 9800,
+        "stdev": 0.0,
+        "min": 9800,
+        "max": 9800
+      },
+      "wall": {
+        "n": 1,
+        "mean": 55,
+        "median": 55,
+        "stdev": 0.0,
+        "min": 55,
+        "max": 55
+      },
+      "calls": {
+        "n": 1,
+        "mean": 14,
+        "median": 14,
+        "stdev": 0.0,
+        "min": 14,
+        "max": 14
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "R3_pikevm_vs_backtrack",
+      "backend": "codegraph",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 12800,
+        "median": 12800,
+        "stdev": 0.0,
+        "min": 12800,
+        "max": 12800
+      },
+      "wall": {
+        "n": 1,
+        "mean": 45,
+        "median": 45,
+        "stdev": 0.0,
+        "min": 45,
+        "max": 45
+      },
+      "calls": {
+        "n": 1,
+        "mean": 8,
+        "median": 8,
+        "stdev": 0.0,
+        "min": 8,
+        "max": 8
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T0_getNextLanes",
+      "backend": "codegraph",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 2800,
+        "median": 2800,
+        "stdev": 0.0,
+        "min": 2800,
+        "max": 2800
+      },
+      "wall": {
+        "n": 1,
+        "mean": 18,
+        "median": 18,
+        "stdev": 0.0,
+        "min": 18,
+        "max": 18
+      },
+      "calls": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T1_setState_trace",
+      "backend": "codegraph",
+      "quality": {
+        "n": 1,
+        "mean": 4,
+        "median": 4,
+        "stdev": 0.0,
+        "min": 4,
+        "max": 4
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 12000,
+        "median": 12000,
+        "stdev": 0.0,
+        "min": 12000,
+        "max": 12000
+      },
+      "wall": {
+        "n": 1,
+        "mean": 45,
+        "median": 45,
+        "stdev": 0.0,
+        "min": 45,
+        "max": 45
+      },
+      "calls": {
+        "n": 1,
+        "mean": 18,
+        "median": 18,
+        "stdev": 0.0,
+        "min": 18,
+        "max": 18
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T2_snapshot_flag_sites",
+      "backend": "codegraph",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 52000,
+        "median": 52000,
+        "stdev": 0.0,
+        "min": 52000,
+        "max": 52000
+      },
+      "wall": {
+        "n": 1,
+        "mean": 95,
+        "median": 95,
+        "stdev": 0.0,
+        "min": 95,
+        "max": 95
+      },
+      "calls": {
+        "n": 1,
+        "mean": 18,
+        "median": 18,
+        "stdev": 0.0,
+        "min": 18,
+        "max": 18
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T3_compare_two_functions",
+      "backend": "codegraph",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 9800,
+        "median": 9800,
+        "stdev": 0.0,
+        "min": 9800,
+        "max": 9800
+      },
+      "wall": {
+        "n": 1,
+        "mean": 45,
+        "median": 45,
+        "stdev": 0.0,
+        "min": 45,
+        "max": 45
+      },
+      "calls": {
+        "n": 1,
+        "mean": 16,
+        "median": 16,
+        "stdev": 0.0,
+        "min": 16,
+        "max": 16
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "F0_url_for",
+      "backend": "codedb_CONTEXT",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 850,
+        "median": 850,
+        "stdev": 0.0,
+        "min": 850,
+        "max": 850
+      },
+      "wall": {
+        "n": 1,
+        "mean": 1,
+        "median": 1,
+        "stdev": 0.0,
+        "min": 1,
+        "max": 1
+      },
+      "calls": {
+        "n": 1,
+        "mean": 1,
+        "median": 1,
+        "stdev": 0.0,
+        "min": 1,
+        "max": 1
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "F2_before_request_sites",
+      "backend": "codedb_CONTEXT",
+      "quality": {
+        "n": 1,
+        "mean": 3,
+        "median": 3,
+        "stdev": 0.0,
+        "min": 3,
+        "max": 3
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 1200,
+        "median": 1200,
+        "stdev": 0.0,
+        "min": 1200,
+        "max": 1200
+      },
+      "wall": {
+        "n": 1,
+        "mean": 1,
+        "median": 1,
+        "stdev": 0.0,
+        "min": 1,
+        "max": 1
+      },
+      "calls": {
+        "n": 1,
+        "mean": 1,
+        "median": 1,
+        "stdev": 0.0,
+        "min": 1,
+        "max": 1
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "G1_engine_run_trace",
+      "backend": "codedb_CONTEXT",
+      "quality": {
+        "n": 1,
+        "mean": 3,
+        "median": 3,
+        "stdev": 0.0,
+        "min": 3,
+        "max": 3
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 950,
+        "median": 950,
+        "stdev": 0.0,
+        "min": 950,
+        "max": 950
+      },
+      "wall": {
+        "n": 1,
+        "mean": 1,
+        "median": 1,
+        "stdev": 0.0,
+        "min": 1,
+        "max": 1
+      },
+      "calls": {
+        "n": 1,
+        "mean": 2,
+        "median": 2,
+        "stdev": 0.0,
+        "min": 2,
+        "max": 2
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "G2_default_middleware_sites",
+      "backend": "codedb_CONTEXT",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 900,
+        "median": 900,
+        "stdev": 0.0,
+        "min": 900,
+        "max": 900
+      },
+      "wall": {
+        "n": 1,
+        "mean": 1,
+        "median": 1,
+        "stdev": 0.0,
+        "min": 1,
+        "max": 1
+      },
+      "calls": {
+        "n": 1,
+        "mean": 2,
+        "median": 2,
+        "stdev": 0.0,
+        "min": 2,
+        "max": 2
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "G3_bind_vs_shouldbind",
+      "backend": "codedb_CONTEXT",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 1400,
+        "median": 1400,
+        "stdev": 0.0,
+        "min": 1400,
+        "max": 1400
+      },
+      "wall": {
+        "n": 1,
+        "mean": 2,
+        "median": 2,
+        "stdev": 0.0,
+        "min": 2,
+        "max": 2
+      },
+      "calls": {
+        "n": 1,
+        "mean": 2,
+        "median": 2,
+        "stdev": 0.0,
+        "min": 2,
+        "max": 2
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "R0_find_iter",
+      "backend": "codedb_CONTEXT",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 950,
+        "median": 950,
+        "stdev": 0.0,
+        "min": 950,
+        "max": 950
+      },
+      "wall": {
+        "n": 1,
+        "mean": 1,
+        "median": 1,
+        "stdev": 0.0,
+        "min": 1,
+        "max": 1
+      },
+      "calls": {
+        "n": 1,
+        "mean": 1,
+        "median": 1,
+        "stdev": 0.0,
+        "min": 1,
+        "max": 1
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T0_getNextLanes",
+      "backend": "codedb_CONTEXT",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 1800,
+        "median": 1800,
+        "stdev": 0.0,
+        "min": 1800,
+        "max": 1800
+      },
+      "wall": {
+        "n": 1,
+        "mean": 1,
+        "median": 1,
+        "stdev": 0.0,
+        "min": 1,
+        "max": 1
+      },
+      "calls": {
+        "n": 1,
+        "mean": 2,
+        "median": 2,
+        "stdev": 0.0,
+        "min": 2,
+        "max": 2
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T1_setState_trace",
+      "backend": "codedb_CONTEXT",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 1500,
+        "median": 1500,
+        "stdev": 0.0,
+        "min": 1500,
+        "max": 1500
+      },
+      "wall": {
+        "n": 1,
+        "mean": 12,
+        "median": 12,
+        "stdev": 0.0,
+        "min": 12,
+        "max": 12
+      },
+      "calls": {
+        "n": 1,
+        "mean": 2,
+        "median": 2,
+        "stdev": 0.0,
+        "min": 2,
+        "max": 2
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T3_compare_two_functions",
+      "backend": "codedb_CONTEXT",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 900,
+        "median": 900,
+        "stdev": 0.0,
+        "min": 900,
+        "max": 900
+      },
+      "wall": {
+        "n": 1,
+        "mean": 3,
+        "median": 3,
+        "stdev": 0.0,
+        "min": 3,
+        "max": 3
+      },
+      "calls": {
+        "n": 1,
+        "mean": 2,
+        "median": 2,
+        "stdev": 0.0,
+        "min": 2,
+        "max": 2
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "G0_context_json",
+      "backend": "codedb_CONTEXT",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 950,
+        "median": 950,
+        "stdev": 0.0,
+        "min": 950,
+        "max": 950
+      },
+      "wall": {
+        "n": 1,
+        "mean": 1,
+        "median": 1,
+        "stdev": 0.0,
+        "min": 1,
+        "max": 1
+      },
+      "calls": {
+        "n": 1,
+        "mean": 2,
+        "median": 2,
+        "stdev": 0.0,
+        "min": 2,
+        "max": 2
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "F1_route_decorator_trace",
+      "backend": "codedb_CONTEXT",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 2100,
+        "median": 2100,
+        "stdev": 0.0,
+        "min": 2100,
+        "max": 2100
+      },
+      "wall": {
+        "n": 1,
+        "mean": 3,
+        "median": 3,
+        "stdev": 0.0,
+        "min": 3,
+        "max": 3
+      },
+      "calls": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "F3_app_vs_blueprint",
+      "backend": "codedb_CONTEXT",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 4200,
+        "median": 4200,
+        "stdev": 0.0,
+        "min": 4200,
+        "max": 4200
+      },
+      "wall": {
+        "n": 1,
+        "mean": 4,
+        "median": 4,
+        "stdev": 0.0,
+        "min": 4,
+        "max": 4
+      },
+      "calls": {
+        "n": 1,
+        "mean": 3,
+        "median": 3,
+        "stdev": 0.0,
+        "min": 3,
+        "max": 3
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "R1_pattern_compile_trace",
+      "backend": "codedb_CONTEXT",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 36000,
+        "median": 36000,
+        "stdev": 0.0,
+        "min": 36000,
+        "max": 36000
+      },
+      "wall": {
+        "n": 1,
+        "mean": 180,
+        "median": 180,
+        "stdev": 0.0,
+        "min": 180,
+        "max": 180
+      },
+      "calls": {
+        "n": 1,
+        "mean": 13,
+        "median": 13,
+        "stdev": 0.0,
+        "min": 13,
+        "max": 13
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "R2_matchkind_all_sites",
+      "backend": "codedb_CONTEXT",
+      "quality": {
+        "n": 1,
+        "mean": 4,
+        "median": 4,
+        "stdev": 0.0,
+        "min": 4,
+        "max": 4
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 4200,
+        "median": 4200,
+        "stdev": 0.0,
+        "min": 4200,
+        "max": 4200
+      },
+      "wall": {
+        "n": 1,
+        "mean": 12,
+        "median": 12,
+        "stdev": 0.0,
+        "min": 12,
+        "max": 12
+      },
+      "calls": {
+        "n": 1,
+        "mean": 9,
+        "median": 9,
+        "stdev": 0.0,
+        "min": 9,
+        "max": 9
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "R3_pikevm_vs_backtrack",
+      "backend": "codedb_CONTEXT",
+      "quality": {
+        "n": 1,
+        "mean": 4,
+        "median": 4,
+        "stdev": 0.0,
+        "min": 4,
+        "max": 4
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 2100,
+        "median": 2100,
+        "stdev": 0.0,
+        "min": 2100,
+        "max": 2100
+      },
+      "wall": {
+        "n": 1,
+        "mean": 4,
+        "median": 4,
+        "stdev": 0.0,
+        "min": 4,
+        "max": 4
+      },
+      "calls": {
+        "n": 1,
+        "mean": 6,
+        "median": 6,
+        "stdev": 0.0,
+        "min": 6,
+        "max": 6
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T2_snapshot_flag_sites",
+      "backend": "codedb_CONTEXT",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 9200,
+        "median": 9200,
+        "stdev": 0.0,
+        "min": 9200,
+        "max": 9200
+      },
+      "wall": {
+        "n": 1,
+        "mean": 45,
+        "median": 45,
+        "stdev": 0.0,
+        "min": 45,
+        "max": 45
+      },
+      "calls": {
+        "n": 1,
+        "mean": 12,
+        "median": 12,
+        "stdev": 0.0,
+        "min": 12,
+        "max": 12
       },
       "reps": [
         1
