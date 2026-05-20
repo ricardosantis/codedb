@@ -1725,7 +1725,19 @@ pub const Explorer = struct {
 
         // Tier 5: full scan fallback — only when NO results from any tier.
         // Avoids 100ms+ scans on large repos when indices already found matches.
-        if (result_list.items.len == 0) {
+        //
+        // Additional short-circuit: if the trigram index returned a non-null
+        // but EMPTY candidate set with query.len >= 3, every trigram-indexed
+        // file is provably free of the query. The only files that could still
+        // contain a match are skip_trigram_files, which Tier 3 already
+        // scanned. Tier 5 would just re-scan everything to find nothing — a
+        // measurable 100ms+ p50 cost on real corpora (see
+        // benchmarks/search-shootout, xyzzy_react_does_not_exist on react).
+        const trigram_ruled_out = if (candidate_paths) |cp|
+            (cp.len == 0 and query.len >= 3)
+        else
+            false;
+        if (result_list.items.len == 0 and !trigram_ruled_out) {
             self.search_tier5_count += 1;
             var iter = self.outlines.keyIterator();
             while (iter.next()) |key_ptr| {
