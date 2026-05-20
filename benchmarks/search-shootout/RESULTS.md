@@ -439,3 +439,85 @@ positioning argument from this whole exercise.
 - All correct answers were verified by the parent. No false-positive cases
   observed.
 
+## 10. Trying to make codedb cheaper — and proving the compression trap on our own tool
+
+After §9's finding that lean-ctx's compression hurt agents, the natural
+question: could codedb get under fts5's token bar (15.9k avg/task) with
+its own opt-in compression? We tried two flags and re-ran the eval.
+
+### The flags added in this round
+
+1. **`CODEDB_MCP_LEAN=1`** — strips the ANSI-colored summary header and
+   the guidance-hint footer from MCP responses. Block-2 raw data unchanged.
+2. **`CODEDB_QUIET=1`** — same idea for the CLI: suppresses
+   "loaded snapshot N files Yms" + "✓ N results for X" decoration.
+3. **`paths_only=true` / `--paths-only`** — emits `path:line` per result
+   without the matching line text. ~20% per-call wire savings.
+4. **`TextContent.annotations.audience`** on every block — spec-canonical
+   per MCP `2025-06-18` — lets clients strip blocks even without env vars.
+
+### Per-call wire savings (codedb_search on React)
+
+| Query | default JSON | MCP-LEAN JSON | --paths-only CLI | fts5 ref |
+|---|---|---|---|---|
+| useState | 8,764 | 8,375 (-4.4%) | 6,604 (-20%) | 3,226 |
+| forwardRef | 10,530 | 10,133 (-3.8%) | (similar) | 3,329 |
+| flushPassiveEffects | 1,531 | 1,126 (-26.5%) | (similar) | 576 |
+| Fiber | 6,649 | 6,257 (-5.9%) | (similar) | 3,701 |
+
+Lean+quiet alone gives ~5%. Adding paths_only gets us to ~20%. Still not
+under fts5 — paths_only on codedb returns longer paths (rich ranking
+surfaces deeper-nested files) and includes line numbers fts5 doesn't.
+
+### The agent-eval surprise
+
+Re-ran T1/T2/T3 with codedb agents told `--paths-only` exists and to use
+it when appropriate (decisions left to the agent):
+
+| Task | codedb default | codedb LEAN+--paths-only |
+|---|---|---|
+| T1 (setState trace) | 14 calls / 108s / 21,010 tok | 27 calls / 226s / 35,504 tok |
+| T2 (Snapshot sites) | 10 calls / 55s / 18,758 tok | 7 calls / 46s / 20,123 tok |
+| T3 (compare 2 fns) | 8 calls / 28s / 16,058 tok | 10 calls / 52s / 17,795 tok |
+| **Total** | **32 calls / 191s / 55,826 tok** | **44 calls / 324s / 73,422 tok** |
+| **Ratio** | 1.00× | **1.38× calls, 1.70× wall, 1.32× tokens** |
+
+**Codedb-lean used 32% MORE tokens than codedb-default** on the same
+tasks. The opt-in compression made agents worse on every dimension. This
+is exactly the trap we observed lean-ctx falling into in §9 — except
+we just demonstrated it ON OUR OWN TOOL by adding the flag and asking
+agents to use it.
+
+### Likely causes
+
+1. **Decision overhead.** The prompt added ~150 words of "use --paths-only
+   when appropriate" guidance. The agent burns tokens reasoning about
+   whether each search is broad-survey or detail.
+2. **Follow-up calls for context.** When --paths-only is used, the agent
+   sometimes needs a second call to see the actual line — net more turns.
+3. **Skip-trigram-files edge case.** T1's agent hit a code path where
+   search returned empty for a query in ReactFiberHooks.js (related to
+   issue #447). Burned ~15 turns recovering with word + outline. This is
+   a fluke of methodology variance but pulls the T1 numbers up.
+
+### The actual lesson
+
+Codedb's default rich response (`path:line:line_text`) is the right
+design for agent consumers. Adding compression options without changing
+defaults gives agents a foot-gun. The flag stays as opt-in for batch
+scripts and humans — but **the agent-facing default should not change**,
+and we shouldn't market compression as an agent feature even when it's
+technically available.
+
+### What's shipped
+
+- `CODEDB_MCP_LEAN` env var: useful for non-agent MCP consumers (CI
+  pipelines, log scrapers) that don't render ANSI.
+- `CODEDB_QUIET` env var: CLI equivalent.
+- `paths_only` MCP arg + `--paths-only` CLI flag: useful for path-list
+  generators; marked "NOT for agents" in the schema description.
+- `audience` annotations on all blocks: spec-canonical, lets MCP clients
+  strip user-only blocks without server cooperation.
+
+All four are opt-in. Default behavior unchanged.
+
