@@ -183,18 +183,27 @@ def render_map_elites(tasks, backends, cells):
     for niche, task_ids in niches.items():
         # For each backend, aggregate across all tasks in this niche
         row_stats = {}
+        from statistics import median as _med
+        def _agg(values):
+            # Use median when n>=3 to be robust against single-rep outliers
+            # (e.g. pre-fix-build artifacts dragging the mean).
+            return _med(values) if len(values) >= 3 else mean(values)
         for b in backends:
             qs, toks, walls = [], [], []
             for tid in task_ids:
                 c = cells.get((tid, b["id"]))
                 if not c: continue
-                if c.get("quality"): qs.append(c["quality"]["mean"])
-                if c.get("tokens"): toks.append(c["tokens"]["mean"])
-                if c.get("wall"): walls.append(c["wall"]["mean"])
+                # Use median of reps within this cell (n>=3) or mean
+                if c.get("quality"):
+                    qs.append(c["quality"].get("median", c["quality"]["mean"]))
+                if c.get("tokens"):
+                    toks.append(c["tokens"].get("median", c["tokens"]["mean"]))
+                if c.get("wall"):
+                    walls.append(c["wall"].get("median", c["wall"]["mean"]))
             if qs:
                 row_stats[b["id"]] = {
-                    "q": mean(qs), "tok": mean(toks) if toks else 0,
-                    "wall": mean(walls) if walls else 0,
+                    "q": _agg(qs), "tok": _agg(toks) if toks else 0,
+                    "wall": _agg(walls) if walls else 0,
                 }
             else:
                 row_stats[b["id"]] = None
@@ -221,15 +230,20 @@ def render_map_elites(tasks, backends, cells):
     win_tally = {b["id"]: {"q": 0, "tok": 0} for b in backends}
     for niche, task_ids in niches.items():
         row_stats = {}
+        from statistics import median as _med
+        def _agg(values):
+            return _med(values) if len(values) >= 3 else mean(values)
         for b in backends:
             qs, toks = [], []
             for tid in task_ids:
                 c = cells.get((tid, b["id"]))
                 if not c: continue
-                if c.get("quality"): qs.append(c["quality"]["mean"])
-                if c.get("tokens"): toks.append(c["tokens"]["mean"])
+                if c.get("quality"):
+                    qs.append(c["quality"].get("median", c["quality"]["mean"]))
+                if c.get("tokens"):
+                    toks.append(c["tokens"].get("median", c["tokens"]["mean"]))
             if qs:
-                row_stats[b["id"]] = {"q": mean(qs), "tok": mean(toks) if toks else 0}
+                row_stats[b["id"]] = {"q": _agg(qs), "tok": _agg(toks) if toks else 0}
         valid = [(k,v) for k,v in row_stats.items() if v]
         if valid:
             best_q_key = max(valid, key=lambda x: x[1]["q"])[0]
