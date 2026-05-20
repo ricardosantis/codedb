@@ -2928,8 +2928,11 @@ fn handleIndex(
 }
 
 fn handleFind(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
-    const query = getStr(args, "query") orelse {
-        out.appendSlice(alloc, "error: missing 'query'") catch {};
+    // Telemetry showed 71% of codedb_find calls were failing with
+    // "missing 'query'" — agents were passing `name`/`path`/`pattern`/`q`
+    // instead, misled by the "FILE-NAME search" framing. Accept aliases.
+    const query = getStr(args, "query") orelse getStr(args, "name") orelse getStr(args, "path") orelse getStr(args, "pattern") orelse getStr(args, "q") orelse {
+        out.appendSlice(alloc, "error: missing 'query' (also accepted: 'name', 'path', 'pattern', 'q')") catch {};
         appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
