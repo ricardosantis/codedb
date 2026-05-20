@@ -492,6 +492,7 @@ pub const Tool = enum {
     codedb_query,
     codedb_glob,
     codedb_ls,
+    codedb_context,
 };
 
 pub const tools_list =
@@ -502,6 +503,7 @@ pub const tools_list =
     \\{"name":"codedb_search","description":"Substring full-text search across the index (regex if regex=true). For one identifier prefer codedb_word; for a definition prefer codedb_symbol. Scope with path_glob to filter by language.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match, or regex if regex=true)"},"max_results":{"type":"integer","description":"Maximum results to return (default: 20, raise to 50 for broad surveys)"},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"},"paths_only":{"type":"boolean","description":"Return path:line per result without the matching line text — ~50% fewer tokens per call, useful for broad surveys or for budget-conscious agents (default: false)"},"regex":{"type":"boolean","description":"Treat query as regex pattern (default: false)"},"path_glob":{"type":"string","description":"Filter results to paths matching this glob, e.g. '*.zig' or 'src/**/*.zig'. Bare patterns like '*.zig' are auto-promoted to '**/*.zig' to match nested files."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
     \\{"name":"codedb_word","description":"Exact-identifier lookup via inverted index — every occurrence of one word, O(1). Use for single identifiers; use codedb_search for substrings or phrases.","inputSchema":{"type":"object","properties":{"word":{"type":"string","description":"Exact word/identifier to look up"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["word"]}},
     \\{"name":"codedb_callers","description":"Find every call site of a named symbol — fuses word-index occurrences with outline scope info. One round-trip vs codedb_word + codedb_outline-per-file. Returns {path, line, snippet, scope_name, scope_kind, scope_lines}. Excludes the symbol's own definition site.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (exact identifier match)"},"max_results":{"type":"integer","description":"Maximum call sites to return (default: 30, raise for hot symbols)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
+    \\{"name":"codedb_context","description":"Task-shaped composer: pass a natural-language task; returns ONE tight block (keywords used + symbol definitions + ranked files + top file:line snippets). Replaces 3-5 sequential search/word/symbol calls — use for first-touch orientation on a new task. For narrow follow-ups stick with codedb_search/codedb_symbol.","inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Natural-language task description (3-1024 chars). Include candidate identifiers (camelCase / snake_case) or \"quoted strings\" so the composer can extract keywords."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["task"]}},
     \\{"name":"codedb_hot","description":"Most recently modified files in the project, newest first.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","description":"Number of files to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_deps","description":"Dependency graph: who imports a file (default) or what a file imports (direction=depends_on). Set transitive=true for the full BFS blast radius.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to check dependencies for"},"direction":{"type":"string","enum":["imported_by","depends_on"],"description":"imported_by (default): who imports this file. depends_on: what this file imports."},"transitive":{"type":"boolean","description":"Follow dependency chain transitively (default: false)"},"max_depth":{"type":"integer","description":"Max traversal depth for transitive queries (default: unlimited)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
     \\{"name":"codedb_read","description":"Read file contents, optionally a line range. Run codedb_outline first to pick the range — large files burn tokens fast. Pass if_hash to skip re-reads when the file is unchanged.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"line_start":{"type":"integer","description":"Start line (1-indexed, inclusive). Omit for full file."},"line_end":{"type":"integer","description":"End line (1-indexed, inclusive). Omit to read to EOF."},"if_hash":{"type":"string","description":"Previous content hash. If unchanged, returns short 'unchanged:HASH' response."},"compact":{"type":"boolean","description":"Skip comment and blank lines (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
@@ -1101,6 +1103,7 @@ fn dispatch(
         .codedb_query => handleQuery(alloc, args, out, ctx.explorer, ctx.store),
         .codedb_glob => handleGlob(alloc, args, out, ctx.explorer),
         .codedb_ls => handleLs(alloc, args, out, ctx.explorer),
+        .codedb_context => handleContext(alloc, args, out, ctx.explorer),
     }
     appendScanProgressHint(alloc, out, tool);
 }
@@ -1602,6 +1605,204 @@ fn langHasCallSites(lang: explore_mod.Language) bool {
         else => true,
     };
 }
+
+// ── codedb_context ──────────────────────────────────────────────────────────
+// Task-shaped composer. Takes a natural-language task, extracts candidate
+// identifiers (camelCase / snake_case / "quoted strings"), and returns ONE
+// composite text block: keywords + symbol defs + ranked files + top sites.
+// Replaces 3-5 separate search/word/symbol calls; targets parity with
+// codegraph_context on per-task token economy.
+
+fn isContextIdentStart(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
+}
+fn isContextIdentCont(c: u8) bool {
+    return isContextIdentStart(c) or (c >= '0' and c <= '9');
+}
+fn looksLikeContextIdentifier(tok: []const u8) bool {
+    // Filter out sentence-leading English words ("Find", "React", "Want")
+    // that incidentally start with a capital, while keeping real identifiers.
+    // Rules:
+    //   - snake_case (any underscore)              → always pass
+    //   - all-caps acronym, 3-8 chars (API, TODO)  → pass
+    //   - camelCase / PascalCase with an internal
+    //     lower→upper transition (getNextLanes)    → pass
+    //   - everything else                          → reject
+    if (tok.len < 3) return false;
+    if (std.mem.indexOfScalar(u8, tok, '_') != null) return true;
+    var all_upper = true;
+    for (tok) |c| {
+        if (c < 'A' or c > 'Z') {
+            all_upper = false;
+            break;
+        }
+    }
+    if (all_upper) return tok.len <= 8;
+    var i: usize = 1;
+    while (i < tok.len) : (i += 1) {
+        const prev_lower = tok[i - 1] >= 'a' and tok[i - 1] <= 'z';
+        const cur_upper = tok[i] >= 'A' and tok[i] <= 'Z';
+        if (prev_lower and cur_upper) return true;
+    }
+    return false;
+}
+
+const CONTEXT_MAX_CANDIDATES: usize = 5;
+const CONTEXT_MAX_RESULTS_PER_KW: usize = 20;
+const CONTEXT_TOP_FILES: usize = 5;
+const CONTEXT_TOP_LINES_PER_FILE: usize = 3;
+
+fn extractContextCandidates(task: []const u8, alloc: std.mem.Allocator, out: *std.ArrayList([]const u8)) void {
+    var seen = std.StringHashMap(void).init(alloc);
+    defer seen.deinit();
+    var i: usize = 0;
+    while (i < task.len) {
+        const c = task[i];
+        // Quoted strings — taken literally as identifiers.
+        if (c == '"' or c == '`') {
+            const q = c;
+            const start = i + 1;
+            var j = start;
+            while (j < task.len and task[j] != q) : (j += 1) {}
+            if (j > start and j - start <= 64 and j - start >= 3) {
+                const slice = task[start..j];
+                if (!seen.contains(slice)) {
+                    seen.put(slice, {}) catch {};
+                    out.append(alloc, slice) catch {};
+                    if (out.items.len >= CONTEXT_MAX_CANDIDATES) return;
+                }
+            }
+            i = j + 1;
+            continue;
+        }
+        // Identifier-like tokens.
+        if (isContextIdentStart(c)) {
+            const start = i;
+            while (i < task.len and isContextIdentCont(task[i])) : (i += 1) {}
+            const tok = task[start..i];
+            if (tok.len >= 3 and tok.len <= 64 and looksLikeContextIdentifier(tok) and !seen.contains(tok)) {
+                seen.put(tok, {}) catch {};
+                out.append(alloc, tok) catch {};
+                if (out.items.len >= CONTEXT_MAX_CANDIDATES) return;
+            }
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn handleContext(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
+    const task = getStr(args, "task") orelse {
+        out.appendSlice(alloc, "error: missing 'task' argument") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
+        return;
+    };
+    if (task.len < 3 or task.len > 1024) {
+        out.appendSlice(alloc, "error: task must be 3-1024 chars") catch {};
+        return;
+    }
+
+    // Arena: every transient string in this handler lives here, no per-result
+    // free bookkeeping. Released at function exit.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const A = arena.allocator();
+
+    var candidates: std.ArrayList([]const u8) = .empty;
+    extractContextCandidates(task, A, &candidates);
+    if (candidates.items.len == 0) {
+        out.appendSlice(alloc, "no candidate identifiers found in task — include symbol names (camelCase or snake_case) or \"quoted strings\" so the composer can extract keywords") catch {};
+        return;
+    }
+
+    const PerFileHit = struct { line: u32, text: []const u8 };
+    const PerFile = struct {
+        total: u32 = 0,
+        top: std.ArrayList(PerFileHit) = .empty,
+    };
+    var by_file = std.StringHashMap(PerFile).init(A);
+
+    const SymRef = struct { kw: []const u8, kind: []const u8, path: []const u8, line: u32 };
+    var sym_refs: std.ArrayList(SymRef) = .empty;
+    var seen_syms = std.StringHashMap(void).init(A);
+
+    for (candidates.items) |kw| {
+        // Symbol definitions (best-effort; ignore failures).
+        if (explorer.findAllSymbols(kw, A)) |defs| {
+            const take = @min(defs.len, 3);
+            for (defs[0..take]) |d| {
+                const key = std.fmt.allocPrint(A, "{s}|{s}|{d}", .{ d.path, kw, d.symbol.line_start }) catch continue;
+                if (seen_syms.contains(key)) continue;
+                seen_syms.put(key, {}) catch continue;
+                sym_refs.append(A, .{
+                    .kw = kw,
+                    .kind = @tagName(d.symbol.kind),
+                    .path = d.path,
+                    .line = d.symbol.line_start,
+                }) catch break;
+            }
+        } else |_| {}
+
+        // Content search — small per-keyword cap keeps the arena lean.
+        const hits = explorer.searchContent(kw, A, CONTEXT_MAX_RESULTS_PER_KW) catch continue;
+        for (hits) |h| {
+            const gop = by_file.getOrPut(h.path) catch continue;
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            gop.value_ptr.total += 1;
+            if (gop.value_ptr.top.items.len < CONTEXT_TOP_LINES_PER_FILE) {
+                gop.value_ptr.top.append(A, .{ .line = h.line_num, .text = h.line_text }) catch {};
+            }
+        }
+    }
+
+    // Rank files by total hits, take top N.
+    const FileRank = struct { path: []const u8, hits: u32, top: []const PerFileHit };
+    var ranked: std.ArrayList(FileRank) = .empty;
+    var iter = by_file.iterator();
+    while (iter.next()) |entry| {
+        ranked.append(A, .{
+            .path = entry.key_ptr.*,
+            .hits = entry.value_ptr.total,
+            .top = entry.value_ptr.top.items,
+        }) catch break;
+    }
+    std.mem.sort(FileRank, ranked.items, {}, struct {
+        fn lt(_: void, a: FileRank, b: FileRank) bool {
+            return a.hits > b.hits;
+        }
+    }.lt);
+    const top_n = @min(ranked.items.len, CONTEXT_TOP_FILES);
+
+    const w = cio.listWriter(out, alloc);
+    w.print("# Task\n{s}\n\n## Keywords used\n", .{task}) catch {};
+    for (candidates.items) |k| w.print("- {s}\n", .{k}) catch {};
+
+    if (sym_refs.items.len > 0) {
+        w.print("\n## Symbol definitions\n", .{}) catch {};
+        for (sym_refs.items) |sr| {
+            w.print("- {s} ({s}) — {s}:{d}\n", .{ sr.kw, sr.kind, sr.path, sr.line }) catch {};
+        }
+    }
+
+    if (top_n == 0) {
+        out.appendSlice(alloc, "\n(no content matches — try codedb_search or codedb_word for narrower queries)\n") catch {};
+        return;
+    }
+
+    w.print("\n## Most-relevant files\n", .{}) catch {};
+    for (ranked.items[0..top_n]) |f| {
+        w.print("- {s}  ({d} matches)\n", .{ f.path, f.hits }) catch {};
+    }
+    w.print("\n## Top sites\n", .{}) catch {};
+    explorer.mu.lockShared();
+    defer explorer.mu.unlockShared();
+    for (ranked.items[0..top_n]) |f| {
+        for (f.top) |h| {
+            w.print("{s}:{d}  {s}\n", .{ f.path, h.line, h.text }) catch {};
+        }
+    }
+}
+
 
 fn handleHot(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer) void {
     const limit: usize = if (getInt(args, "limit")) |n| @intCast(@min(@max(1, n), 1000)) else 10;
