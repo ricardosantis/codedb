@@ -11550,3 +11550,85 @@ test "issue-negq: negative-query search short-circuits Tier 5 full scan" {
     // ruled out a match. On main this expectation fails (count == 1).
     try testing.expectEqual(@as(u64, 0), explorer.search_tier5_count);
 }
+
+test "issue-471a: codedb_find accepts query/name/path/pattern/q aliases" {
+    // Real-user telemetry (24h) showed 71% of codedb_find calls failing with
+    // "missing 'query'" because agents passed the search term under `name`,
+    // `path`, `pattern`, or `q` (misled by the "FILE-NAME search" framing in
+    // the tool description). Regression: every common alias must succeed.
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+    try explorer.indexFile("src/auth_middleware.go", "package auth\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    const aliases = [_][]const u8{ "query", "name", "path", "pattern", "q" };
+    for (aliases) |key| {
+        const bundle_json = try std.fmt.allocPrint(
+            testing.allocator,
+            "{{\"ops\":[{{\"tool\":\"codedb_find\",\"arguments\":{{\"{s}\":\"main\"}}}}]}}",
+            .{key},
+        );
+        defer testing.allocator.free(bundle_json);
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, bundle_json, .{});
+        defer parsed.deinit();
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        bench_ctx.runDispatch(io, testing.allocator, .codedb_bundle, &parsed.value.object, &out, &store, &explorer, &agents);
+
+        // Every alias must succeed: no "missing" error, and the matching
+        // file must appear in the response.
+        if (std.mem.indexOf(u8, out.items, "missing 'query'") != null) {
+            std.debug.print("alias '{s}' failed with: {s}\n", .{ key, out.items });
+            return error.AliasRejected;
+        }
+        try testing.expect(std.mem.indexOf(u8, out.items, "main.zig") != null);
+    }
+}
+
+test "issue-471b: codedb_find error message enumerates accepted aliases" {
+    // If an agent calls codedb_find with no recognized key, the error message
+    // must enumerate the accepted aliases so the agent can self-correct on
+    // the next call instead of repeating the same broken call.
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    const bundle_json =
+        \\{"ops":[{"tool":"codedb_find","arguments":{"bogus":"main"}}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, bundle_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_bundle, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // Error must enumerate the alias list so the agent can self-correct.
+    try testing.expect(std.mem.indexOf(u8, out.items, "missing 'query'") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "name") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "path") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "pattern") != null);
+}
+
