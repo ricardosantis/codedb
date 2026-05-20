@@ -10,6 +10,7 @@ Writes:
 import json, sys
 from pathlib import Path
 from collections import defaultdict
+NL = chr(10)
 from statistics import mean, median, stdev
 
 HERE = Path(__file__).resolve().parent
@@ -158,12 +159,99 @@ def render_markdown(tasks, backends, cells):
     out.append("")
     return "\n".join(out)
 
+def render_map_elites(tasks, backends, cells):
+    """MAP-Elites style grid: rows = behavioral niches (query_type), cols =
+    backends. Each cell shows the (quality, tokens, wall) achieved on tasks
+    matching that niche, aggregated across reps."""
+    # Group tasks by niche (query_type axis); if a task has no `niche` field,
+    # bucket under "uncategorized".
+    niches = {}
+    for t in tasks:
+        niche_key = t.get("niche", {}).get("query_type", "uncategorized")
+        niches.setdefault(niche_key, []).append(t["id"])
+
+    out = []
+    out.append("## MAP-Elites grid")
+    out.append("")
+    out.append("Rows = behavioral niche (`query_type`). Cols = backend.")
+    out.append("Each cell shows aggregated (quality / tokens / wall) over tasks in that niche.")
+    out.append("**Bold** = best in row on quality; *italic* = best in row on tokens.")
+    out.append("")
+    header = ["niche"] + [b["id"] for b in backends]
+    out.append("| " + " | ".join(header) + " |")
+    out.append("|" + "---|" * len(header))
+    for niche, task_ids in niches.items():
+        # For each backend, aggregate across all tasks in this niche
+        row_stats = {}
+        for b in backends:
+            qs, toks, walls = [], [], []
+            for tid in task_ids:
+                c = cells.get((tid, b["id"]))
+                if not c: continue
+                if c.get("quality"): qs.append(c["quality"]["mean"])
+                if c.get("tokens"): toks.append(c["tokens"]["mean"])
+                if c.get("wall"): walls.append(c["wall"]["mean"])
+            if qs:
+                row_stats[b["id"]] = {
+                    "q": mean(qs), "tok": mean(toks) if toks else 0,
+                    "wall": mean(walls) if walls else 0,
+                }
+            else:
+                row_stats[b["id"]] = None
+        # Find best quality + best tokens in row
+        valid = [(k,v) for k,v in row_stats.items() if v]
+        best_q = max(valid, key=lambda x: x[1]["q"])[0] if valid else None
+        best_t = min(valid, key=lambda x: x[1]["tok"] if x[1]["tok"] > 0 else 1e18)[0] if valid else None
+        cells_row = [f"`{niche}` ({len(task_ids)} task{'s' if len(task_ids)>1 else ''})"]
+        for b in backends:
+            s = row_stats[b["id"]]
+            if not s:
+                cells_row.append("—"); continue
+            q_str = f"{s['q']:.2f}"
+            t_str = f"{s['tok']:,.0f}"
+            w_str = f"{s['wall']:.1f}s"
+            if b["id"] == best_q: q_str = f"**{q_str}**"
+            if b["id"] == best_t: t_str = f"*{t_str}*"
+            cells_row.append(f"{q_str} / {t_str} / {w_str}")
+        out.append("| " + " | ".join(cells_row) + " |")
+    out.append("")
+    # Tally "wins" per backend
+    out.append("### Niche wins per backend")
+    out.append("")
+    win_tally = {b["id"]: {"q": 0, "tok": 0} for b in backends}
+    for niche, task_ids in niches.items():
+        row_stats = {}
+        for b in backends:
+            qs, toks = [], []
+            for tid in task_ids:
+                c = cells.get((tid, b["id"]))
+                if not c: continue
+                if c.get("quality"): qs.append(c["quality"]["mean"])
+                if c.get("tokens"): toks.append(c["tokens"]["mean"])
+            if qs:
+                row_stats[b["id"]] = {"q": mean(qs), "tok": mean(toks) if toks else 0}
+        valid = [(k,v) for k,v in row_stats.items() if v]
+        if valid:
+            best_q_key = max(valid, key=lambda x: x[1]["q"])[0]
+            best_t_key = min(valid, key=lambda x: x[1]["tok"] if x[1]["tok"] > 0 else 1e18)[0]
+            win_tally[best_q_key]["q"] += 1
+            win_tally[best_t_key]["tok"] += 1
+    out.append("| backend | niches won on quality | niches won on tokens |")
+    out.append("|---|---|---|")
+    for b in backends:
+        out.append(f"| {b['id']} | {win_tally[b['id']]['q']} | {win_tally[b['id']]['tok']} |")
+    out.append("")
+    return NL.join(out)
+
+
 def main():
     tasks, backends, scores, answers = load()
     cells = build_matrix(tasks, backends, scores, answers)
     md_path = HERE / "qd_matrix.md"
     js_path = HERE / "qd_matrix.json"
-    md_path.write_text(render_markdown(tasks, backends, cells))
+    md_content = render_markdown(tasks, backends, cells)
+    me_content = render_map_elites(tasks, backends, cells)
+    md_path.write_text(md_content + chr(10) + me_content)
     js_path.write_text(json.dumps({
         "tasks": [t["id"] for t in tasks],
         "backends": [b["id"] for b in backends],
