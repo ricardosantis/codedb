@@ -325,7 +325,21 @@ fn writeLanguages(writer: anytype, language_mask: u32) !void {
     }
 }
 
+/// Cache for approxIndexSizeBytes — the iteration is O(unique-trigrams +
+/// unique-words + sparse-ngrams) which got 2x slower after the trigram cap
+/// was lifted to 1MB (more files indexed). codedb_status is the only caller
+/// and a 5-second stale-tolerance is fine for a "this is approximate"
+/// memory metric.
+var size_cache_value: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var size_cache_at_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0);
+const SIZE_CACHE_TTL_MS: i64 = 5_000;
+
 pub fn approxIndexSizeBytes(explorer: *const explore.Explorer) u64 {
+    const now = cio.milliTimestamp();
+    const cached_at = size_cache_at_ms.load(.monotonic);
+    if (cached_at != 0 and now - cached_at < SIZE_CACHE_TTL_MS) {
+        return size_cache_value.load(.monotonic);
+    }
     var total: u64 = 0;
 
     var word_iter = explorer.word_index.index.iterator();
@@ -365,5 +379,7 @@ pub fn approxIndexSizeBytes(explorer: *const explore.Explorer) u64 {
         total +|= entry.value_ptr.items.len * @sizeOf(@TypeOf(entry.value_ptr.items[0]));
     }
 
+    size_cache_value.store(total, .monotonic);
+    size_cache_at_ms.store(now, .monotonic);
     return total;
 }
