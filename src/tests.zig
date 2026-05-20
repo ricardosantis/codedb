@@ -11514,3 +11514,39 @@ test "issue-208: content cache evicts cold entries under pressure" {
     const s = cache.stats();
     try testing.expect(s.evictions > 0);
 }
+
+test "issue-negq: negative-query search short-circuits Tier 5 full scan" {
+    // When a query contains trigrams that no indexed file contains (a
+    // definitively-negative query), searchContent should return [] without
+    // running the Tier 5 full-scan fallback. On the buggy path Tier 5 fires
+    // anyway, scanning every outline — measurable as 100ms+ p50 on real
+    // codebases (see benchmarks/search-shootout, react corpus).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    // Index enough files that Tier 5 would be observably wasteful if it ran.
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buf, "file_{d}.zig", .{i});
+        try explorer.indexFile(path, "fn process() void { _ = thing; }\n");
+    }
+
+    // 'zzqqxxnopematch' — trigrams 'zzq','zqq','qqx',... none of which appear
+    // in any indexed file. The trigram index can definitively rule this out
+    // without any content scan.
+    const results = try explorer.searchContent("zzqqxxnopematch", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.line_text);
+            testing.allocator.free(r.path);
+        }
+        testing.allocator.free(results);
+    }
+
+    try testing.expectEqual(@as(usize, 0), results.len);
+    // The fix: Tier 5 must NOT fire when the trigram index has already
+    // ruled out a match. On main this expectation fails (count == 1).
+    try testing.expectEqual(@as(u64, 0), explorer.search_tier5_count);
+}

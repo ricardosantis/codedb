@@ -499,7 +499,7 @@ pub const tools_list =
     \\{"name":"codedb_tree","description":"Whole-repo file tree with per-file language, line counts, and symbol counts. Use to orient in an unfamiliar project.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_outline","description":"Symbol outline of one file: functions, structs, enums, imports, consts with line numbers. 4-15x smaller than reading the raw file. Run before codedb_read to find the lines you actually need.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"compact":{"type":"boolean","description":"Condensed format without detail comments (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
     \\{"name":"codedb_symbol","description":"Find where a named symbol is defined across the index. Returns file, line, and kind. Pass body=true for source. Pick this over codedb_search when you have an exact identifier.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name to search for (exact match)"},"body":{"type":"boolean","description":"Include source body for each symbol (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
-    \\{"name":"codedb_search","description":"Substring full-text search across the index (regex if regex=true). For one identifier prefer codedb_word; for a definition prefer codedb_symbol. Scope with path_glob to filter by language.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match, or regex if regex=true)"},"max_results":{"type":"integer","description":"Maximum results to return (default: 50, start with 10 for broad queries)"},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"},"regex":{"type":"boolean","description":"Treat query as regex pattern (default: false)"},"path_glob":{"type":"string","description":"Filter results to paths matching this glob, e.g. '*.zig' or 'src/**/*.zig'. Bare patterns like '*.zig' are auto-promoted to '**/*.zig' to match nested files."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
+    \\{"name":"codedb_search","description":"Substring full-text search across the index (regex if regex=true). For one identifier prefer codedb_word; for a definition prefer codedb_symbol. Scope with path_glob to filter by language.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match, or regex if regex=true)"},"max_results":{"type":"integer","description":"Maximum results to return (default: 50, start with 10 for broad queries)"},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"},"paths_only":{"type":"boolean","description":"Return path:line per result without the matching line text — ~50% fewer tokens per call, useful for broad surveys or for budget-conscious agents (default: false)"},"regex":{"type":"boolean","description":"Treat query as regex pattern (default: false)"},"path_glob":{"type":"string","description":"Filter results to paths matching this glob, e.g. '*.zig' or 'src/**/*.zig'. Bare patterns like '*.zig' are auto-promoted to '**/*.zig' to match nested files."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
     \\{"name":"codedb_word","description":"Exact-identifier lookup via inverted index — every occurrence of one word, O(1). Use for single identifiers; use codedb_search for substrings or phrases.","inputSchema":{"type":"object","properties":{"word":{"type":"string","description":"Exact word/identifier to look up"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["word"]}},
     \\{"name":"codedb_callers","description":"Find every call site of a named symbol — fuses word-index occurrences with outline scope info. One round-trip vs codedb_word + codedb_outline-per-file. Returns {path, line, snippet, scope_name, scope_kind, scope_lines}. Excludes the symbol's own definition site.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (exact identifier match)"},"max_results":{"type":"integer","description":"Maximum call sites to return (default: 50)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
     \\{"name":"codedb_hot","description":"Most recently modified files in the project, newest first.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","description":"Number of files to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
@@ -997,42 +997,52 @@ fn handleCall(
     }
     if (is_notification) return;
 
-    // Block 1: Human-readable colored summary (ANSI — preview pane always renders it)
+    const lean = mcpLeanMode();
+
+    // Block 1: Human-readable colored summary (ANSI — preview pane always
+    // renders it). Skipped in lean mode (agents don't render ANSI; the
+    // summary duplicates info that's already in Block 2).
     var summary: std.ArrayList(u8) = .empty;
     defer summary.deinit(alloc);
-    summary.ensureTotalCapacity(alloc, 256) catch {};
-    summary.appendSlice(alloc, if (is_error) MCP_RED ++ MCP_CROSS ++ " " ++ MCP_RESET else MCP_GREEN ++ MCP_CHECK ++ " " ++ MCP_RESET) catch {};
-    summary.appendSlice(alloc, mcpToolIcon(name)) catch {};
-    mcpGenerateSummary(alloc, name, args, out.items, is_error, &summary);
-    var dur_buf: [96]u8 = undefined;
-    summary.appendSlice(alloc, mcpFormatDuration(&dur_buf, elapsed)) catch {};
+    if (!lean) {
+        summary.ensureTotalCapacity(alloc, 256) catch {};
+        summary.appendSlice(alloc, if (is_error) MCP_RED ++ MCP_CROSS ++ " " ++ MCP_RESET else MCP_GREEN ++ MCP_CHECK ++ " " ++ MCP_RESET) catch {};
+        summary.appendSlice(alloc, mcpToolIcon(name)) catch {};
+        mcpGenerateSummary(alloc, name, args, out.items, is_error, &summary);
+        var dur_buf: [96]u8 = undefined;
+        summary.appendSlice(alloc, mcpFormatDuration(&dur_buf, elapsed)) catch {};
+    }
 
-    // Block 3: Guidance hints
+    // Block 3: Guidance hints. Skipped in lean mode for same reason.
     var guidance: std.ArrayList(u8) = .empty;
     defer guidance.deinit(alloc);
-    mcpGenerateGuidance(alloc, name, args, out.items, is_error, &guidance);
+    if (!lean) {
+        mcpGenerateGuidance(alloc, name, args, out.items, is_error, &guidance);
+    }
 
-    // Assemble 3-block MCP content envelope
+    // Assemble MCP content envelope (1 block in lean mode, up to 3 otherwise).
     var result: std.ArrayList(u8) = .empty;
     defer result.deinit(alloc);
     result.ensureTotalCapacity(alloc, out.items.len + summary.items.len + guidance.items.len + 256) catch {};
     result.appendSlice(alloc, "{\"content\":[") catch return;
 
-    // Block 1 (summary)
+    // Block 1 (summary — audience: user; spec-canonical signal that
+    // token-conscious clients can strip)
     if (summary.items.len > 0) {
-        result.appendSlice(alloc, "{\"type\":\"text\",\"text\":\"") catch return;
+        result.appendSlice(alloc, "{\"type\":\"text\",\"annotations\":{\"audience\":[\"user\"]},\"text\":\"") catch return;
         mcpj.writeEscaped(alloc, &result, summary.items);
         result.appendSlice(alloc, "\"},") catch return;
     }
 
-    // Block 2 (raw data — no colors, zero extra tokens to model)
-    result.appendSlice(alloc, "{\"type\":\"text\",\"text\":\"") catch return;
+    // Block 2 (raw data — audience: assistant; this is what the model
+    // actually consumes)
+    result.appendSlice(alloc, "{\"type\":\"text\",\"annotations\":{\"audience\":[\"assistant\"]},\"text\":\"") catch return;
     mcpj.writeEscaped(alloc, &result, out.items);
     result.appendSlice(alloc, "\"}") catch return;
 
-    // Block 3 (guidance)
+    // Block 3 (guidance — audience: user)
     if (guidance.items.len > 0) {
-        result.appendSlice(alloc, ",{\"type\":\"text\",\"text\":\"") catch return;
+        result.appendSlice(alloc, ",{\"type\":\"text\",\"annotations\":{\"audience\":[\"user\"]},\"text\":\"") catch return;
         mcpj.writeEscaped(alloc, &result, guidance.items);
         result.appendSlice(alloc, "\"}") catch return;
     }
@@ -1229,6 +1239,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
     const max_results: usize = if (getInt(args, "max_results")) |n| @intCast(@max(1, @min(n, 10000))) else 50;
     const scope = getBool(args, "scope");
     const compact = getBool(args, "compact");
+    const paths_only = getBool(args, "paths_only");
     const is_regex = getBool(args, "regex");
     const path_glob_raw = getStr(args, "path_glob");
     // Auto-promote basename-only patterns ('*.zig') to '**/*.zig' so they match
@@ -1272,12 +1283,18 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         for (results) |r| {
             if (path_glob) |g| if (!globMatch(g, r.path)) continue;
             if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
-            if (r.scope_name) |sn| {
+            if (paths_only) {
+                w.print("  {s}:{d}\n", .{ r.path, r.line_num }) catch {};
+            } else if (r.scope_name) |sn| {
                 w.print("  {s}:{d}: {s}  [in {s} ({s}, L{d}-L{d})]\n", .{
                     r.path, r.line_num, r.line_text, sn, @tagName(r.scope_kind.?), r.scope_start, r.scope_end,
                 }) catch {};
             } else {
-                w.print("  {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+                if (paths_only) {
+                    w.print("  {s}:{d}\n", .{ r.path, r.line_num }) catch {};
+                } else {
+                    w.print("  {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+                }
             }
         }
     } else if (scope) {
@@ -1322,12 +1339,18 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
                 }
                 continue;
             }
-            if (r.scope_name) |sn| {
+            if (paths_only) {
+                w.print("  {s}:{d}\n", .{ r.path, r.line_num }) catch {};
+            } else if (r.scope_name) |sn| {
                 w.print("  {s}:{d}: {s}  [in {s} ({s}, L{d}-L{d})]\n", .{
                     r.path, r.line_num, r.line_text, sn, @tagName(r.scope_kind.?), r.scope_start, r.scope_end,
                 }) catch {};
             } else {
-                w.print("  {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+                if (paths_only) {
+                    w.print("  {s}:{d}\n", .{ r.path, r.line_num }) catch {};
+                } else {
+                    w.print("  {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+                }
             }
             shown += 1;
         }
@@ -1374,7 +1397,11 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
                 }
                 continue;
             }
-            w.print("  {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+            if (paths_only) {
+                w.print("  {s}:{d}\n", .{ r.path, r.line_num }) catch {};
+            } else {
+                w.print("  {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+            }
             shown += 1;
         }
         if (shown < visible_total) {
@@ -1420,7 +1447,11 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
                 }
                 continue;
             }
-            w.print("  {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+            if (paths_only) {
+                w.print("  {s}:{d}\n", .{ r.path, r.line_num }) catch {};
+            } else {
+                w.print("  {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+            }
             shown += 1;
         }
         if (shown < visible_total) {
@@ -3527,6 +3558,24 @@ pub fn appendId(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), id: ?std.json
 
 // ── MCP UX: 3-block response helpers ────────────────────────────────────────
 // Colors are always on — MCP preview pane always renders ANSI. No TTY check.
+
+var mcp_lean_mode_cached: ?bool = null;
+
+/// True when CODEDB_MCP_LEAN is set (any non-empty value). Cached on first
+/// read. When true, MCP responses omit Block 1 (colored summary header) and
+/// Block 3 (guidance hints) — emitting only Block 2 (raw data). Saves
+/// tokens for agent consumers that can't render ANSI and don't need the
+/// hints.
+fn mcpLeanMode() bool {
+    if (mcp_lean_mode_cached) |v| return v;
+    const v = cio.posixGetenv("CODEDB_MCP_LEAN") orelse {
+        mcp_lean_mode_cached = false;
+        return false;
+    };
+    const enabled = v.len > 0 and !std.mem.eql(u8, v, "0") and !std.mem.eql(u8, v, "false");
+    mcp_lean_mode_cached = enabled;
+    return enabled;
+}
 
 const MCP_RESET = "\x1b[0m";
 const MCP_BOLD = "\x1b[1m";
