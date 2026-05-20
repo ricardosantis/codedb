@@ -138,40 +138,41 @@
       "task": "T1_setState_trace",
       "backend": "codedb",
       "quality": {
-        "n": 2,
-        "mean": 4.5,
-        "median": 4.5,
-        "stdev": 0.7071067811865476,
+        "n": 3,
+        "mean": 4.666666666666667,
+        "median": 5,
+        "stdev": 0.5773502691896257,
         "min": 4,
         "max": 5
       },
       "tokens": {
-        "n": 2,
-        "mean": 18324,
-        "median": 18324.0,
-        "stdev": 3798.5776285341335,
+        "n": 3,
+        "mean": 18253,
+        "median": 18111,
+        "stdev": 2688.813678929799,
         "min": 15638,
         "max": 21010
       },
       "wall": {
-        "n": 2,
-        "mean": 67,
-        "median": 67.0,
-        "stdev": 57.982756057296896,
+        "n": 3,
+        "mean": 59.666666666666664,
+        "median": 45,
+        "stdev": 42.922410618851934,
         "min": 26,
         "max": 108
       },
       "calls": {
-        "n": 2,
-        "mean": 10,
-        "median": 10.0,
-        "stdev": 5.656854249492381,
+        "n": 3,
+        "mean": 11.333333333333334,
+        "median": 14,
+        "stdev": 4.618802153517006,
         "min": 6,
         "max": 14
       },
       "reps": [
         1,
-        2
+        2,
+        3
       ]
     },
     {
@@ -295,41 +296,43 @@
       "task": "T2_snapshot_flag_sites",
       "backend": "codedb",
       "quality": {
-        "n": 3,
-        "mean": 3.6666666666666665,
+        "n": 5,
+        "mean": 4,
         "median": 4,
-        "stdev": 0.5773502691896257,
+        "stdev": 0.7071067811865476,
         "min": 3,
-        "max": 4
+        "max": 5
       },
       "tokens": {
-        "n": 3,
-        "mean": 15129.333333333334,
-        "median": 14193,
-        "stdev": 3262.866888693643,
+        "n": 5,
+        "mean": 15967.2,
+        "median": 16287,
+        "stdev": 2660.53062376662,
         "min": 12437,
         "max": 18758
       },
       "wall": {
-        "n": 3,
-        "mean": 22.666666666666668,
+        "n": 5,
+        "mean": 24.4,
         "median": 11,
-        "stdev": 28.36077102854105,
+        "stdev": 24.2548964128895,
         "min": 2,
         "max": 55
       },
       "calls": {
-        "n": 3,
-        "mean": 5,
-        "median": 3,
-        "stdev": 4.358898943540674,
+        "n": 5,
+        "mean": 6,
+        "median": 5,
+        "stdev": 3.8078865529319543,
         "min": 2,
         "max": 10
       },
       "reps": [
         1,
         2,
-        4
+        4,
+        5,
+        6
       ]
     },
     {
@@ -727,39 +730,40 @@
       "task": "R1_pattern_compile_trace",
       "backend": "codedb",
       "quality": {
-        "n": 1,
-        "mean": 4,
-        "median": 4,
-        "stdev": 0.0,
+        "n": 2,
+        "mean": 4.5,
+        "median": 4.5,
+        "stdev": 0.7071067811865476,
         "min": 4,
-        "max": 4
+        "max": 5
       },
       "tokens": {
-        "n": 1,
-        "mean": 24156,
-        "median": 24156,
-        "stdev": 0.0,
+        "n": 2,
+        "mean": 25734,
+        "median": 25734.0,
+        "stdev": 2231.629001424744,
         "min": 24156,
-        "max": 24156
+        "max": 27312
       },
       "wall": {
-        "n": 1,
-        "mean": 49,
-        "median": 49,
-        "stdev": 0.0,
-        "min": 49,
+        "n": 2,
+        "mean": 29.5,
+        "median": 29.5,
+        "stdev": 27.577164466275352,
+        "min": 10,
         "max": 49
       },
       "calls": {
-        "n": 1,
-        "mean": 9,
-        "median": 9,
-        "stdev": 0.0,
+        "n": 2,
+        "mean": 10,
+        "median": 10.0,
+        "stdev": 1.4142135623730951,
         "min": 9,
-        "max": 9
+        "max": 11
       },
       "reps": [
-        1
+        1,
+        2
       ]
     },
     {
@@ -844,39 +848,40 @@
       "task": "R2_matchkind_all_sites",
       "backend": "codedb",
       "quality": {
-        "n": 1,
+        "n": 2,
         "mean": 4,
-        "median": 4,
+        "median": 4.0,
         "stdev": 0.0,
         "min": 4,
         "max": 4
       },
       "tokens": {
-        "n": 1,
-        "mean": 12867,
-        "median": 12867,
-        "stdev": 0.0,
+        "n": 2,
+        "mean": 15251,
+        "median": 15251.0,
+        "stdev": 3371.4851326974585,
         "min": 12867,
-        "max": 12867
+        "max": 17635
       },
       "wall": {
-        "n": 1,
-        "mean": 1,
-        "median": 1,
-        "stdev": 0.0,
+        "n": 2,
+        "mean": 2,
+        "median": 2.0,
+        "stdev": 1.4142135623730951,
         "min": 1,
-        "max": 1
+        "max": 3
       },
       "calls": {
-        "n": 1,
-        "mean": 1,
-        "median": 1,
-        "stdev": 0.0,
+        "n": 2,
+        "mean": 3.5,
+        "median": 3.5,
+        "stdev": 3.5355339059327378,
         "min": 1,
-        "max": 1
+        "max": 6
       },
       "reps": [
-        1
+        1,
+        2
       ]
     },
     {

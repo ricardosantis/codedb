@@ -382,5 +382,65 @@
     "task": "T3_compare_two_functions",
     "backend": "codedb",
     "rep": 2
+  },
+  {
+    "file": 1,
+    "function": 1,
+    "snippet": 1,
+    "explanation": 1,
+    "completeness": 1,
+    "total": 5,
+    "notes": "All key parts match ground truth; agent correctly identifies delegation to RegexBuilder, meta::Regex construction via HIR, and strategy::new dispatch, with plausible verified-line-number quotes \u2014 minor elision of the explicit AST step doesn't cost a point since the task description only requires 'parsing \u2192 HIR' not explicitly the Ast intermediate.",
+    "task": "R1_pattern_compile_trace",
+    "backend": "codedb",
+    "rep": 2
+  },
+  {
+    "file": 1,
+    "function": 1,
+    "snippet": 0,
+    "explanation": 1,
+    "completeness": 1,
+    "total": 4,
+    "notes": "Files and functions are plausible real code locations, but snippets 1 and 3 show dangling method calls with no receiver, suggesting reformatted/paraphrased extracts rather than faithful quotes.",
+    "task": "R2_matchkind_all_sites",
+    "backend": "codedb",
+    "rep": 2
+  },
+  {
+    "file": 1,
+    "function": 1,
+    "snippet": 1,
+    "explanation": 1,
+    "completeness": 1,
+    "total": 5,
+    "notes": "All fields match ground truth exactly: correct file/function, authentic snippet with real React variable names at plausible line numbers, and trace that matches the ground truth call chain verbatim.",
+    "task": "T1_setState_trace",
+    "backend": "codedb",
+    "rep": 3
+  },
+  {
+    "file": 1,
+    "function": 1,
+    "snippet": 1,
+    "explanation": 0,
+    "completeness": 1,
+    "total": 4,
+    "notes": "Lines and files are all correct, but the branch context descriptions for lines 1147 and 1165 are swapped (agent labels 1147 as 'shouldComponentUpdate false branch' when ground truth says shouldUpdate=true, and vice versa for 1165).",
+    "task": "T2_snapshot_flag_sites",
+    "backend": "codedb",
+    "rep": 5
+  },
+  {
+    "file": 1,
+    "function": 1,
+    "snippet": 1,
+    "explanation": 1,
+    "completeness": 1,
+    "total": 5,
+    "notes": "Agent hit all three primary sites plus bonus site with correct line numbers, function names, and accurate branch-level context descriptions matching ground truth exactly.",
+    "task": "T2_snapshot_flag_sites",
+    "backend": "codedb",
+    "rep": 6
   }
 ]
