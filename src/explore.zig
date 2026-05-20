@@ -521,6 +521,11 @@ pub const Explorer = struct {
     /// to this path (v0 rerank-trace experiment). Borrowed; caller owns
     /// the slice for the Explorer's lifetime.
     rerank_trace_path: ?[]const u8 = null,
+    /// Test-only counter: incremented each time the Tier 5 full-scan
+    /// fallback in searchContent fires. Used by perf regression tests to
+    /// assert the short-circuit holds (issue: negative-query slow path).
+    /// Production code does not read this field.
+    search_tier5_count: u64 = 0,
 
     pub fn setRoot(self: *Explorer, io: std.Io, root_path: []const u8) void {
         self.io = io;
@@ -1721,6 +1726,7 @@ pub const Explorer = struct {
         // Tier 5: full scan fallback — only when NO results from any tier.
         // Avoids 100ms+ scans on large repos when indices already found matches.
         if (result_list.items.len == 0) {
+            self.search_tier5_count += 1;
             var iter = self.outlines.keyIterator();
             while (iter.next()) |key_ptr| {
                 if (searched.contains(key_ptr.*)) continue;
