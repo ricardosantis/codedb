@@ -1,0 +1,115 @@
+[
+  {
+    "id": "T0_getNextLanes",
+    "title": "Find getNextLanes",
+    "prompt": "Find the function in React's reconciler that decides which lanes to render next when the scheduler picks up work. Report file path, exact function name, a 3-8 line snippet from the function body showing the lane selection logic, and one sentence on what makes a lane eligible.",
+    "ground_truth": {
+      "file": "packages/react-reconciler/src/ReactFiberLane.js",
+      "function": "getNextLanes",
+      "key_facts": [
+        "function defined around line 249",
+        "selection flow: nonIdleUnblockedLanes = nonIdlePendingLanes & ~suspendedLanes",
+        "then getHighestPriorityLanes() to narrow to top-priority subset",
+        "falls back to pingedLanes if unblocked is empty"
+      ]
+    },
+    "answer_shape": {
+      "file": "<relative path>",
+      "function": "<name>",
+      "snippet": "<3-8 lines from source>",
+      "eligibility": "<one sentence>"
+    }
+  },
+  {
+    "id": "T1_setState_trace",
+    "title": "Trace setState to fiber scheduling",
+    "prompt": "When useState's setter (`setX(v)`) is called, what eventually triggers React to schedule a re-render? Find the function responsible for scheduling work on the fiber. Report file, function, 3-5 line snippet, and a 2-3 sentence trace from setState to scheduling.",
+    "ground_truth": {
+      "file": "packages/react-reconciler/src/ReactFiberWorkLoop.js",
+      "function": "scheduleUpdateOnFiber",
+      "key_facts": [
+        "chain: dispatchSetState -> dispatchSetStateInternal -> enqueueConcurrentHookUpdate -> scheduleUpdateOnFiber -> ensureRootIsScheduled",
+        "dispatchSetState in ReactFiberHooks.js (~line 3598)",
+        "scheduleUpdateOnFiber in ReactFiberWorkLoop.js (~line 973)",
+        "ensureRootIsScheduled in ReactFiberRootScheduler.js"
+      ]
+    },
+    "answer_shape": {
+      "file": "<relative path>",
+      "function": "<name>",
+      "snippet": "<3-5 lines>",
+      "trace": "<2-3 sentences>"
+    }
+  },
+  {
+    "id": "T2_snapshot_flag_sites",
+    "title": "Find Snapshot-flag call sites",
+    "prompt": "Find places in React's reconciler where a Fiber's `flags` field gets the `Snapshot` flag set (bitwise OR with the Snapshot constant). Report 2-3 distinct call sites with file + line + one-line context, plus a one-sentence explanation of what the Snapshot flag does.",
+    "ground_truth": {
+      "primary_sites": [
+        {
+          "file": "packages/react-reconciler/src/ReactFiberClassComponent.js",
+          "line": 1093,
+          "context": "updateClassInstance bail-out path: getSnapshotBeforeUpdate exists + props/state unchanged"
+        },
+        {
+          "file": "packages/react-reconciler/src/ReactFiberClassComponent.js",
+          "line": 1147,
+          "context": "updateClassInstance shouldUpdate=true path: getSnapshotBeforeUpdate defined"
+        },
+        {
+          "file": "packages/react-reconciler/src/ReactFiberClassComponent.js",
+          "line": 1165,
+          "context": "updateClassInstance else branch (shouldUpdate=false with later check)"
+        }
+      ],
+      "bonus_site": {
+        "file": "packages/react-reconciler/src/ReactFiberCompleteWork.js",
+        "line": 1164,
+        "context": "host root reverted to client render from hydration"
+      },
+      "purpose": "Snapshot flag schedules getSnapshotBeforeUpdate lifecycle to run pre-commit, capturing DOM state before mutations are applied."
+    },
+    "answer_shape": {
+      "sites": [
+        {
+          "file": "<path>",
+          "line": "<int>",
+          "context": "<one-line>"
+        }
+      ],
+      "purpose": "<one sentence>"
+    }
+  },
+  {
+    "id": "T3_compare_two_functions",
+    "title": "Compare processUpdateQueue and prepareFreshStack",
+    "prompt": "Compare two reconciler functions: `processUpdateQueue` and `prepareFreshStack`. For each, find its file + function name and write a one-sentence description of what it does. Then write a one-sentence comparison of when each is called.",
+    "ground_truth": {
+      "A": {
+        "file": "packages/react-reconciler/src/ReactFiberClassUpdateQueue.js",
+        "function": "processUpdateQueue",
+        "does": "Iterates the pending update queue on a fiber, applies each update in priority lane order, computes new memoizedState."
+      },
+      "B": {
+        "file": "packages/react-reconciler/src/ReactFiberWorkLoop.js",
+        "function": "prepareFreshStack",
+        "does": "Resets the work loop and creates a fresh work-in-progress fiber tree before a render attempt."
+      },
+      "comparison": "prepareFreshStack runs once per render pass (in performWorkOnRoot / error-retry paths); processUpdateQueue runs per-fiber during beginWork."
+    },
+    "answer_shape": {
+      "A": {
+        "file": "<path>",
+        "function": "processUpdateQueue",
+        "does": "<one sentence>"
+      },
+      "B": {
+        "file": "<path>",
+        "function": "prepareFreshStack",
+        "does": "<one sentence>"
+      },
+      "comparison": "<one sentence>"
+    }
+  }
+]

@@ -1,0 +1,601 @@
+{
+  "tasks": [
+    "T0_getNextLanes",
+    "T1_setState_trace",
+    "T2_snapshot_flag_sites",
+    "T3_compare_two_functions"
+  ],
+  "backends": [
+    "codedb",
+    "codedb_LEAN",
+    "fts5_trigram",
+    "leanctx"
+  ],
+  "cells": [
+    {
+      "task": "T0_getNextLanes",
+      "backend": "codedb",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 22598,
+        "median": 22598,
+        "stdev": 0.0,
+        "min": 22598,
+        "max": 22598
+      },
+      "wall": {
+        "n": 1,
+        "mean": 44,
+        "median": 44,
+        "stdev": 0.0,
+        "min": 44,
+        "max": 44
+      },
+      "calls": {
+        "n": 1,
+        "mean": 10,
+        "median": 10,
+        "stdev": 0.0,
+        "min": 10,
+        "max": 10
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T0_getNextLanes",
+      "backend": "fts5_trigram",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 14523,
+        "median": 14523,
+        "stdev": 0.0,
+        "min": 14523,
+        "max": 14523
+      },
+      "wall": {
+        "n": 1,
+        "mean": 25,
+        "median": 25,
+        "stdev": 0.0,
+        "min": 25,
+        "max": 25
+      },
+      "calls": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T0_getNextLanes",
+      "backend": "leanctx",
+      "quality": {
+        "n": 1,
+        "mean": 4,
+        "median": 4,
+        "stdev": 0.0,
+        "min": 4,
+        "max": 4
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 21212,
+        "median": 21212,
+        "stdev": 0.0,
+        "min": 21212,
+        "max": 21212
+      },
+      "wall": {
+        "n": 1,
+        "mean": 123,
+        "median": 123,
+        "stdev": 0.0,
+        "min": 123,
+        "max": 123
+      },
+      "calls": {
+        "n": 1,
+        "mean": 16,
+        "median": 16,
+        "stdev": 0.0,
+        "min": 16,
+        "max": 16
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T1_setState_trace",
+      "backend": "codedb",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 21010,
+        "median": 21010,
+        "stdev": 0.0,
+        "min": 21010,
+        "max": 21010
+      },
+      "wall": {
+        "n": 1,
+        "mean": 108,
+        "median": 108,
+        "stdev": 0.0,
+        "min": 108,
+        "max": 108
+      },
+      "calls": {
+        "n": 1,
+        "mean": 14,
+        "median": 14,
+        "stdev": 0.0,
+        "min": 14,
+        "max": 14
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T1_setState_trace",
+      "backend": "fts5_trigram",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 17876,
+        "median": 17876,
+        "stdev": 0.0,
+        "min": 17876,
+        "max": 17876
+      },
+      "wall": {
+        "n": 1,
+        "mean": 95,
+        "median": 95,
+        "stdev": 0.0,
+        "min": 95,
+        "max": 95
+      },
+      "calls": {
+        "n": 1,
+        "mean": 13,
+        "median": 13,
+        "stdev": 0.0,
+        "min": 13,
+        "max": 13
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T1_setState_trace",
+      "backend": "leanctx",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 18370,
+        "median": 18370,
+        "stdev": 0.0,
+        "min": 18370,
+        "max": 18370
+      },
+      "wall": {
+        "n": 1,
+        "mean": 91,
+        "median": 91,
+        "stdev": 0.0,
+        "min": 91,
+        "max": 91
+      },
+      "calls": {
+        "n": 1,
+        "mean": 13,
+        "median": 13,
+        "stdev": 0.0,
+        "min": 13,
+        "max": 13
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T1_setState_trace",
+      "backend": "codedb_LEAN",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 35504,
+        "median": 35504,
+        "stdev": 0.0,
+        "min": 35504,
+        "max": 35504
+      },
+      "wall": {
+        "n": 1,
+        "mean": 226,
+        "median": 226,
+        "stdev": 0.0,
+        "min": 226,
+        "max": 226
+      },
+      "calls": {
+        "n": 1,
+        "mean": 27,
+        "median": 27,
+        "stdev": 0.0,
+        "min": 27,
+        "max": 27
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T2_snapshot_flag_sites",
+      "backend": "codedb",
+      "quality": {
+        "n": 1,
+        "mean": 3,
+        "median": 3,
+        "stdev": 0.0,
+        "min": 3,
+        "max": 3
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 18758,
+        "median": 18758,
+        "stdev": 0.0,
+        "min": 18758,
+        "max": 18758
+      },
+      "wall": {
+        "n": 1,
+        "mean": 55,
+        "median": 55,
+        "stdev": 0.0,
+        "min": 55,
+        "max": 55
+      },
+      "calls": {
+        "n": 1,
+        "mean": 10,
+        "median": 10,
+        "stdev": 0.0,
+        "min": 10,
+        "max": 10
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T2_snapshot_flag_sites",
+      "backend": "fts5_trigram",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 15853,
+        "median": 15853,
+        "stdev": 0.0,
+        "min": 15853,
+        "max": 15853
+      },
+      "wall": {
+        "n": 1,
+        "mean": 49,
+        "median": 49,
+        "stdev": 0.0,
+        "min": 49,
+        "max": 49
+      },
+      "calls": {
+        "n": 1,
+        "mean": 8,
+        "median": 8,
+        "stdev": 0.0,
+        "min": 8,
+        "max": 8
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T2_snapshot_flag_sites",
+      "backend": "leanctx",
+      "quality": {
+        "n": 1,
+        "mean": 3,
+        "median": 3,
+        "stdev": 0.0,
+        "min": 3,
+        "max": 3
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 23661,
+        "median": 23661,
+        "stdev": 0.0,
+        "min": 23661,
+        "max": 23661
+      },
+      "wall": {
+        "n": 1,
+        "mean": 121,
+        "median": 121,
+        "stdev": 0.0,
+        "min": 121,
+        "max": 121
+      },
+      "calls": {
+        "n": 1,
+        "mean": 13,
+        "median": 13,
+        "stdev": 0.0,
+        "min": 13,
+        "max": 13
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T2_snapshot_flag_sites",
+      "backend": "codedb_LEAN",
+      "quality": {
+        "n": 1,
+        "mean": 3,
+        "median": 3,
+        "stdev": 0.0,
+        "min": 3,
+        "max": 3
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 20123,
+        "median": 20123,
+        "stdev": 0.0,
+        "min": 20123,
+        "max": 20123
+      },
+      "wall": {
+        "n": 1,
+        "mean": 46,
+        "median": 46,
+        "stdev": 0.0,
+        "min": 46,
+        "max": 46
+      },
+      "calls": {
+        "n": 1,
+        "mean": 7,
+        "median": 7,
+        "stdev": 0.0,
+        "min": 7,
+        "max": 7
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T3_compare_two_functions",
+      "backend": "codedb",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 16058,
+        "median": 16058,
+        "stdev": 0.0,
+        "min": 16058,
+        "max": 16058
+      },
+      "wall": {
+        "n": 1,
+        "mean": 28,
+        "median": 28,
+        "stdev": 0.0,
+        "min": 28,
+        "max": 28
+      },
+      "calls": {
+        "n": 1,
+        "mean": 8,
+        "median": 8,
+        "stdev": 0.0,
+        "min": 8,
+        "max": 8
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T3_compare_two_functions",
+      "backend": "fts5_trigram",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 15307,
+        "median": 15307,
+        "stdev": 0.0,
+        "min": 15307,
+        "max": 15307
+      },
+      "wall": {
+        "n": 1,
+        "mean": 29,
+        "median": 29,
+        "stdev": 0.0,
+        "min": 29,
+        "max": 29
+      },
+      "calls": {
+        "n": 1,
+        "mean": 7,
+        "median": 7,
+        "stdev": 0.0,
+        "min": 7,
+        "max": 7
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T3_compare_two_functions",
+      "backend": "leanctx",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 15361,
+        "median": 15361,
+        "stdev": 0.0,
+        "min": 15361,
+        "max": 15361
+      },
+      "wall": {
+        "n": 1,
+        "mean": 61,
+        "median": 61,
+        "stdev": 0.0,
+        "min": 61,
+        "max": 61
+      },
+      "calls": {
+        "n": 1,
+        "mean": 11,
+        "median": 11,
+        "stdev": 0.0,
+        "min": 11,
+        "max": 11
+      },
+      "reps": [
+        1
+      ]
+    },
+    {
+      "task": "T3_compare_two_functions",
+      "backend": "codedb_LEAN",
+      "quality": {
+        "n": 1,
+        "mean": 5,
+        "median": 5,
+        "stdev": 0.0,
+        "min": 5,
+        "max": 5
+      },
+      "tokens": {
+        "n": 1,
+        "mean": 17795,
+        "median": 17795,
+        "stdev": 0.0,
+        "min": 17795,
+        "max": 17795
+      },
+      "wall": {
+        "n": 1,
+        "mean": 52,
+        "median": 52,
+        "stdev": 0.0,
+        "min": 52,
+        "max": 52
+      },
+      "calls": {
+        "n": 1,
+        "mean": 10,
+        "median": 10,
+        "stdev": 0.0,
+        "min": 10,
+        "max": 10
+      },
+      "reps": [
+        1
+      ]
+    }
+  ]
+}
