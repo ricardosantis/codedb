@@ -870,3 +870,82 @@ If you want to add a new backend to the bench:
    ≥0.85 is the bar for "finding the same answers."
 5. Drop a markdown report into `results/` and PR it.
 
+## 15. Per-response token cost (the missing axis)
+
+§13 measured engine latency. The other axis that matters for agents is
+**how many tokens the LLM pays per tool call** — the response, tokenized.
+Measured via `tiktoken cl100k_base` (close approximation for Claude
+tokenization) on the exact response body the agent would receive.
+
+### Per-query token counts (one call each, full response)
+
+| Backend | Avg tokens / query | vs cheapest |
+|---|---|---|
+| **fts5_uni `SELECT path` LIMIT 50** | **452** | 1.00× |
+| fts5_tri `SELECT path` LIMIT 50 | 456 | 1.01× |
+| fts5_tri w/ `snippet()` | 686 | 1.52× |
+| lean-ctx MCP `ctx_search` | 774 | 1.71× |
+| lean-ctx `grep` CLI | 774 | 1.71× |
+| codedb `paths_only=true` + `CODEDB_MCP_LEAN=1` | 790 | 1.75× |
+| codedb `paths_only=true` (default env) | 871 | 1.93× |
+| fts5_uni w/ `snippet()` | 1,126 | 2.49× |
+| codedb default + `CODEDB_MCP_LEAN=1` | 1,269 | 2.81× |
+| **codedb default** | **1,350** | **2.99×** |
+
+The codedb default (`path:line:line_text` for up to 50 hits) is the
+most expensive option at ~1,350 tokens/call — about 3× the cheapest
+(FTS5 paths-only). codedb's lean configurations (LEAN env + paths_only)
+drop to 790 tokens, within 10% of the lean-ctx response and within
+2× of FTS5 paths-only.
+
+### Per-query detail (selected, full table in `results/`)
+
+| Query | codedb default | codedb LEAN+paths | fts5_tri+snippet | lean-ctx MCP |
+|---|---|---|---|---|
+| `useState` | 2,027 | 1,535 | 949 | 609 |
+| `forwardRef` | 2,451 | 1,061 | 808 | 885 |
+| `Fiber` | 1,640 | 841 | 1,004 | 491 |
+| `flushPassiveEffects` | 337 | 163 | 156 | 454 |
+| `function` (5,286 hits) | 1,678 | 1,340 | 711 | 1,224 |
+| `xyzzy_react_does_not_exist` | 99 | 12 | 0 | 23 |
+
+### Why this doesn't flip the agentic eval
+
+§9 showed codedb and lean-ctx achieving similar **total** tokens per
+agent task (19.6k vs 19.7k average), with FTS5 24% lower (15.9k).
+Per-call tokens here would predict lean-ctx winning by ~2× since it's
+774 vs codedb's 1,350. The agent eval shows otherwise because:
+
+  per-task tokens ≈ (per-call tokens × calls/task) + agent-reasoning overhead
+
+From the agentic eval averages:
+
+| Backend | Avg per-call tokens | Avg calls / task | Tool-response budget | Measured task total | Reasoning overhead |
+|---|---|---|---|---|---|
+| fts5_trigram | 686 | 8.2 | 5,625 | 15,890 | 10,265 |
+| codedb (default) | 1,350 | 10.5 | 14,175 | 19,606 | 5,431 |
+| lean-ctx | 774 | 13.2 | 10,217 | 19,651 | 9,434 |
+
+codedb spends ~3× more tokens per call but the agent does **fewer calls
+and less reasoning between calls** — net total ends up at 19.6k, the
+same as lean-ctx and 24% above FTS5. The "richer per call" design pays
+off when the alternative is the agent having to do extra probes to
+reconstruct context. Compression-first responses save bytes per call,
+spend them on more turns.
+
+### Recommendation
+
+- **For agent use:** codedb default is fine. The per-call token premium
+  (~2× lean-ctx) is recovered by fewer calls and less reasoning between
+  turns. Don't enable `CODEDB_MCP_LEAN=1` or `paths_only=true` for
+  agents — §10 measured that those flags made agents use **32% MORE**
+  tokens.
+- **For batch scripts / pipelines / log scrapers** where there's no
+  agent reasoning between calls: `CODEDB_MCP_LEAN=1` + `paths_only=true`
+  drops per-call cost from 1,350 to 790 tokens (42% reduction) at no
+  loss of information for the consumer (they wanted paths anyway).
+- **For "what files match" queries specifically:** FTS5 paths-only is
+  unambiguously cheapest and codedb's `bench-engine search-paths` is
+  the engine equivalent. Both fit in <500 tokens for typical
+  React-sized corpora.
+
