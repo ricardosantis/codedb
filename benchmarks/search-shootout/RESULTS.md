@@ -326,3 +326,116 @@ not engine cost; it's periodic ~500 ms+ spikes from something. Candidates:
 snapshot persistence, watcher polling, arena cleanup, background indexing.
 Worth filing as a separate perf issue; the test bench is reproducible.
 
+## 9. Multi-task agentic eval — testing lean-ctx's "99% token savings" claim
+
+The first agentic eval (`getNextLanes`, in §4 above) was a single data point.
+This extends it with three more React-internals exploration tasks. Same
+methodology: one Sonnet 4.6 sub-agent per (task, backend) pair, restricted
+to that backend's CLI only (no Read, no grep, no peeking). All 12 agents
+ran in parallel.
+
+### The tasks
+
+| ID | Task |
+|---|---|
+| T0 | (original) Find `getNextLanes` and explain lane eligibility |
+| T1 | Trace from `useState`'s setter to the function that schedules re-render |
+| T2 | Find 2–3 sites where a Fiber's `flags` gets the `Snapshot` flag set |
+| T3 | Compare `processUpdateQueue` vs `prepareFreshStack` — file, function, when called |
+
+### Per-task results
+
+| Task | Backend | Tool calls | Wall sec | Tokens | Correct? |
+|---|---|---|---|---|---|
+| T0 | codedb     | 10 | 44 s   | 22,598 | ✅ |
+| T0 | fts5_tri   | 5  | **25 s** | **14,523** | ✅ |
+| T0 | leanctx    | 16 | 123 s  | 21,212 | ✅ |
+| T1 | codedb     | 14 | 108 s  | 21,010 | ✅ |
+| T1 | fts5_tri   | 13 | 95 s   | 17,876 | ✅ (admitted 1 grep violation) |
+| T1 | leanctx    | 13 | **91 s** | 18,370 | ✅ |
+| T2 | codedb     | 10 | 55 s   | 18,758 | ✅ |
+| T2 | fts5_tri   | 8  | **49 s** | **15,853** | ✅ |
+| T2 | leanctx    | 13 | 121 s  | 23,661 | ✅ |
+| T3 | codedb     | 8  | **28 s** | 16,058 | ✅ |
+| T3 | fts5_tri   | 7  | 29 s   | **15,307** | ✅ |
+| T3 | leanctx    | 11 | 61 s   | 15,361 | ✅ |
+
+### Aggregate across 4 tasks
+
+| Backend | Total calls | Total wall sec | Total tokens | Avg calls/task | Avg sec/task | Avg tokens/task |
+|---|---|---|---|---|---|---|
+| **fts5_trigram** | **33** | **198** | **63,559** | **8.2** | **49.5** | **15,890** |
+| codedb | 42 | 235 | 78,424 | 10.5 | 58.8 | 19,606 |
+| lean-ctx | 53 | 396 | 78,604 | 13.2 | 99.0 | 19,651 |
+
+### The headline
+
+**All 12 agents reached the correct answer.** Recall isn't the differentiator;
+efficiency is. The aggregate ratios:
+
+- lean-ctx vs codedb: **1.69× wall time**, **1.00× tokens**, **1.26× tool calls**
+- lean-ctx vs fts5:   **2.00× wall time**, **1.24× tokens**, **1.61× tool calls**
+- codedb vs fts5:     **1.19× wall time**, **1.23× tokens**, **1.27× tool calls**
+
+### What this says about "99% token savings"
+
+lean-ctx markets aggressive token compression as its main value prop. The
+per-output compression is real — `lean-ctx grep` does pack a lot of matches
+into fewer bytes than raw output. But across these four agent tasks,
+**lean-ctx used essentially the same total tokens as codedb** (78,604 vs
+78,424 — a 0.2% difference) and **24% more tokens than the plainest backend
+in the comparison** (fts5_trigram via raw sqlite3).
+
+The reason is visible in every lean-ctx agent's notes: the compression is
+lossy enough that the agent has to do follow-up probes to reconstruct what
+it needs. The α1/α2/§MAP symbol substitution that saves bytes per response
+costs additional grep calls to decode. `lean-ctx read` returns metadata
+summaries for large files, forcing the agent back to grep when it actually
+wants source. Per-call savings get spent on extra calls.
+
+The clearest single quote, from the T1 leanctx agent's notes:
+
+> "The build uses minified symbol aliases (α1) for cross-module exports;
+> α1 in ReactFiberHooks.js maps to scheduleUpdateOnFiber from
+> ReactFiberWorkLoop.js."
+
+That's the compression actively producing work for the agent to undo.
+
+### Where FTS5 trigram wins agent efficiency
+
+FTS5 wins on every aggregate metric — fewest calls, fewest wall seconds,
+fewest tokens. Three reasons:
+
+1. **Output is minimal but unambiguous.** `sqlite3` returns `path|snippet`
+   with no formatting flourish. The agent reads exactly what's there.
+2. **Cold-start is free.** `sqlite3` startup is microseconds, not Rust's
+   ~700 ms or codedb's ~50 ms. Every per-call CLI cost gets amortized
+   differently.
+3. **BM25 ranking is good enough** for code: the right file is in the top 3
+   results essentially every time.
+
+This is a real argument for keeping FTS5 in the conversation as a
+**substrate** for code-context tools. But it's a substrate, not a product —
+you still need outline / call graph / watcher on top.
+
+### Where codedb sits
+
+codedb is the middle ground: 19% slower than fts5 wall-clock, 23% more
+tokens, 27% more tool calls. The extra cost is the trade for `codedb
+outline` / `codedb find` / `codedb deps` — things FTS5 doesn't have. The
+fact that codedb is competitive on token spend with both alternatives,
+while offering structural features lean-ctx and fts5 don't, is the strongest
+positioning argument from this whole exercise.
+
+### Caveats
+
+- 4 tasks isn't a benchmark suite; it's a probe. More tasks would tighten
+  the per-task variance.
+- All three backends were given CLI access only. lean-ctx in particular has
+  an MCP mode (used in §7 for the latency comparison) that we did NOT use
+  here for the agentic task — the agent would have had to manage MCP RPC
+  itself, which isn't how agents are typically wired. Future work: run the
+  same tasks with lean-ctx exposed as registered MCP tools to the agent.
+- All correct answers were verified by the parent. No false-positive cases
+  observed.
+
