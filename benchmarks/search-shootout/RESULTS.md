@@ -949,3 +949,90 @@ spend them on more turns.
   the engine equivalent. Both fit in <500 tokens for typical
   React-sized corpora.
 
+## 16. Per-task quality scoring (the missing dimension)
+
+§9 measured agentic efficiency (tool calls, wall time, tokens per task)
+but only graded answers binary pass/fail. This section adds a per-answer
+quality score and cross-tabs it with the efficiency metrics.
+
+### Methodology
+
+One Sonnet 4.6 judge sub-agent was given:
+
+- ground truth for each of the 4 tasks (correct files, functions, key
+  facts) — independently verified against React source
+- all 15 prior agent submissions (12 from §9 + 3 from §10
+  codedb-LEAN variant)
+- a 5-point rubric: +1 each for file_correct, function_correct,
+  snippet_faithful, explanation_accurate, completeness
+
+The judge was allowed to `Read` / `grep` the React source to verify
+references but capped its tool use.
+
+### Per-task × per-backend scores (out of 5)
+
+| Task | codedb | fts5_trigram | lean-ctx | codedb-LEAN |
+|---|---|---|---|---|
+| T0 `getNextLanes` | 5 | **5** | 4 | — |
+| T1 setState → scheduleUpdateOnFiber | 5 | **5** | 5 | 5 |
+| T2 Snapshot flag sites | 3 | **5** | 3 | 3 |
+| T3 `processUpdateQueue` vs `prepareFreshStack` | 5 | **5** | 5 | 5 |
+| **Average** | **4.50** | **5.00** | **4.25** | **4.33** |
+
+### Aggregate quality × efficiency
+
+| Backend | Avg quality | Avg tokens / task | Avg wall sec | Tokens / quality-point |
+|---|---|---|---|---|
+| **fts5_trigram** | **5.00** | 15,890 | 49.5 | **3,178** |
+| codedb | 4.50 | 19,606 | 58.8 | 4,357 |
+| lean-ctx | 4.25 | 19,651 | 99.0 | 4,624 |
+| codedb-LEAN | 4.33 | 24,474 | 108.0 | 5,650 |
+
+**`fts5_trigram` is Pareto-dominant on this task set**: highest quality,
+lowest tokens, lowest wall time. The "richer per-call response" advantage
+codedb has (§15) doesn't translate to higher answer quality here —
+because agents using codedb tended to stop at the first plausible-looking
+set of results and skip broader exploration.
+
+**`codedb-LEAN` is dominated on every axis** including quality — confirming
+the §10 finding that opt-in compression doesn't help agents and now
+extending it to "doesn't help answer correctness either."
+
+### Where points were lost (per task)
+
+| Task | Avg | What cost points |
+|---|---|---|
+| T1 setState | 5.00 | (nothing — perfect across all 4 cells) |
+| T3 compare 2 fns | 5.00 | (nothing — all backends got both fns + comparison right) |
+| T0 `getNextLanes` | 4.67 | lean-ctx -1: snippet elided the `if`-guard context and appended a non-contiguous extra line (`getHighestPriorityLane(nextLanes)`) |
+| T2 Snapshot flag sites | 3.67 | codedb/lean-ctx/codedb-LEAN all mislabeled the `updateClassInstance` branches (e.g. line 1093 called "shouldUpdate=true" when it's the bail-out path) AND missed the 4th site at `ReactFiberCompleteWork.js:1164` |
+
+### The most interesting behavioral finding
+
+T2 is "find 2-3 distinct sites where `flags |= Snapshot`". The task
+explicitly allowed 2-3, and three of the four backends gave 3 sites all
+in `ReactFiberClassComponent.js`. But the **fts5 agent went further** and
+found a 4th site in a completely different file (`ReactFiberCompleteWork.js`),
+because its SQL queries returned broad result sets that surfaced the
+secondary file. The codedb/lean-ctx agents, working with more
+narrowly-ranked results, accepted the first 3 hits and stopped looking.
+
+This suggests **search precision can be a double-edged sword for
+agents**: a tool that returns "the best" results faster lets agents
+finish faster, but a tool that returns "broader" results encourages more
+exploration. Codedb's tier-ranked search is more precise; FTS5's pure
+BM25 is more permissive. For tasks where completeness matters more than
+quick consensus, the broader tool wins.
+
+### Caveats specific to this section
+
+- N=1 per (task, backend) cell. Quality scoring at scale would need
+  replication (queued in §14 caveats list).
+- Judge is one Sonnet 4.6 model. Inter-judge agreement not measured.
+- Quality rubric is biased toward "found and cited everything"; some
+  tasks reward depth of analysis differently.
+- T2's "missing 4th site" finding depended on whether the judge counted
+  it as a real completeness gap. The judge applied the rubric strictly;
+  a more lenient judge might give codedb 4/5 instead of 3/5 on T2
+  (since the asked-for "2-3 sites" was satisfied).
+
