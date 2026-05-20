@@ -44,6 +44,15 @@ pub const Telemetry = struct {
     path_len: usize = 0,
     call_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     write_lock: cio.Mutex = .{},
+    /// Background sync thread (set by startSyncThread). Cloud sync runs on
+    /// this thread so it never blocks the tool-call response path.
+    sync_thread: ?std.Thread = null,
+    /// Signals the background sync thread to exit. Set on deinit.
+    should_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// How often the background thread syncs to cloud (seconds). 30s
+    /// matches the previous per-10-calls cadence on typical workloads
+    /// without ever blocking a tool response.
+    sync_interval_seconds: u64 = 30,
 
     pub fn init(io: std.Io, data_dir: []const u8, allocator: std.mem.Allocator, disabled: bool) Telemetry {
         var self = Telemetry{};
@@ -68,10 +77,47 @@ pub const Telemetry = struct {
     }
 
     pub fn deinit(self: *Telemetry) void {
+        // Signal background sync thread to stop and wait for it before
+        // touching shared state (file, write_offset) below.
+        self.should_stop.store(true, .release);
+        if (self.sync_thread) |th| {
+            th.join();
+            self.sync_thread = null;
+        }
         if (self.enabled) self.flush();
         if (self.file) |f| f.close(self.io);
         self.file = null;
+        // Final cloud sync on shutdown — the background thread may have
+        // run a sync moments ago, but this guarantees the WAL is uploaded
+        // if there are events since the last tick.
         if (self.enabled) self.syncToCloud();
+    }
+
+    /// Start the background cloud-sync thread. Call this AFTER the
+    /// Telemetry has been placed at its final memory location (init returns
+    /// by value, so the thread can't safely take a pointer until then).
+    /// No-op when telemetry is disabled or already started.
+    pub fn startSyncThread(self: *Telemetry) void {
+        if (!self.enabled) return;
+        if (self.sync_thread != null) return;
+        self.sync_thread = std.Thread.spawn(.{}, syncThreadFn, .{self}) catch return;
+    }
+
+    /// Background loop: every `sync_interval_seconds`, call syncToCloud.
+    /// Checks should_stop every 100ms so shutdown is responsive (<=100ms
+    /// shutdown latency rather than waiting out a full interval).
+    fn syncThreadFn(self: *Telemetry) void {
+        const tick_ms: u64 = 100;
+        const ticks_per_interval: u64 = self.sync_interval_seconds * 1000 / tick_ms;
+        while (!self.should_stop.load(.acquire)) {
+            var i: u64 = 0;
+            while (i < ticks_per_interval) : (i += 1) {
+                if (self.should_stop.load(.acquire)) return;
+                cio.sleepMs(tick_ms);
+            }
+            if (self.should_stop.load(.acquire)) return;
+            self.syncToCloud();
+        }
     }
 
     pub fn record(self: *Telemetry, kind: Event.Kind) void {

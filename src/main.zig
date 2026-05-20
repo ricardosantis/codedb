@@ -805,6 +805,7 @@ fn mainImpl() !void {
 
         var telem = telemetry.Telemetry.init(io, data_dir, allocator, telemetry_disabled);
         defer telem.deinit();
+        telem.startSyncThread();
         telem.recordSessionStart();
 
         var shutdown = std.atomic.Value(bool).init(false);
