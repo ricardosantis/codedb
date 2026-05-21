@@ -12,6 +12,7 @@ pub const Root = mcp_lib.mcp.Root;
 const Store = @import("store.zig").Store;
 const explore_mod = @import("explore.zig");
 const Explorer = explore_mod.Explorer;
+const reader_md = @import("reader_md.zig");
 const AgentRegistry = @import("agent.zig").AgentRegistry;
 const snapshot_json = @import("snapshot_json.zig");
 const watcher = @import("watcher.zig");
@@ -1106,7 +1107,7 @@ fn dispatch(
         .codedb_query => handleQuery(alloc, args, out, ctx.explorer, ctx.store),
         .codedb_glob => handleGlob(alloc, args, out, ctx.explorer),
         .codedb_ls => handleLs(alloc, args, out, ctx.explorer),
-        .codedb_context => handleContext(alloc, args, out, ctx.explorer),
+        .codedb_context => handleContext(io, alloc, args, out, ctx.explorer, project_path orelse cache.default_path),
     }
     appendScanProgressHint(alloc, out, tool);
 }
@@ -1694,7 +1695,7 @@ fn extractContextCandidates(task: []const u8, alloc: std.mem.Allocator, out: *st
     }
 }
 
-fn handleContext(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
+fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer, project_root: []const u8) void {
     const task = getStr(args, "task") orelse {
         out.appendSlice(alloc, "error: missing 'task' argument") catch {};
         appendBundleArgKeysDiagnostic(alloc, out, args);
@@ -1705,6 +1706,31 @@ fn handleContext(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
         return;
     }
 
+    // reader.md prepend (experimental): if .codedb/reader.md exists and its
+    // declared source_hash matches the current source files, prepend its body
+    // to the response. Gives the agent one-shot orientation without paying
+    // exploratory search calls. See experiments/reader-md/SPEC.md.
+    {
+        var reader_state = reader_md.load(io, alloc, project_root) catch null;
+        if (reader_state) |*r| {
+            defer r.free(alloc);
+            switch (r.state) {
+                .ready => {
+                    if (r.body) |b| {
+                        out.appendSlice(alloc, "<!-- reader.md (hash-verified): -->\n") catch {};
+                        out.appendSlice(alloc, b) catch {};
+                        out.appendSlice(alloc, "\n<!-- end reader.md -->\n\n") catch {};
+                    }
+                },
+                .stale => {
+                    out.appendSlice(alloc, "<!-- reader.md is stale (source_hash drifted). Regenerate by writing a new .codedb/reader.md with current source_hash. -->\n\n") catch {};
+                },
+                .malformed, .missing => {
+                    // Silent — reader.md is optional.
+                },
+            }
+        }
+    }
     // Arena: every transient string in this handler lives here, no per-result
     // free bookkeeping. Released at function exit.
     var arena = std.heap.ArenaAllocator.init(alloc);
