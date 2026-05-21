@@ -1851,7 +1851,6 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
             w.print("- {s} ({s}) — {s}:{d}\n", .{ sr.kw, sr.kind, sr.path, sr.line }) catch {};
             if (inline_bodies) {
                 if (explorer.getContent(sr.path, A) catch null) |content| {
-                    // Slice lines [sr.line .. sr.line+5] from content
                     var cur_line: u32 = 1;
                     var i: usize = 0;
                     var line_start: ?usize = null;
@@ -1873,12 +1872,77 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                             }
                         }
                     }
-                    // Trailing line without final newline
                     if (line_start) |ls| {
                         if (captured < 6) {
                             w.print("       {d:>5} | {s}\n", .{ cur_line, content[ls..] }) catch {};
                         }
                     }
+                }
+            }
+        }
+
+        // Callers section (closes the T1 flask agent-mean gap):
+        // For each ≤3 symbol_definitions, surface up to 2 non-definition,
+        // non-test call sites with their enclosing scope. The whole point of
+        // this section is to pre-resolve "where is this called from" so the
+        // agent doesn't need codedb_callers / outline / read follow-ups.
+        // Examples this targets directly:
+        //   T1 flask: before_request → preprocess_request in app.py
+        //   T2 regex: Builder::build → meta::Regex::new in regex.rs
+        // Callers section (closes the T1 flask agent-mean gap):
+        // For each ≤3 symbol_definitions, surface up to 2 non-definition,
+        // non-test, non-import call sites with their enclosing scope. The
+        // whole point of this section is to pre-resolve "where is this called
+        // from" so the agent doesn't need codedb_callers / outline / read
+        // follow-ups. Examples this targets directly:
+        //   T1 flask: before_request → preprocess_request in app.py
+        //   T2 regex: Builder::build → meta::Regex::new in regex.rs
+        if (inline_bodies) {
+            var any_callers = false;
+            var seen_caller = std.StringHashMap(void).init(A);
+            var total_shown: u32 = 0;
+            for (sym_refs.items) |sr| {
+                if (total_shown >= 6) break;
+                const scoped = explorer.searchContentWithScope(sr.kw, A, 30) catch continue;
+                var shown_for_sym: u32 = 0;
+                for (scoped) |r| {
+                    if (shown_for_sym >= 2 or total_shown >= 6) break;
+                    if (!langHasCallSites(explore_mod.detectLanguage(r.path))) continue;
+                    // Skip the definition site itself
+                    if (r.line_num == sr.line and std.mem.eql(u8, r.path, sr.path)) continue;
+                    // Skip test/spec/fixture paths
+                    // Skip test/spec/fixture paths
+                    const is_test = std.mem.startsWith(u8, r.path, "tests/") or
+                        std.mem.startsWith(u8, r.path, "test/") or
+                        std.mem.indexOf(u8, r.path, "/test") != null or
+                        std.mem.indexOf(u8, r.path, "_test.") != null or
+                        std.mem.indexOf(u8, r.path, ".test.") != null or
+                        std.mem.indexOf(u8, r.path, "/__tests__/") != null or
+                        std.mem.indexOf(u8, r.path, "/spec/") != null or
+                        std.mem.indexOf(u8, r.path, "/fixtures/") != null;
+                    if (is_test) continue;
+                    // Skip matches inside import statements / module-level type
+                    // declarations — those are signature noise, not real callers
+                    if (r.scope_kind) |sk| {
+                        if (sk == .import or sk == .type_alias or sk == .constant) continue;
+                    }
+                    // Dedupe across sym_refs by path:line
+                    const dedup_key = std.fmt.allocPrint(A, "{s}:{d}", .{ r.path, r.line_num }) catch continue;
+                    if (seen_caller.contains(dedup_key)) continue;
+                    seen_caller.put(dedup_key, {}) catch {};
+                    if (!any_callers) {
+                        w.print("\n## Callers (top non-test, non-import usages of these symbols)\n", .{}) catch {};
+                        any_callers = true;
+                    }
+                    if (r.scope_name) |sn| {
+                        w.print("- {s}:{d}: {s}  [in {s} ({s}, L{d}-L{d})]\n", .{
+                            r.path, r.line_num, r.line_text, sn, @tagName(r.scope_kind.?), r.scope_start, r.scope_end,
+                        }) catch {};
+                    } else {
+                        w.print("- {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+                    }
+                    shown_for_sym += 1;
+                    total_shown += 1;
                 }
             }
         }
@@ -1888,7 +1952,6 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
         out.appendSlice(alloc, "\n(no content matches — try codedb_search or codedb_word for narrower queries)\n") catch {};
         return;
     }
-
     w.print("\n## Most-relevant files\n", .{}) catch {};
     for (ranked.items[0..top_n]) |f| {
         w.print("- {s}  ({d} matches)\n", .{ f.path, f.hits }) catch {};
