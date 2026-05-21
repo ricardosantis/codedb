@@ -668,14 +668,45 @@ fn mainImpl() !void {
             });
             std.process.exit(1);
         };
+        // Same safety guards as codedb_read MCP — path must be project-relative
+        // (no leading `/`, no `..` traversal, no null bytes / backslashes) and
+        // must not target sensitive files like .env / id_rsa / .ssh/*. Without
+        // these guards the CLI happily reads /etc/passwd, secrets, or any file
+        // the codedb process can see.
+        if (!mcp_server.isPathSafe(path)) {
+            out.p("{s}\xe2\x9c\x97{s} path must be relative to the project root (no leading `/`, no `..` traversal): {s}{s}{s}\n", .{
+                s.red, s.reset, s.bold, path, s.reset,
+            });
+            out.flush();
+            std.process.exit(1);
+        }
+        if (watcher.isSensitivePath(path)) {
+            out.p("{s}\xe2\x9c\x97{s} access to sensitive file blocked: {s}{s}{s}\n", .{
+                s.red, s.reset, s.bold, path, s.reset,
+            });
+            out.flush();
+            std.process.exit(1);
+        }
         const t0 = cio.nanoTimestamp();
         // Prefer indexed content (matches the indexed view), fall back to disk
+        // reads anchored at the resolved project root — NOT cwd. Pre-fix, an
+        // explicit `codedb /path/to/proj read foo.zig` would read `./foo.zig`
+        // from wherever the user happened to invoke it.
         const cached = explorer.getContent(path, allocator) catch null;
         const content_owned = if (cached) |c| c else blk: {
-            break :blk std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(10 * 1024 * 1024)) catch {
+            var root_dir = std.Io.Dir.cwd().openDir(io, root, .{}) catch {
+                out.p("{s}\xe2\x9c\x97{s} cannot open project root: {s}{s}{s}\n", .{
+                    s.red, s.reset, s.bold, root, s.reset,
+                });
+                out.flush();
+                std.process.exit(1);
+            };
+            defer root_dir.close(io);
+            break :blk root_dir.readFileAlloc(io, path, allocator, .limited(10 * 1024 * 1024)) catch {
                 out.p("{s}\xe2\x9c\x97{s} not indexed and disk read failed: {s}{s}{s}\n", .{
                     s.red, s.reset, s.bold, path, s.reset,
                 });
+                out.flush();
                 std.process.exit(1);
             };
         };
