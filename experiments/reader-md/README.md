@@ -2,18 +2,16 @@
 
 Experiment branch: `experiment/reader-md`. **Status: now wired into the codedb runtime** (commit `da71484`). Earlier versions of this experiment were spec-only; this branch ships an actual integration that any `codedb mcp` build can use.
 
-## TL;DR
+## TL;DR (runtime-wired)
 
-A hash-stable, ≤200-LOC, agent-authored markdown file at `.codedb/reader.md` that codedb can prepend to `codedb_context` responses so a fresh agent gets one-shot orientation. Measured against codedb v0.2.5816:
+A hash-stable, ≤200-LOC, agent-authored markdown file at `.codedb/reader.md` that codedb's runtime auto-prepends to every `codedb_context` response. Measured against the experimental binary with `.codedb/reader.md` installed in each corpus:
 
-- **−31% tool calls** vs control (avg of 3 tasks)
-- **−40% wall time**
-- **−25% tokens consumed**
-- **0/6 quality regressions**
+- **−57% tool calls** vs control (avg of 3 tasks, Sonnet 4.6)
+- **−39% wall time**
+- **−19% tokens consumed** (T2 regex alone: −48%)
+- **6/6 quality preserved**
 
-T2 regex saw a **70%** call reduction because the multi-crate workspace structure is exactly what a map disambiguates. T3 react saw only 0% / 9% / 8% because the map didn't cover the specific subsystem the task targeted — a useful negative data point about source-file selection.
-
-## Contents
+This is **better than the prompt-inlined version** measured in [`eval/RESULTS.md`](eval/RESULTS.md) — see [`eval/RESULTS-RUNTIME.md`](eval/RESULTS-RUNTIME.md) for the full A/B breakdown.
 
 - [`SPEC.md`](SPEC.md) — file format, frontmatter, hash protocol, lifecycle, open questions
 - [`readers/`](readers/) — generated `reader.md` for 3 corpora:
