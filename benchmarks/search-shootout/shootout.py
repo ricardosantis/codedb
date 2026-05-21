@@ -26,7 +26,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent.parent
-DEFAULT_CODEDB = shutil.which("codedb") or str(REPO_ROOT / "zig-out/bin/codedb")
+DEFAULT_CODEDB = REPO_ROOT / "zig-out/bin/codedb"
 DEFAULT_LEANCTX = shutil.which("lean-ctx")
 DEFAULT_CODEGRAPH = shutil.which("codegraph")
 QUERIES_PATH = HERE / "queries.json"
@@ -490,10 +490,12 @@ def query_codegraph(client, q, iters):
     return times, count
 
 
-def codegraph_cold_index(bin_path, corpus):
-    """`codegraph init` then `codegraph index` — wall-clock = full cold build."""
+def codegraph_cold_index(bin_path, corpus, clean=False):
+    """`codegraph init` then `codegraph index` — wall-clock = full cold build
+    when clean=True, incremental otherwise. Pre-fix this wiped .codegraph/
+    unconditionally, ignoring the --clean-codegraph flag."""
     cg_dir = Path(corpus) / ".codegraph"
-    if cg_dir.exists():
+    if clean and cg_dir.exists():
         shutil.rmtree(cg_dir)
     s = time.perf_counter()
     subprocess.run([bin_path, "init", corpus], capture_output=True, timeout=60)
@@ -944,7 +946,7 @@ def main():
     if not args.skip_codegraph and args.codegraph_bin:
         print("[build] codegraph ...", flush=True)
         try:
-            t, sz, cg_dir = codegraph_cold_index(args.codegraph_bin, str(corpus))
+            t, sz, cg_dir = codegraph_cold_index(args.codegraph_bin, str(corpus), clean=args.clean_codegraph)
             print("        {:.2f}s, ~{:.1f} MB ({})".format(t, sz / 1e6, cg_dir))
             builds.append(("codegraph", t, sz))
             backends.append("codegraph")
