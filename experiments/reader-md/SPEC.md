@@ -21,7 +21,7 @@ The proposal: a **hash-stable, agent-authored, ≤200-LOC markdown file** at `.c
 schema_version: 1
 generated_at: 2026-05-21T14:30:00Z
 generator: "claude-sonnet-4-6"
-source_hash: "blake3:abc123…"
+source_hash: "blake2b:abc123…"
 source_files:
   - src/flask/app.py
   - src/flask/blueprints.py
@@ -60,7 +60,7 @@ WSGI underneath, blueprints for modular composition.
 - **`schema_version`**: bump if codedb's parser changes shape
 - **`generated_at`**: ISO 8601; informational only
 - **`generator`**: model name; informational
-- **`source_hash`**: blake3 of `concat(sort(source_files), open(f).read() for f in source_files)`. Recomputed on every codedb scan; mismatch ⇒ stale
+- **`source_hash`**: blake2b (16-byte digest, 32 hex chars) of `concat(sort(source_files), open(f).read() for f in source_files)`. Recomputed on every codedb scan; mismatch ⇒ stale. See § Hash protocol below for the canonical algorithm.
 - **`source_files`**: list of paths the reader summarizes — **THE hash is over these specific files**, NOT the whole repo. The agent picks them when generating.
 - **`loc_budget`** / **`loc_actual`**: enforces terseness. Codedb rejects files over `loc_budget * 1.2` to prevent drift.
 
@@ -88,7 +88,7 @@ WSGI underneath, blueprints for modular composition.
                   agent writes reader.md
                           │
                           ▼
-                  codedb stores blake3
+                  codedb stores blake2b hash
 ```
 
 ## Why this earns the LOC

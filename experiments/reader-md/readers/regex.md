@@ -2,18 +2,18 @@
 schema_version: 1
 generated_at: 2026-05-21T00:00:00Z
 generator: "claude-sonnet-4-6"
-source_hash: "blake2b:076c6b3e358a99cca96e593056f546ee"
+source_hash: "blake2b:2348b7427c5c2697a3e956d1c6104558"
 source_files:
-  - /Users/blackfloofie/codedb-bench/regex/Cargo.toml
-  - /Users/blackfloofie/codedb-bench/regex/src/lib.rs
-  - /Users/blackfloofie/codedb-bench/regex/src/builders.rs
-  - /Users/blackfloofie/codedb-bench/regex/regex-automata/src/lib.rs
-  - /Users/blackfloofie/codedb-bench/regex/regex-automata/src/meta/regex.rs
-  - /Users/blackfloofie/codedb-bench/regex/regex-automata/src/meta/strategy.rs
-  - /Users/blackfloofie/codedb-bench/regex/regex-automata/src/nfa/thompson/mod.rs
-  - /Users/blackfloofie/codedb-bench/regex/regex-syntax/src/lib.rs
-  - /Users/blackfloofie/codedb-bench/regex/regex-syntax/src/hir/mod.rs
-  - /Users/blackfloofie/codedb-bench/regex/regex-lite/src/lib.rs
+  - Cargo.toml
+  - src/lib.rs
+  - src/builders.rs
+  - regex-automata/src/lib.rs
+  - regex-automata/src/meta/regex.rs
+  - regex-automata/src/meta/strategy.rs
+  - regex-automata/src/nfa/thompson/mod.rs
+  - regex-syntax/src/lib.rs
+  - regex-syntax/src/hir/mod.rs
+  - regex-lite/src/lib.rs
 loc_budget: 200
 loc_actual: 80
 ---
