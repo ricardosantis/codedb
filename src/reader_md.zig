@@ -91,7 +91,33 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, project_root: []const u8) 
         if (in_source_files and (std.mem.startsWith(u8, trimmed, "  - ") or std.mem.startsWith(u8, trimmed, "- "))) {
             const after_dash = if (std.mem.startsWith(u8, trimmed, "  - ")) trimmed[4..] else trimmed[2..];
             const path = std.mem.trim(u8, after_dash, " \"'");
-            if (path.len > 0) try source_files.append(allocator, path);
+            if (path.len > 0) {
+                // P1 fix (review I01): reject absolute paths and `..` traversal
+                // so a hostile reader.md can't make codedb read /etc/passwd or
+                // escape the project root. Same posture as `mcp_server.isPathSafe`
+                // (mcp.zig:3725) — except we can't import it cleanly here, so
+                // inline the equivalent check.
+                if (std.fs.path.isAbsolute(path)) {
+                    return .{ .state = .malformed, .raw = raw, .declared_hash = declared_hash_opt };
+                }
+                if (std.mem.indexOf(u8, path, "..") != null) {
+                    // Be conservative: any `..` substring is suspicious. Bare
+                    // file/dir names like `re..fl` are vanishingly rare in code
+                    // and not worth the false-negative risk.
+                    return .{ .state = .malformed, .raw = raw, .declared_hash = declared_hash_opt };
+                }
+                if (std.mem.indexOfScalar(u8, path, 0) != null) {
+                    return .{ .state = .malformed, .raw = raw, .declared_hash = declared_hash_opt };
+                }
+                // P1 fix (review I02): cap source_files at 20 entries. A
+                // reader.md is allowed up to 64 KB; without this cap a
+                // crafted file could list ~600 entries × 8 MB read each
+                // = ~5 GB of allocations on every codedb_context call.
+                if (source_files.items.len >= 20) {
+                    return .{ .state = .malformed, .raw = raw, .declared_hash = declared_hash_opt };
+                }
+                try source_files.append(allocator, path);
+            }
             continue;
         }
         in_source_files = false;
@@ -103,6 +129,15 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, project_root: []const u8) 
             declared_hash_opt = try allocator.dupe(u8, val);
         } else if (std.mem.eql(u8, key, "source_files")) {
             in_source_files = true;
+        } else if (std.mem.eql(u8, key, "loc_actual")) {
+            // P2 fix (review I03): enforce loc_budget × 1.2 ceiling per SPEC.
+            // The 64 KB raw cap was the only size check before; an agent that
+            // ignored the 200-LOC budget could prepend ~1500 lines on every
+            // call, inverting the efficiency win on small-context models.
+            const loc_actual = std.fmt.parseInt(u32, val, 10) catch continue;
+            if (loc_actual > 240) {
+                return .{ .state = .malformed, .raw = raw, .declared_hash = declared_hash_opt };
+            }
         }
     }
 
@@ -155,12 +190,21 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, project_root: []const u8) 
     };
 }
 
-test "load: blake2b hash format roundtrip" {
-    // Simple deterministic test: hash of single file matches Python algorithm.
-    // The Python equivalent of this sequence:
-    //   h = blake2b(digest_size=16); h.update(b"a.txt"); h.update(b"\0");
-    //   h.update(b"hello"); h.update(b"\0\0"); h.hexdigest()
-    // → "ae2db8e2c5c5b3d11c0f0a5cd4f7e8aa" (recomputed by Python below if drift)
+test "blake2b: byte-for-byte parity with canonical Python algorithm" {
+    // Lock the hash-protocol contract against drift. The golden digest below
+    // was produced by:
+    //
+    //   python3 -c "
+    //   import hashlib
+    //   h = hashlib.blake2b(digest_size=16)
+    //   h.update(b'a.txt'); h.update(b'\0')
+    //   h.update(b'hello'); h.update(b'\0\0')
+    //   print(h.hexdigest())"
+    //   # → 3768d3b5cda868e1d504d5c0417f7818
+    //
+    // If Zig's `{x}` formatting for [N]u8 ever changes, or if std.crypto's
+    // Blake2b128 disagrees with Python's blake2b(digest_size=16), this test
+    // catches it before every reader.md silently goes stale.
     var h = std.crypto.hash.blake2.Blake2b128.init(.{});
     h.update("a.txt");
     h.update(&[_]u8{0});
@@ -170,5 +214,5 @@ test "load: blake2b hash format roundtrip" {
     h.final(&digest);
     var hex_buf: [32]u8 = undefined;
     const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{digest}) catch unreachable;
-    try std.testing.expectEqual(@as(usize, 32), hex.len);
+    try std.testing.expectEqualStrings("3768d3b5cda868e1d504d5c0417f7818", hex);
 }
