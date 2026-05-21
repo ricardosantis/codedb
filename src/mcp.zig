@@ -1710,7 +1710,19 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
     // declared source_hash matches the current source files, prepend its body
     // to the response. Gives the agent one-shot orientation without paying
     // exploratory search calls. See experiments/reader-md/SPEC.md.
-    {
+    //
+    // Critical-review I11 + n=2 vs-main eval (RESULTS-VS-MAIN-FINAL.md): on
+    // short narrow tasks like "find before_request" the composer's
+    // symbol_definitions section already pinpoints the answer, and reader.md's
+    // ~5 KB body becomes pure overhead — the T1 flask regression
+    // (+37% calls / +18% tokens) came entirely from this case.
+    //
+    // Gate: only prepend reader.md when the task is long enough to suggest
+    // exploration rather than a narrow lookup. 80 chars is the inflection
+    // point in the eval — T1's "find before_request decorator" is 28 chars,
+    // T2/T3 are 230+ chars.
+    const reader_md_gate = task.len > 80;
+    if (reader_md_gate) {
         var reader_state = reader_md.load(io, alloc, project_root) catch null;
         if (reader_state) |*r| {
             defer r.free(alloc);
@@ -1830,8 +1842,45 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
 
     if (sym_refs.items.len > 0) {
         w.print("\n## Symbol definitions\n", .{}) catch {};
+        // Enhancement (closes T1 flask variance gap): when there are ≤3
+        // symbol definitions, inline the first ~6 lines of each so the agent
+        // doesn't need a follow-up `codedb_read` to see the body. For wider
+        // result sets this would bloat the response, so cap at 3.
+        const inline_bodies = sym_refs.items.len <= 3;
         for (sym_refs.items) |sr| {
             w.print("- {s} ({s}) — {s}:{d}\n", .{ sr.kw, sr.kind, sr.path, sr.line }) catch {};
+            if (inline_bodies) {
+                if (explorer.getContent(sr.path, A) catch null) |content| {
+                    // Slice lines [sr.line .. sr.line+5] from content
+                    var cur_line: u32 = 1;
+                    var i: usize = 0;
+                    var line_start: ?usize = null;
+                    var captured: u32 = 0;
+                    const want_end: u32 = sr.line + 6;
+                    if (cur_line == sr.line) line_start = 0;
+                    while (i < content.len and captured < 6) : (i += 1) {
+                        if (content[i] == '\n') {
+                            if (line_start) |ls| {
+                                const line_end = i;
+                                w.print("       {d:>5} | {s}\n", .{ cur_line, content[ls..line_end] }) catch {};
+                                captured += 1;
+                            }
+                            cur_line += 1;
+                            if (cur_line >= sr.line and cur_line <= want_end) {
+                                line_start = i + 1;
+                            } else {
+                                line_start = null;
+                            }
+                        }
+                    }
+                    // Trailing line without final newline
+                    if (line_start) |ls| {
+                        if (captured < 6) {
+                            w.print("       {d:>5} | {s}\n", .{ cur_line, content[ls..] }) catch {};
+                        }
+                    }
+                }
+            }
         }
     }
 
