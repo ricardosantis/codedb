@@ -53,27 +53,43 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run codedb daemon");
     run_step.dependOn(&run_cmd.step);
 
-    // ── Tests ──
+    // ── Tests (split into independent binaries for faster compilation) ──
     const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
-    const tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tests.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    tests.root_module.addImport("mcp", mcp_dep.module("mcp"));
-    tests.root_module.addImport("nanoregex", nanoregex_dep.module("nanoregex"));
-    if (test_filter) |f| {
-        const filters = b.allocator.alloc([]const u8, 1) catch @panic("oom");
-        filters[0] = f;
-        tests.filters = filters;
-    }
+    const test_step = b.step("test", "Run all tests");
 
-    const test_step = b.step("test", "Run tests");
-    const tests_run = b.addRunArtifact(tests);
-    test_step.dependOn(&tests_run.step);
+    const test_files = [_]struct { name: []const u8, path: []const u8, needs_mcp: bool, needs_nanoregex: bool }{
+        .{ .name = "test-core",     .path = "src/test_core.zig",     .needs_mcp = false, .needs_nanoregex = false },
+        .{ .name = "test-explore",  .path = "src/test_explore.zig",  .needs_mcp = false, .needs_nanoregex = true },
+        .{ .name = "test-index",    .path = "src/test_index.zig",    .needs_mcp = true,  .needs_nanoregex = true },
+        .{ .name = "test-parser",   .path = "src/test_parser.zig",   .needs_mcp = false, .needs_nanoregex = true },
+        .{ .name = "test-search",   .path = "src/test_search.zig",   .needs_mcp = true,  .needs_nanoregex = true },
+        .{ .name = "test-snapshot", .path = "src/test_snapshot.zig", .needs_mcp = false, .needs_nanoregex = true },
+        .{ .name = "test-mcp",      .path = "src/test_mcp.zig",      .needs_mcp = true,  .needs_nanoregex = true },
+        .{ .name = "test-query",    .path = "src/test_query.zig",    .needs_mcp = true,  .needs_nanoregex = true },
+    };
+
+    for (test_files) |tf| {
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(tf.path),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        if (tf.needs_mcp) t.root_module.addImport("mcp", mcp_dep.module("mcp"));
+        if (tf.needs_nanoregex) t.root_module.addImport("nanoregex", nanoregex_dep.module("nanoregex"));
+        if (test_filter) |f| {
+            const filters = b.allocator.alloc([]const u8, 1) catch @panic("oom");
+            filters[0] = f;
+            t.filters = filters;
+        }
+        const run = b.addRunArtifact(t);
+        test_step.dependOn(&run.step);
+
+        const individual_step = b.step(tf.name, b.fmt("Run {s}", .{tf.name}));
+        individual_step.dependOn(&run.step);
+    }
 
 
     // ── Library tests (verify the module root compiles) ──
