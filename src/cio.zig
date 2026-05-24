@@ -16,6 +16,15 @@ extern "c" fn clock_gettime(id: c_int, ts: *std.c.timespec) c_int;
 extern "c" fn pipe(fds: *[2]c_int) c_int;
 extern "c" fn close(fd: c_int) c_int;
 
+pub fn ignoreSigpipe() void {
+    var act: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = 0,
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.PIPE, &act, null);
+}
+
 const CLOCK_REALTIME: c_int = 0;
 const CLOCK_MONOTONIC: c_int = if (builtin.os.tag == .macos) 6 else 1;
 

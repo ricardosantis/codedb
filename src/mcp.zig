@@ -651,6 +651,8 @@ pub var last_activity: std.atomic.Value(i64) = std.atomic.Value(i64).init(0);
 /// How often the watchdog checks whether the MCP client disconnected.
 pub const dead_client_poll_ms: u64 = 1000;
 
+pub var stdout_broken: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
 // ── Serve-first scan state (issue #207) ─────────────────────────────────────
 //
 // MCP serves immediately on startup; the file walk + index build runs in a
@@ -732,6 +734,7 @@ pub fn run(
     content_cache_capacity: u32,
     telem: *telemetry_mod.Telemetry,
     deferred_scan: ?*DeferredScan,
+    shutdown: *std.atomic.Value(bool),
 ) void {
     const stdout = cio.File.stdout();
     const stdin = std.Io.File.stdin();
@@ -778,7 +781,7 @@ pub fn run(
     var read_buf: [4096]u8 = undefined;
     var stdin_reader = stdin.reader(io, &read_buf);
 
-    while (true) {
+    while (!stdout_broken.load(.acquire) and !shutdown.load(.acquire)) {
         const msg = mcpj.readLineBuf(alloc, &stdin_reader.interface) orelse break;
         last_activity.store(cio.milliTimestamp(), .release);
         defer alloc.free(msg);
@@ -935,7 +938,10 @@ fn writeRequest(alloc: std.mem.Allocator, stdout: cio.File, id: i64, method: []c
     buf.appendSlice(alloc, "\",\"params\":") catch return;
     buf.appendSlice(alloc, params) catch return;
     buf.appendSlice(alloc, "}\n") catch return;
-    stdout.writeAll(buf.items) catch {};
+    stdout.writeAll(buf.items) catch {
+        stdout_broken.store(true, .release);
+        return;
+    };
 }
 
 fn handleCall(
@@ -3890,7 +3896,10 @@ fn writeResult(alloc: std.mem.Allocator, stdout: cio.File, id: ?std.json.Value, 
         if (i < result.len) i += 1;
     }
     buf.appendSlice(alloc, "}\n") catch return;
-    stdout.writeAll(buf.items) catch return;
+    stdout.writeAll(buf.items) catch {
+        stdout_broken.store(true, .release);
+        return;
+    };
 }
 
 fn writeError(alloc: std.mem.Allocator, stdout: cio.File, id: ?std.json.Value, code: i32, msg: []const u8) void {
@@ -3905,8 +3914,14 @@ fn writeError(alloc: std.mem.Allocator, stdout: cio.File, id: ?std.json.Value, c
     buf.appendSlice(alloc, ",\"message\":\"") catch return;
     mcpj.writeEscaped(alloc, &buf, msg);
     buf.appendSlice(alloc, "\"}}") catch return;
-    stdout.writeAll(buf.items) catch return;
-    stdout.writeAll("\n") catch return;
+    stdout.writeAll(buf.items) catch {
+        stdout_broken.store(true, .release);
+        return;
+    };
+    stdout.writeAll("\n") catch {
+        stdout_broken.store(true, .release);
+        return;
+    };
 }
 /// Fast JSON string escaper: batch-copies runs of safe characters via
 /// appendSlice instead of the per-byte append in mcpj.writeEscaped.

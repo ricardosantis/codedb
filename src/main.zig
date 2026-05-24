@@ -80,6 +80,7 @@ fn mainInner() void {
 fn mainImpl() !void {
     // Use c_allocator (libc malloc) — better page reclamation than GPA
     const allocator = std.heap.c_allocator;
+    cio.ignoreSigpipe();
 
     // 0.16: single Threaded I/O instance passed down through every subsystem
     // that touches fs/subprocess. See issue #282. `io` flows into mcp.run,
@@ -1048,7 +1049,7 @@ fn mainImpl() !void {
 
         std.log.info("codedb mcp: root={s} files={d} data={s} scan={s}", .{ abs_root, store.currentSeq(), data_dir, mcp_server.getScanState().name() });
 
-        mcp_server.run(io, allocator, &store, &explorer, &agents, abs_root, cfg.max_cached, &telem, maybe_deferred);
+        mcp_server.run(io, allocator, &store, &explorer, &agents, abs_root, cfg.max_cached, &telem, maybe_deferred, &shutdown);
 
         shutdown.store(true, .release);
         if (scan_thread) |st| st.join();
