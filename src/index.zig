@@ -351,7 +351,8 @@ pub const WordIndex = struct {
     pub fn avgDocLength(self: *const WordIndex) f32 {
         const n = self.doc_lengths.count();
         if (n == 0) return 1.0;
-        return @as(f32, @floatFromInt(self.total_tokens)) / @as(f32, @floatFromInt(n));
+        const avg = @as(f32, @floatFromInt(self.total_tokens)) / @as(f32, @floatFromInt(n));
+        return if (avg > 0) avg else 1.0;
     }
 
     /// Shrink all hit lists and per-file word sets to release excess capacity.

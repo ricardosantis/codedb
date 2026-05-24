@@ -646,8 +646,8 @@ pub const Explorer = struct {
 
         persistent_outline.path = stable_path;
 
+        const prior_content = self.contents.get(stable_path);
         try self.contents.put(stable_path, content);
-        const prior_content: ?[]const u8 = null;
 
         if (full_index) {
             if (!self.word_index_complete) {
@@ -1770,7 +1770,9 @@ pub const Explorer = struct {
         if (result_list.items.len > 1) {
             std.sort.block(SearchResult, result_list.items, {}, struct {
                 pub fn lessThan(_: void, a: SearchResult, b: SearchResult) bool {
-                    if (a.score != b.score) return a.score > b.score;
+                    const sa = if (a.score == a.score) a.score else 0;
+                    const sb = if (b.score == b.score) b.score else 0;
+                    if (sa != sb) return sa > sb;
                     const ord = std.mem.order(u8, a.path, b.path);
                     if (ord != .eq) return ord == .lt;
                     return a.line_num < b.line_num;
