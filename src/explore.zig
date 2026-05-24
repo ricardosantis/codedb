@@ -1558,6 +1558,7 @@ pub const Explorer = struct {
                 path: []const u8,
                 count: u32,
                 first_seen: usize,
+                is_doc: bool,
             };
 
             var tier0_files_by_path = std.StringHashMap(Tier0File).init(allocator);
@@ -1572,6 +1573,7 @@ pub const Explorer = struct {
                         .path = hit_path,
                         .count = 0,
                         .first_seen = ordinal,
+                        .is_doc = isDocLanguage(detectLanguage(hit_path)),
                     };
                 }
                 gop.value_ptr.count +|= 1;
@@ -1588,9 +1590,7 @@ pub const Explorer = struct {
             if (tier0_files.items.len > 1) {
                 std.sort.block(Tier0File, tier0_files.items, {}, struct {
                     pub fn lessThan(_: void, a: Tier0File, b: Tier0File) bool {
-                        const a_doc = isDocLanguage(detectLanguage(a.path));
-                        const b_doc = isDocLanguage(detectLanguage(b.path));
-                        if (a_doc != b_doc) return !a_doc;
+                        if (a.is_doc != b.is_doc) return !a.is_doc;
                         if (a.count != b.count) return a.count > b.count;
                         if (a.first_seen != b.first_seen) return a.first_seen < b.first_seen;
                         return std.mem.lessThan(u8, a.path, b.path);
@@ -1747,11 +1747,10 @@ pub const Explorer = struct {
 
         const t4_start = cio.nanoTimestamp();
         if (result_list.items.len < max_results) {
-            const tier4_hits = self.word_index.search(query);
-            if (tier4_hits.len > 0) {
+            if (word_hits.len > 0) {
                 var word_paths = std.StringHashMap(void).init(allocator);
                 defer word_paths.deinit();
-                for (tier4_hits) |hit| word_paths.put(self.word_index.hitPath(hit), {}) catch {};
+                for (word_hits) |hit| word_paths.put(self.word_index.hitPath(hit), {}) catch {};
                 var wp_iter = word_paths.keyIterator();
                 while (wp_iter.next()) |key_ptr| {
                     if (searched.contains(key_ptr.*)) continue;
@@ -4148,8 +4147,14 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
     // overflow panic in Debug, SIGBUS in ReleaseFast.
     if (query.len > content.len) return;
     result_list.ensureTotalCapacity(allocator, result_list.items.len + @min(max_per_file, 16)) catch {};
-    const first_lower: u8 = if (query[0] >= 'A' and query[0] <= 'Z') query[0] + 32 else query[0];
-    const first_upper: u8 = if (query[0] >= 'a' and query[0] <= 'z') query[0] - 32 else query[0];
+    var query_lower_buf: [4096]u8 = undefined;
+    if (query.len > query_lower_buf.len) return;
+    for (query, 0..) |c, i| {
+        query_lower_buf[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+    }
+    const query_lower = query_lower_buf[0..query.len];
+    const first_lower: u8 = query_lower[0];
+    const first_upper: u8 = if (first_lower >= 'a' and first_lower <= 'z') first_lower - 32 else first_lower;
     var file_hits: usize = 0;
     var pos: usize = 0;
     const end = content.len - query.len + 1;
@@ -4183,7 +4188,7 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
                 const cand = pos + offset;
                 if (cand >= end) break;
 
-                if (matchAtCaseInsensitive(content, cand, query)) {
+                if (matchAtCaseInsensitive(content, cand, query_lower)) {
                     // ── Match found ──
                     while (current_line_start < cand) {
                         if (simdIndexOfNewline(content, current_line_start)) |nl| {
@@ -4218,7 +4223,7 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
 
         // ── Scalar tail for last <16 bytes ──
         const c = content[pos];
-        if ((c == first_lower or c == first_upper) and matchAtCaseInsensitive(content, pos, query)) {
+        if ((c == first_lower or c == first_upper) and matchAtCaseInsensitive(content, pos, query_lower)) {
             while (current_line_start < pos) {
                 if (simdIndexOfNewline(content, current_line_start)) |nl| {
                     if (nl < pos) {
@@ -4284,11 +4289,10 @@ fn extractLineByNumber(content: []const u8, target_line: u32) ?[]const u8 {
     return null;
 }
 
-fn matchAtCaseInsensitive(content: []const u8, pos: usize, query: []const u8) bool {
-    if (pos + query.len > content.len) return false;
-    for (0..query.len) |j| {
+fn matchAtCaseInsensitive(content: []const u8, pos: usize, query_lower: []const u8) bool {
+    if (pos + query_lower.len > content.len) return false;
+    for (query_lower, 0..) |nc, j| {
         const hc = if (content[pos + j] >= 'A' and content[pos + j] <= 'Z') content[pos + j] + 32 else content[pos + j];
-        const nc = if (query[j] >= 'A' and query[j] <= 'Z') query[j] + 32 else query[j];
         if (hc != nc) return false;
     }
     return true;
@@ -5248,7 +5252,6 @@ pub fn fuzzyScore(query: []const u8, path: []const u8) ?f32 {
             }
         }
 
-        // Swap rows
         @memcpy(prev_h[0 .. path.len + 1], curr_h[0 .. path.len + 1]);
         @memcpy(prev_gap[0 .. path.len + 1], curr_gap[0 .. path.len + 1]);
     }

@@ -271,13 +271,13 @@ pub fn writeSnapshot(
         const offset = file_writer.logicalPos();
         const index_mod = @import("index.zig");
         const table = index_mod.active_pair_freq;
-        var row_buf: [256 * 2]u8 = undefined;
-        for (table) |row| {
-            for (row, 0..) |val, j| {
-                std.mem.writeInt(u16, row_buf[j * 2 ..][0..2], val, .little);
+        var bulk_buf: [256 * 256 * 2]u8 = undefined;
+        for (table, 0..) |row, a| {
+            for (row, 0..) |val, b| {
+                std.mem.writeInt(u16, bulk_buf[(a * 256 + b) * 2 ..][0..2], val, .little);
             }
-            try fw.writeAll(&row_buf);
         }
+        try fw.writeAll(&bulk_buf);
         const end = file_writer.logicalPos();
         try sections.append(allocator, .{ .id = @intFromEnum(SectionId.freq_table), .offset = offset, .length = end - offset });
     }
@@ -559,20 +559,18 @@ pub fn loadSnapshotValidated(
         if (freq_entry.length == 256 * 256 * 2) {
             const index_mod = @import("index.zig");
             const ft = allocator.create([256][256]u16) catch return file_count > 0;
-            var fp: u64 = freq_entry.offset;
-            var row_buf: [256 * 2]u8 = undefined;
+            var bulk_buf: [256 * 256 * 2]u8 = undefined;
+            const nr = file.readPositionalAll(io, &bulk_buf, freq_entry.offset) catch {
+                allocator.destroy(ft);
+                return file_count > 0;
+            };
+            if (nr != bulk_buf.len) {
+                allocator.destroy(ft);
+                return file_count > 0;
+            }
             for (0..256) |a| {
-                const nr = file.readPositionalAll(io, &row_buf, fp) catch {
-                    allocator.destroy(ft);
-                    return file_count > 0;
-                };
-                if (nr != 512) {
-                    allocator.destroy(ft);
-                    return file_count > 0;
-                }
-                fp += 512;
                 for (0..256) |b| {
-                    ft[a][b] = std.mem.readInt(u16, row_buf[b * 2 ..][0..2], .little);
+                    ft[a][b] = std.mem.readInt(u16, bulk_buf[(a * 256 + b) * 2 ..][0..2], .little);
                 }
             }
             index_mod.setFrequencyTable(ft);
@@ -850,20 +848,18 @@ fn loadSnapshotFast(
             const ft = allocator.create([256][256]u16) catch return file_count > 0;
             const freq_file = std.Io.Dir.cwd().openFile(io, snapshot_path, .{}) catch return file_count > 0;
             defer freq_file.close(io);
-            var fp: u64 = freq_entry.offset;
-            var row_buf: [256 * 2]u8 = undefined;
+            var bulk_buf: [256 * 256 * 2]u8 = undefined;
+            const nr = freq_file.readPositionalAll(io, &bulk_buf, freq_entry.offset) catch {
+                allocator.destroy(ft);
+                return file_count > 0;
+            };
+            if (nr != bulk_buf.len) {
+                allocator.destroy(ft);
+                return file_count > 0;
+            }
             for (0..256) |a| {
-                const nr = freq_file.readPositionalAll(io, &row_buf, fp) catch {
-                    allocator.destroy(ft);
-                    return file_count > 0;
-                };
-                if (nr != 512) {
-                    allocator.destroy(ft);
-                    return file_count > 0;
-                }
-                fp += 512;
                 for (0..256) |b| {
-                    ft[a][b] = std.mem.readInt(u16, row_buf[b * 2 ..][0..2], .little);
+                    ft[a][b] = std.mem.readInt(u16, bulk_buf[(a * 256 + b) * 2 ..][0..2], .little);
                 }
             }
             index_mod.setFrequencyTable(ft);
