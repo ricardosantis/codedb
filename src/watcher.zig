@@ -1145,7 +1145,7 @@ pub fn isSensitivePath(path: []const u8) bool {
     }
     // .env, .env.<token>; do NOT match .envoy, .envrc, .environment, etc.
     if (basename.len >= 4 and std.mem.eql(u8, basename[0..4], ".env") and
-        (basename.len == 4 or basename[4] == '.')) return true;
+        (basename.len == 4 or basename[4] == '.' or basename[4] == '-' or basename[4] == '_')) return true;
     // Exact matches
     const sensitive_names = [_][]const u8{
         ".dev.vars",        ".npmrc",               ".pypirc",      ".netrc",
