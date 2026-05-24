@@ -181,6 +181,20 @@ pub const SearchResult = struct {
     score: f32 = 0.0,
 };
 
+pub const SearchBreakdown = struct {
+    tier0_ns: i128 = 0,
+    tier05_ns: i128 = 0,
+    tier1_ns: i128 = 0,
+    tier2_ns: i128 = 0,
+    tier3_ns: i128 = 0,
+    tier4_ns: i128 = 0,
+    tier5_ns: i128 = 0,
+    rerank_ns: i128 = 0,
+    tier_reached: u8 = 0,
+    candidate_count: u32 = 0,
+    result_count: u32 = 0,
+};
+
 pub const DependencyGraph = struct {
     forward: std.StringHashMap(std.ArrayList([]const u8)),
     reverse: std.StringHashMap(std.StringHashMap(void)),
@@ -522,6 +536,7 @@ pub const Explorer = struct {
     /// assert the short-circuit holds (issue: negative-query slow path).
     /// Production code does not read this field.
     search_tier5_count: u64 = 0,
+    last_search_breakdown: SearchBreakdown = .{},
 
     pub const DEFAULT_CONTENT_CACHE_CAPACITY: u32 = 16384;
 
@@ -1520,6 +1535,9 @@ pub const Explorer = struct {
 
         if (max_results == 0) return try allocator.alloc(SearchResult, 0);
 
+        var breakdown: SearchBreakdown = .{};
+        defer self.last_search_breakdown = breakdown;
+
         var result_list: std.ArrayList(SearchResult) = .empty;
         errdefer result_list.deinit(allocator);
 
@@ -1533,6 +1551,7 @@ pub const Explorer = struct {
         // docs, and files with more exact word hits are considered first so
         // popular identifiers and skip-trigram canonical files are not hidden
         // behind earlier low-signal posting-list entries.
+        const t0_start = cio.nanoTimestamp();
         const word_hits = self.word_index.search(query);
         if (word_hits.len > 0) {
             const Tier0File = struct {
@@ -1587,13 +1606,19 @@ pub const Explorer = struct {
                 searched.put(stats.path, {}) catch {};
                 try searchInContent(stats.path, ref.data, query, allocator, tier0_per_file_cap, max_results, &result_list);
             }
-            if (result_list.items.len >= max_results)
-                return self.rerankAndFinalize(&result_list, query, allocator);
+            if (result_list.items.len >= max_results) {
+                breakdown.tier0_ns = cio.nanoTimestamp() - t0_start;
+                breakdown.tier_reached = 0;
+                breakdown.result_count = @intCast(result_list.items.len);
+                const t_rerank = cio.nanoTimestamp();
+                const res = self.rerankAndFinalize(&result_list, query, allocator);
+                breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
+                return res;
+            }
         }
+        breakdown.tier0_ns = cio.nanoTimestamp() - t0_start;
 
-        // Tier 0.5: prefix expansion — find all indexed keys that begin with the query.
-        // Activates when Tier 0 found nothing and query is ≥3 chars, catching partial
-        // identifier queries like "searchC" that match "searchContent" in the word index.
+        const t05_start = cio.nanoTimestamp();
         if (result_list.items.len == 0 and query.len >= 3) {
             const prefix_hits = try self.word_index.searchPrefix(query, allocator, max_results);
             defer allocator.free(prefix_hits);
@@ -1616,14 +1641,23 @@ pub const Explorer = struct {
                 searched.put(hit_path, {}) catch {};
                 if (result_list.items.len >= max_results) break;
             }
-            if (result_list.items.len >= max_results)
-                return self.rerankAndFinalize(&result_list, query, allocator);
+            if (result_list.items.len >= max_results) {
+                breakdown.tier05_ns = cio.nanoTimestamp() - t05_start;
+                breakdown.tier_reached = 1;
+                breakdown.result_count = @intCast(result_list.items.len);
+                const t_rerank = cio.nanoTimestamp();
+                const res = self.rerankAndFinalize(&result_list, query, allocator);
+                breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
+                return res;
+            }
         }
+        breakdown.tier05_ns = cio.nanoTimestamp() - t05_start;
 
+        const t1_start = cio.nanoTimestamp();
         const candidate_paths = self.trigram_index.candidates(query, allocator);
         defer if (candidate_paths) |cp| allocator.free(cp);
+        if (candidate_paths) |cp| breakdown.candidate_count = @intCast(cp.len);
 
-        // Tier 1: trigram candidates — fast path, skips files already found by Tier 0.
         if (candidate_paths) |cp| {
             if (cp.len > 0) {
                 // Issue #427: rank candidates by per-file word-index hit count
@@ -1662,18 +1696,25 @@ pub const Explorer = struct {
                     const ref = self.readContentForSearch(path, allocator) orelse continue;
                     defer ref.deinit();
                     try searchInContent(path, ref.data, query, allocator, max_per_file, max_results, &result_list);
-                    if (result_list.items.len >= max_results)
-                        return self.rerankAndFinalize(&result_list, query, allocator);
+                    if (result_list.items.len >= max_results) {
+                        breakdown.tier1_ns = cio.nanoTimestamp() - t1_start;
+                        breakdown.tier_reached = 2;
+                        breakdown.result_count = @intCast(result_list.items.len);
+                        const t_rerank = cio.nanoTimestamp();
+                        const res = self.rerankAndFinalize(&result_list, query, allocator);
+                        breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
+                        return res;
+                    }
                 }
             }
         }
 
-        // Mark all Tier 1 candidates as searched.
         if (candidate_paths) |cp| {
             for (cp) |p| searched.put(p, {}) catch {};
         }
+        breakdown.tier1_ns = cio.nanoTimestamp() - t1_start;
 
-        // Tier 2: sparse candidates — LAZY, only computed when Tier 1 found nothing.
+        const t2_start = cio.nanoTimestamp();
         if (result_list.items.len == 0) {
             const sparse_paths = self.sparse_ngram_index.candidates(query, allocator);
             defer if (sparse_paths) |sp| allocator.free(sp);
@@ -1688,8 +1729,9 @@ pub const Explorer = struct {
                 }
             }
         }
+        breakdown.tier2_ns = cio.nanoTimestamp() - t2_start;
 
-        // Tier 3: skip_trigram_files not already searched.
+        const t3_start = cio.nanoTimestamp();
         if (result_list.items.len < max_results) {
             var skip_iter = self.skip_trigram_files.keyIterator();
             while (skip_iter.next()) |key_ptr| {
@@ -1701,8 +1743,9 @@ pub const Explorer = struct {
                 if (result_list.items.len >= max_results) break;
             }
         }
+        breakdown.tier3_ns = cio.nanoTimestamp() - t3_start;
 
-        // Tier 4: word index scan — for files not yet searched.
+        const t4_start = cio.nanoTimestamp();
         if (result_list.items.len < max_results) {
             const tier4_hits = self.word_index.search(query);
             if (tier4_hits.len > 0) {
@@ -1720,21 +1763,9 @@ pub const Explorer = struct {
                 }
             }
         }
+        breakdown.tier4_ns = cio.nanoTimestamp() - t4_start;
 
-        // Tier 5: full scan fallback — only when NO results from any tier.
-        // Avoids 100ms+ scans on large repos when indices already found matches.
-        //
-        // Short-circuit Tier 5 whenever the trigram index was consulted with
-        // a query long enough to fully cover it (query.len >= 3). The trigram
-        // filter returns a SUPERSET of files containing the substring (every
-        // file containing the substring necessarily contains all its
-        // trigrams). If Tier 1 scanned that superset and found 0 results, no
-        // other trigram-indexed file can match either; skip_trigram_files
-        // were handled separately by Tier 3. Tier 5 would otherwise re-scan
-        // every indexed file for nothing — a measurable 2–3 ms p50 cost on
-        // queries whose constituent trigrams are common-but-not-co-occurring
-        // syllables (e.g. `Suspense` on a Rust corpus). The cp.len == 0
-        // sub-case of this was already short-circuited before this change.
+        const t5_start = cio.nanoTimestamp();
         const trigram_ruled_out = if (candidate_paths) |_|
             (query.len >= 3)
         else
@@ -1750,7 +1781,23 @@ pub const Explorer = struct {
                 if (result_list.items.len >= max_results) break;
             }
         }
-        return self.rerankAndFinalize(&result_list, query, allocator);
+        breakdown.tier5_ns = cio.nanoTimestamp() - t5_start;
+
+        if (result_list.items.len > 0) {
+            breakdown.tier_reached = if (breakdown.tier5_ns > 0 and result_list.items.len > 0) 7
+                else if (breakdown.tier4_ns > 0 and result_list.items.len > 0) 6
+                else if (breakdown.tier3_ns > 0) 5
+                else if (breakdown.tier2_ns > 0) 4
+                else if (breakdown.tier1_ns > 0) 3
+                else if (breakdown.tier05_ns > 0) 1
+                else 0;
+        }
+        breakdown.result_count = @intCast(result_list.items.len);
+
+        const t_rerank = cio.nanoTimestamp();
+        const res = self.rerankAndFinalize(&result_list, query, allocator);
+        breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
+        return res;
     }
 
     /// Run the multi-signal rerank in place, then transfer ownership of

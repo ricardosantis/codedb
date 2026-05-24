@@ -995,6 +995,10 @@ fn handleCall(
     const is_error = std.mem.startsWith(u8, out.items, "error:");
     telem.recordToolCall(name, elapsed, is_error, out.items.len);
 
+    if (std.mem.eql(u8, name, "codedb_search") or std.mem.eql(u8, name, "codedb_find") or std.mem.eql(u8, name, "codedb_word")) {
+        telem.recordSearchBreakdown(explorer.last_search_breakdown);
+    }
+
     // Query + file access tracking WAL
     if (!is_error) {
         if (std.mem.eql(u8, name, "codedb_search") or std.mem.eql(u8, name, "codedb_find") or std.mem.eql(u8, name, "codedb_word")) {

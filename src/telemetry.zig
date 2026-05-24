@@ -28,6 +28,19 @@ pub const Event = struct {
             index_size_bytes: u64,
             startup_time_ms: u64,
         },
+        search_breakdown: struct {
+            tier0_ns: i64,
+            tier05_ns: i64,
+            tier1_ns: i64,
+            tier2_ns: i64,
+            tier3_ns: i64,
+            tier4_ns: i64,
+            tier5_ns: i64,
+            rerank_ns: i64,
+            tier_reached: u8,
+            candidate_count: u32,
+            result_count: u32,
+        },
     };
 };
 
@@ -169,6 +182,28 @@ pub const Telemetry = struct {
         self.record(tc);
     }
 
+    pub fn recordSearchBreakdown(self: *Telemetry, bd: explore.SearchBreakdown) void {
+        if (!self.enabled) return;
+        const clamp = struct {
+            fn f(v: i128) i64 {
+                return @intCast(@min(v, std.math.maxInt(i64)));
+            }
+        }.f;
+        self.record(.{ .search_breakdown = .{
+            .tier0_ns = clamp(bd.tier0_ns),
+            .tier05_ns = clamp(bd.tier05_ns),
+            .tier1_ns = clamp(bd.tier1_ns),
+            .tier2_ns = clamp(bd.tier2_ns),
+            .tier3_ns = clamp(bd.tier3_ns),
+            .tier4_ns = clamp(bd.tier4_ns),
+            .tier5_ns = clamp(bd.tier5_ns),
+            .rerank_ns = clamp(bd.rerank_ns),
+            .tier_reached = bd.tier_reached,
+            .candidate_count = bd.candidate_count,
+            .result_count = bd.result_count,
+        } });
+    }
+
     pub fn recordCodebaseStats(self: *Telemetry, explorer: *explore.Explorer, startup_time_ms: u64) void {
         if (!self.enabled) return;
 
@@ -273,6 +308,14 @@ pub const Telemetry = struct {
                 try w.print("],\"index_size_bytes\":{d},\"startup_time_ms\":{d}", .{
                     stats.index_size_bytes,
                     stats.startup_time_ms,
+                });
+            },
+            .search_breakdown => |sb| {
+                try w.print(",\"event_type\":\"search_breakdown\",\"tier0_ns\":{d},\"tier05_ns\":{d},\"tier1_ns\":{d},\"tier2_ns\":{d},\"tier3_ns\":{d},\"tier4_ns\":{d},\"tier5_ns\":{d},\"rerank_ns\":{d},\"tier_reached\":{d},\"candidates\":{d},\"results\":{d}", .{
+                    sb.tier0_ns,  sb.tier05_ns, sb.tier1_ns,
+                    sb.tier2_ns,  sb.tier3_ns,  sb.tier4_ns,
+                    sb.tier5_ns,  sb.rerank_ns, sb.tier_reached,
+                    sb.candidate_count, sb.result_count,
                 });
             },
         }
