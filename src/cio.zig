@@ -19,7 +19,7 @@ extern "c" fn close(fd: c_int) c_int;
 pub fn ignoreSigpipe() void {
     var act: std.posix.Sigaction = .{
         .handler = .{ .handler = std.posix.SIG.IGN },
-        .mask = 0,
+        .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
     std.posix.sigaction(std.posix.SIG.PIPE, &act, null);
