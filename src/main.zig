@@ -915,7 +915,10 @@ fn mainImpl() !void {
         );
     } else if (std.mem.eql(u8, cmd, "snapshot")) {
         const t0 = cio.nanoTimestamp();
-        const output = if (args.len > cmd_args_start) args[cmd_args_start] else "codedb.snapshot";
+        const output = if (args.len > cmd_args_start) args[cmd_args_start] else blk: {
+            break :blk std.fmt.allocPrint(allocator, "{s}/codedb.snapshot", .{abs_root}) catch "codedb.snapshot";
+        };
+        defer if (args.len <= cmd_args_start and output.len > "codedb.snapshot".len) allocator.free(output);
         snapshot_mod.writeSnapshotDual(io, &explorer, abs_root, output, allocator) catch |err| {
             out.p("{s}\xe2\x9c\x97{s} snapshot failed: {}\n", .{ s.red, s.reset, err });
             std.process.exit(1);
@@ -1426,7 +1429,9 @@ fn scanBg(io: std.Io, store: *Store, explorer: *Explorer, root: []const u8, allo
                 mcp_server.setScanState(.ready);
                 if (shutdown.load(.acquire)) return;
                 telem.recordCodebaseStats(explorer, @intCast(@max(cio.milliTimestamp() - startup_t0, 0)));
-                snapshot_mod.writeSnapshotDual(io, explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
+                const snap_path_1 = std.fmt.allocPrint(allocator, "{s}/codedb.snapshot", .{abs_root}) catch null;
+                defer if (snap_path_1) |p| allocator.free(p);
+                snapshot_mod.writeSnapshotDual(io, explorer, abs_root, snap_path_1 orelse "codedb.snapshot", allocator) catch |err| {
                     std.log.warn("could not auto-write snapshot: {}", .{err});
                 };
                 const fc = explorer.outlines.count();
@@ -1448,7 +1453,9 @@ fn scanBg(io: std.Io, store: *Store, explorer: *Explorer, root: []const u8, allo
                 mcp_server.setScanState(.ready);
                 if (shutdown.load(.acquire)) return;
                 telem.recordCodebaseStats(explorer, @intCast(@max(cio.milliTimestamp() - startup_t0, 0)));
-                snapshot_mod.writeSnapshotDual(io, explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
+                const snap_path_2 = std.fmt.allocPrint(allocator, "{s}/codedb.snapshot", .{abs_root}) catch null;
+                defer if (snap_path_2) |p| allocator.free(p);
+                snapshot_mod.writeSnapshotDual(io, explorer, abs_root, snap_path_2 orelse "codedb.snapshot", allocator) catch |err| {
                     std.log.warn("could not auto-write snapshot: {}", .{err});
                 };
                 const fc = explorer.outlines.count();
@@ -1500,7 +1507,9 @@ fn scanBg(io: std.Io, store: *Store, explorer: *Explorer, root: []const u8, allo
 
     telem.recordCodebaseStats(explorer, @intCast(@max(cio.milliTimestamp() - startup_t0, 0)));
 
-    snapshot_mod.writeSnapshotDual(io, explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
+    const snap_path_3 = std.fmt.allocPrint(allocator, "{s}/codedb.snapshot", .{abs_root}) catch null;
+    defer if (snap_path_3) |p| allocator.free(p);
+    snapshot_mod.writeSnapshotDual(io, explorer, abs_root, snap_path_3 orelse "codedb.snapshot", allocator) catch |err| {
         std.log.warn("could not auto-write snapshot: {}", .{err});
     };
     const file_count = explorer.outlines.count();
