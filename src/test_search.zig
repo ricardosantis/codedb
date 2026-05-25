@@ -1596,3 +1596,45 @@ test "issue-471b: codedb_find error message enumerates accepted aliases" {
     try testing.expect(std.mem.indexOf(u8, out.items, "pattern") != null);
 }
 
+test "issue-451: scope=true search surfaces skip-trigram files" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        var path_buf: [32]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "small_{d}.zig", .{i}) catch unreachable;
+        try explorer.indexFile(path, "fn s() void { _ = widgetX; }\n");
+    }
+
+    try explorer.indexFileSkipTrigram("canonical.zig",
+        \\fn canonical() void {
+        \\    _ = widgetX;
+        \\    _ = widgetX;
+        \\    _ = widgetX;
+        \\    _ = widgetX;
+        \\    _ = widgetX;
+        \\}
+        \\
+    );
+
+    const results = try explorer.searchContentWithScope("widgetX", testing.allocator, 20);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+            if (r.scope_name) |n| testing.allocator.free(n);
+        }
+        testing.allocator.free(results);
+    }
+
+    var found_canonical = false;
+    for (results) |r| {
+        if (std.mem.eql(u8, r.path, "canonical.zig")) {
+            found_canonical = true;
+            try testing.expect(r.scope_name != null);
+            try testing.expect(std.mem.eql(u8, r.scope_name.?, "canonical"));
+        }
+    }
+    try testing.expect(found_canonical);
+}
