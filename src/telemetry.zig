@@ -285,7 +285,7 @@ pub const Telemetry = struct {
     fn formatEvent(self: *Telemetry, ev: *const Event) !usize {
         var stream = std.Io.Writer.fixed(&self.buf);
         const w = &stream;
-        try w.print("{{\"timestamp_ms\":{d}", .{cio.milliTimestamp()});
+        try w.print("{{\"timestamp_ms\":{d},\"version\":\"{s}\"", .{ cio.milliTimestamp(), VERSION });
         switch (ev.kind) {
             .tool_call => |tc| {
                 const name = tc.tool[0..tc.tool_len];
@@ -297,7 +297,7 @@ pub const Telemetry = struct {
                 });
             },
             .session_start => {
-                try w.print(",\"event_type\":\"session_start\",\"version\":\"{s}\",\"platform\":\"{s}\"", .{ VERSION, PLATFORM });
+                try w.print(",\"event_type\":\"session_start\",\"platform\":\"{s}\"", .{PLATFORM});
             },
             .codebase_stats => |stats| {
                 try w.print(",\"event_type\":\"codebase_stats\",\"file_count\":{d},\"total_lines\":{d},\"languages\":[", .{
