@@ -168,18 +168,84 @@ PYEOF
   printf "  ${G}✓${N} cursor       ${D}→ $config${N}\n"
 }
 
+register_hooks() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf "  ${D}hooks:   skip (python3 not found)${N}\n"
+    return
+  fi
+  python3 << 'PYEOF'
+import json, os, stat
+
+home = os.path.expanduser("~")
+hooks_dir = os.path.join(home, ".claude", "hooks")
+settings_path = os.path.join(home, ".claude", "settings.json")
+os.makedirs(hooks_dir, exist_ok=True)
+
+scripts = {
+    "codedb-block-legacy.sh": r'''#!/bin/bash
+command -v jq >/dev/null 2>&1 || exit 0
+command -v codedb >/dev/null 2>&1 || exit 0
+INPUT=$(cat)
+CMD=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
+STRIPPED=$(echo "$CMD" | sed -E 's/^[[:space:]]*(env|sudo|command|builtin|exec|nohup)[[:space:]]+//')
+STRIPPED=$(echo "$STRIPPED" | sed -E 's/^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+//')
+FIRST=$(echo "$STRIPPED" | awk '{print $1}')
+case "$FIRST" in
+  grep|rg|egrep|fgrep) echo "BLOCKED: Use mcp__codedb__codedb_search instead of $FIRST. If codedb MCP is not connected, use Bash directly." >&2; exit 2 ;;
+  cat) echo "BLOCKED: Use mcp__codedb__codedb_read instead of cat. If codedb MCP is not connected, use Bash directly." >&2; exit 2 ;;
+  head|tail) echo "BLOCKED: Use mcp__codedb__codedb_read with line_start/line_end instead of $FIRST. If codedb MCP is not connected, use Bash directly." >&2; exit 2 ;;
+  sed|awk) echo "BLOCKED: Use mcp__codedb__codedb_edit instead of $FIRST. If codedb MCP is not connected, use Bash directly." >&2; exit 2 ;;
+  find) echo "BLOCKED: Use mcp__codedb__codedb_find or mcp__codedb__codedb_glob instead of find. If codedb MCP is not connected, use Bash directly." >&2; exit 2 ;;
+esac
+exit 0
+''',
+    "codedb-warmup.sh": r'''#!/bin/bash
+command -v codedb >/dev/null 2>&1 || exit 0
+codedb . status >/dev/null 2>&1 &
+exit 0
+''',
+}
+
+for name, content in scripts.items():
+    path = os.path.join(hooks_dir, name)
+    with open(path, "w") as f:
+        f.write(content)
+    os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+try:
+    with open(settings_path) as f:
+        data = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    data = {}
+
+hooks = data.setdefault("hooks", {})
+
+# Merge codedb hooks without clobbering existing hooks from other tools
+def merge_hook(event, new_entry):
+    existing = hooks.get(event, [])
+    cmd = new_entry["hooks"][0]["command"]
+    for e in existing:
+        if any(cmd in h.get("command", "") for h in e.get("hooks", [])):
+            return
+    existing.append(new_entry)
+    hooks[event] = existing
+
+merge_hook("PreToolUse", {"matcher": "Bash", "hooks": [{"type": "command", "command": "$HOME/.claude/hooks/codedb-block-legacy.sh"}]})
+merge_hook("SessionStart", {"matcher": "", "hooks": [{"type": "command", "command": "$HOME/.claude/hooks/codedb-warmup.sh"}]})
+
+with open(settings_path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PYEOF
+  printf "  ${G}✓${N} hooks        ${D}→ ~/.claude/hooks/ + settings.json${N}\n"
+}
+
 print_hook_notes() {
   local codedb_bin="$1"
 
   echo ""
   printf "  ${W}mcp command${N}\n"
   printf "  ${C}$codedb_bin mcp${N}\n"
-  echo ""
-  printf "  ${W}optional hooks${N}\n"
-  printf "  ${D}codex${N}        enable [features].codex_hooks in ~/.codex/config.toml\n"
-  printf "  ${D}codex paths${N}  ~/.codex/hooks.json or <repo>/.codex/hooks.json\n"
-  printf "  ${D}claude paths${N} ~/.claude/settings.json or <repo>/.claude/settings.json\n"
-  printf "  ${D}examples${N}     https://github.com/justrach/codedb/blob/release/0.2.579/docs/hooks-labs.md\n"
 }
 
 main() {
@@ -261,6 +327,7 @@ main() {
   register_codex "$dest"
   register_gemini "$dest"
   register_cursor "$dest"
+  register_hooks
   print_hook_notes "$dest"
 
   # Check PATH
