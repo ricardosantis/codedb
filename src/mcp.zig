@@ -864,11 +864,51 @@ fn handleInitialize(s: *Session, root: *const std.json.ObjectMap, id: ?std.json.
             s.client_name = name;
         }
     }
+    // #505 / #506: negotiate the protocol version with the client.
+    // Old versions of opencode/Zed reject a server reply with a NEWER
+    // protocolVersion than they sent. Echo the client's version back when
+    // we recognize it; otherwise fall back to the latest we support.
+    var negotiated: []const u8 = "2025-06-18";
+    proto: {
+        const p = root.get("params") orelse break :proto;
+        if (p != .object) break :proto;
+        const requested = mcpj.getStr(&p.object, "protocolVersion") orelse break :proto;
+        if (negotiateProtocolVersion(requested)) |v| negotiated = v;
+    }
     const init_result = std.fmt.allocPrint(s.alloc,
-        \\{{"protocolVersion":"2025-06-18","capabilities":{{"tools":{{"listChanged":false}}}},"serverInfo":{{"name":"codedb","version":"{s}"}}}}
-    , .{release_info.semver}) catch return;
+        \\{{"protocolVersion":"{s}","capabilities":{{"tools":{{"listChanged":false}}}},"serverInfo":{{"name":"codedb","version":"{s}"}}}}
+    , .{ negotiated, release_info.semver }) catch return;
     defer s.alloc.free(init_result);
     writeResult(s.alloc, s.stdout, id, init_result);
+}
+
+/// Versions of the MCP spec this server has been verified against. Listed
+/// newest-first because clients that send a newer version than we know
+/// should still get our newest known version back, not an old one.
+const SUPPORTED_PROTOCOL_VERSIONS = [_][]const u8{
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+};
+
+/// Pick the protocol version to send back in initialize. Returns the
+/// client's requested version if we recognize it, the latest version we
+/// know about if the request is newer than that, or null if the request
+/// looks malformed and the caller should fall back to a default. See
+/// #505 / #506 — older clients (Zed, certain opencode versions) reject
+/// a server reply with a protocolVersion they don't understand.
+pub fn negotiateProtocolVersion(requested: []const u8) ?[]const u8 {
+    if (requested.len == 0) return null;
+    for (SUPPORTED_PROTOCOL_VERSIONS) |v| {
+        if (std.mem.eql(u8, v, requested)) return v;
+    }
+    // Unknown version. If it looks like a future date (lex-greater than our
+    // latest), reply with our latest. Otherwise reply with our oldest known
+    // version so older clients at least get a compatible-shaped response.
+    if (std.mem.order(u8, requested, SUPPORTED_PROTOCOL_VERSIONS[0]) == .gt) {
+        return SUPPORTED_PROTOCOL_VERSIONS[0];
+    }
+    return SUPPORTED_PROTOCOL_VERSIONS[SUPPORTED_PROTOCOL_VERSIONS.len - 1];
 }
 
 fn requestRoots(s: *Session) void {

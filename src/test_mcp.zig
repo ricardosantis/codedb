@@ -1715,11 +1715,30 @@ test "issue-502: findGitRootFrom returns null when no .git is found upward" {
     }
 }
 
+test "issue-506: negotiateProtocolVersion echoes a recognized client version" {
+    // Before fix, server always replied "2025-06-18", which older Zed and
+    // some opencode builds reject with a timeout because they don't know
+    // that version. Now we echo the client's version when we recognize it.
+    try testing.expectEqualStrings("2024-11-05", mcp_mod.negotiateProtocolVersion("2024-11-05").?);
+    try testing.expectEqualStrings("2025-03-26", mcp_mod.negotiateProtocolVersion("2025-03-26").?);
+    try testing.expectEqualStrings("2025-06-18", mcp_mod.negotiateProtocolVersion("2025-06-18").?);
+}
+
+test "issue-506: negotiateProtocolVersion returns latest for newer-than-known clients" {
+    try testing.expectEqualStrings("2025-06-18", mcp_mod.negotiateProtocolVersion("2099-01-01").?);
+}
+
+test "issue-506: negotiateProtocolVersion returns oldest for ancient/unknown clients" {
+    // A pre-2024-11-05 string lex-orders below SUPPORTED[0], so we serve
+    // the oldest version we know; client decides whether to proceed.
+    try testing.expectEqualStrings("2024-11-05", mcp_mod.negotiateProtocolVersion("2024-01-01").?);
+}
+
+test "issue-506: negotiateProtocolVersion returns null on empty input" {
+    try testing.expect(mcp_mod.negotiateProtocolVersion("") == null);
+}
+
 test "issue-508: appendRemoteErrorHint differentiates Cloudflare 530 from 404/429" {
-    // Cloudflare 530 + error code 1033 → "origin unreachable" hint with the
-    // local-clone fallback. Plain 530 (no Cloudflare body) → softer "retry"
-    // hint. 404 → "repo not indexed". 429 → "rate limited". This is the
-    // actionable bit the user from #508 was missing.
     {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(testing.allocator);
@@ -1750,7 +1769,6 @@ test "issue-508: appendRemoteErrorHint differentiates Cloudflare 530 from 404/42
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(testing.allocator);
         mcp_mod.appendRemoteErrorHint(testing.allocator, &out, 200, "");
-        // Successful status → no hint appended.
         try testing.expectEqual(@as(usize, 0), out.items.len);
     }
 }
