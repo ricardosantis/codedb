@@ -157,6 +157,31 @@ fn mainImpl() !void {
     // See #304.
     if (std.mem.eql(u8, cmd, "mcp")) {
         out.file = cio.File.stderr();
+        // #502: reject unknown flags after `mcp` (e.g. `codedb mcp --snapshot`
+        // was previously consumed silently and the server started anyway,
+        // hiding the typo). Whitelist via isValidMcpFlag.
+        // Handle `--help` here too — parsePositional only catches it when it
+        // sits immediately after `mcp`; combos like `mcp --no-telemetry --help`
+        // need their own bypass.
+        for (args[cmd_args_start..]) |a| {
+            if (a.len == 0 or a[0] != '-') continue;
+            if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "help")) {
+                out.file = stdout;
+                printUsage(&out, s);
+                return;
+            }
+            if (!isValidMcpFlag(a)) {
+                out.p("{s}\xe2\x9c\x97{s} unknown flag for {s}mcp{s}: {s}{s}{s}\n  valid: {s}--no-telemetry{s}, {s}--help{s}, {s}--config-file=<path>{s}\n", .{
+                    s.red,  s.reset,
+                    s.bold, s.reset,
+                    s.bold, a,      s.reset,
+                    s.bold, s.reset,
+                    s.bold, s.reset,
+                    s.bold, s.reset,
+                });
+                std.process.exit(1);
+            }
+        }
     }
 
     // Handle --version early (no root needed)
@@ -1098,6 +1123,15 @@ pub fn parsePositional(args: []const []const u8) ParsedPositional {
         return .{ .root = a1, .cmd = args[2], .cmd_args_start = 3, .root_is_explicit = true };
     }
     return .{ .root = "", .cmd = "", .cmd_args_start = 0, .root_is_explicit = false, .usage_exit = true };
+}
+
+/// Whitelist of post-command flags accepted by `codedb mcp`. Anything else
+/// starting with `-` is rejected at startup (#502). `--config-file=<path>`
+/// is stripped before positional parsing and never reaches this whitelist;
+/// `--help`/`-h`/`help` are rewritten by parsePositional and also never
+/// reach here as a command arg.
+pub fn isValidMcpFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--no-telemetry");
 }
 fn isCommand(arg: []const u8) bool {
     const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "snapshot", "serve", "mcp", "update", "nuke" };

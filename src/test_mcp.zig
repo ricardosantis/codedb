@@ -1658,6 +1658,17 @@ test "parsePositional: existing commands still parse correctly (regression)" {
     }
 }
 
+
+test "issue-502: isValidMcpFlag whitelist rejects unknown flags" {
+    // Before fix: `codedb mcp --snapshot` silently swallowed the flag and
+    // started the server with surprising state. After fix, mainImpl rejects
+    // any non-whitelisted flag with a clear error and exit 1.
+    try testing.expect(main_mod.isValidMcpFlag("--no-telemetry"));
+    try testing.expect(!main_mod.isValidMcpFlag("--snapshot"));
+    try testing.expect(!main_mod.isValidMcpFlag("-x"));
+    try testing.expect(!main_mod.isValidMcpFlag("--help")); // rewritten by parsePositional before reaching here
+    try testing.expect(!main_mod.isValidMcpFlag(""));
+}
 test "issue-507: indexFileOutlineOnly files remain searchable via tier 3" {
     // Repro for #507: after a snapshot rebuild, certain files showed up in
     // `tree` and `read` but searchContent returned 0 hits for substrings
