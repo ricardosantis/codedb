@@ -46,7 +46,7 @@
 
 | What works today                                       | What's in progress                       |
 |--------------------------------------------------------|------------------------------------------|
-| 16 MCP tools for full codebase intelligence            | Deeper parser coverage and edge-case handling |
+| 21 MCP tools for full codebase intelligence            | Deeper parser coverage and edge-case handling |
 | Trigram v2: integer doc IDs, batch-accumulate, merge intersect | Incremental segment-based indexing |
 | 538x faster than ripgrep on pre-indexed queries        | WASM target for Cloudflare Workers       |
 | O(1) inverted word index for identifier lookup         | Multi-project support                    |
@@ -72,6 +72,34 @@ curl -fsSL https://codedb.codegraff.com/install.sh | bash
 
 Downloads the binary for your platform and auto-registers codedb as an MCP server in **Claude Code**, **Codex**, **Gemini CLI**, and **Cursor**. The installer prints the exact `codedb mcp` command it registered plus hook setup pointers for Codex and Claude Code.
 
+### Or via npm/npx (zero-install for MCP clients)
+
+```bash
+npx -y codedeebee mcp
+```
+
+Or install globally:
+
+```bash
+npm install -g codedeebee
+codedb mcp
+```
+
+The npm package is named [`codedeebee`](https://www.npmjs.com/package/codedeebee) (the bare `codedb` name is restricted on npm); it ships a thin launcher that downloads the matching native binary from GitHub Releases on `postinstall` and verifies the SHA256 checksum. The installed CLI is still called `codedb`.
+
+Useful for MCP clients (Claude Code, Cursor, opencode, Claude Desktop) that already use `npx`:
+
+```json
+{
+  "codedb": {
+    "type": "local",
+    "command": ["npx", "-y", "codedeebee"],
+    "args": ["mcp"],
+    "enabled": true
+  }
+}
+```
+
 ### Updating or repairing an older install
 
 If `codedb update` fails on an older release, rerun the installer:
@@ -81,28 +109,6 @@ curl -fsSL https://codedb.codegraff.com/install.sh | bash
 ```
 
 This replaces the `codedb` binary with the latest GitHub Release and keeps your existing MCP registrations, config, caches, and snapshots. Use this path for any release whose built-in updater cannot fetch release checksums.
-
-### v0.2.579 MCP hotfix and release checksums
-
-This note applies to `v0.2.579` only. Earlier `v0.2.579` binaries were rebuilt
-and re-uploaded on May 2, 2026 because they passed the normal Zig test suite but
-missed an MCP end-to-end regression: after `codedb_index` reported success,
-follow-up MCP queries could still see an empty in-memory project (`files: 0`,
-`scan: loading_snapshot`, empty `tree`/`find`/`search`, or `file not indexed`).
-
-The fixed `v0.2.579` release assets were rebuilt from source commit
-`1b634f0ba5cd1072e9ca54cabf442b573e034f53`. The values below are SHA256
-checksums for the uploaded binaries, not Git commit SHAs:
-
-| Binary | SHA256 |
-|--------|--------|
-| `codedb-darwin-arm64` | `b5bddba01767e38e9723f28c7b3ff55370c4eda5f9e0e84172aaec1ff5094cb2` |
-| `codedb-darwin-x86_64` | `cf2a9ec511f99fd839d2349cc17e671cd9566260cf601b8b23dd649665c22999` |
-| `codedb-linux-arm64` | `955b0288c5cfb5c360f7b814cd3cc288ecc42c63a569f65fac358bd9454d788b` |
-| `codedb-linux-x86_64` | `201dfe26bec33b3569c44a3d4893c51822bc793e06fab69fd93e81c0354232ee` |
-
-If you installed `v0.2.579` before this hotfix, rerun the installer above so the
-binary matches the final uploaded checksum for your platform.
 
 ## Documentation
 
@@ -127,7 +133,7 @@ Or install manually from [GitHub Releases](https://github.com/justrach/codedb/re
 
 ### As an MCP server (recommended)
 
-After installing, codedb is automatically registered. Just open a project and the 16 MCP tools are available to your AI agent.
+After installing, codedb is automatically registered. Just open a project and the 21 MCP tools are available to your AI agent.
 
 ```bash
 # Manual MCP start (auto-configured by install script)
@@ -156,7 +162,7 @@ codedb hot                            # recently modified files
 
 ## 🔧 MCP Tools
 
-16 tools over the Model Context Protocol (JSON-RPC 2.0 over stdio):
+21 tools over the Model Context Protocol (JSON-RPC 2.0 over stdio):
 
 | Tool | Description |
 |------|-------------|
@@ -165,18 +171,22 @@ codedb hot                            # recently modified files
 | `codedb_symbol` | Find where a symbol is defined across the codebase |
 | `codedb_search` | Trigram-accelerated full-text search (supports regex, scoped results) |
 | `codedb_word` | O(1) inverted index word lookup |
+| `codedb_callers` | Every call site of a symbol — word index ∩ outline scope, in one round-trip |
+| `codedb_context` | Task-shaped composer — pass a NL task, get keywords + symbol defs + ranked files + top snippets in one block (replaces 3–5 sequential calls) |
 | `codedb_hot` | Most recently modified files |
-| `codedb_deps` | Reverse dependency graph (which files import this file) |
-| `codedb_read` | Read file content (supports line ranges, hash-based caching) |
-| `codedb_edit` | Apply line-range edits (replace, insert, delete — atomic writes) |
+| `codedb_deps` | Dependency graph: `imported_by` (default) or `depends_on`; `transitive=true` for full BFS |
+| `codedb_read` | Read file content (line ranges, `if_hash` skip-unchanged, `compact` mode) |
+| `codedb_edit` | Apply line-range edits (replace, insert, delete — atomic writes, optional `if_hash` guard) |
 | `codedb_changes` | Changed files since a sequence number |
-| `codedb_status` | Index status (file count, current sequence) |
+| `codedb_status` | Index status (file count, current sequence, scan phase) |
 | `codedb_snapshot` | Full pre-rendered JSON snapshot of the codebase |
-| `codedb_bundle` | Batch multiple read-only queries in one call (max 20 ops) |
 | `codedb_remote` | Query indexed public repos via api.wiki.codes — no local clone needed |
 | `codedb_projects` | List all locally indexed projects on this machine |
-| `codedb_index` | Index a local folder and create a codedb.snapshot |
-
+| `codedb_index` | Index a local folder and write `codedb.snapshot` |
+| `codedb_find` | Fuzzy **file-name** search (typo-tolerant subsequence match against indexed paths — not a content/symbol search) |
+| `codedb_glob` | Match indexed paths against a glob pattern (`src/**/*.zig`, `*.md`, …) |
+| `codedb_ls` | List immediate children of a directory — dirs first, then files with language + counts |
+| `codedb_query` | Composable pipeline — chain `find`, `search`, `filter`, `deps`, `outline`, `read`, `sort`, `limit` in one request |
 
 ### `codedb_remote` — Cloud Intelligence
 
@@ -224,6 +234,7 @@ For Codex and Claude Code hook examples around `codedb_remote`, see [`docs/hooks
 | `codedb search <query>` | Full-text search (trigram, case-insensitive) |
 | `codedb search --regex <pattern>` | Regex search |
 | `codedb word <identifier>` | Exact word lookup via inverted index |
+| `codedb read <path>` | Read file contents (supports `-L FROM-TO`, `--compact`) |
 | `codedb hot` | Recently modified files |
 | `codedb snapshot` | Write codedb.snapshot to project root |
 | `codedb serve` | HTTP daemon on :7719 |

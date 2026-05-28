@@ -864,11 +864,51 @@ fn handleInitialize(s: *Session, root: *const std.json.ObjectMap, id: ?std.json.
             s.client_name = name;
         }
     }
+    // #505 / #506: negotiate the protocol version with the client.
+    // Old versions of opencode/Zed reject a server reply with a NEWER
+    // protocolVersion than they sent. Echo the client's version back when
+    // we recognize it; otherwise fall back to the latest we support.
+    var negotiated: []const u8 = "2025-06-18";
+    proto: {
+        const p = root.get("params") orelse break :proto;
+        if (p != .object) break :proto;
+        const requested = mcpj.getStr(&p.object, "protocolVersion") orelse break :proto;
+        if (negotiateProtocolVersion(requested)) |v| negotiated = v;
+    }
     const init_result = std.fmt.allocPrint(s.alloc,
-        \\{{"protocolVersion":"2025-06-18","capabilities":{{"tools":{{"listChanged":false}}}},"serverInfo":{{"name":"codedb","version":"{s}"}}}}
-    , .{release_info.semver}) catch return;
+        \\{{"protocolVersion":"{s}","capabilities":{{"tools":{{"listChanged":false}}}},"serverInfo":{{"name":"codedb","version":"{s}"}}}}
+    , .{ negotiated, release_info.semver }) catch return;
     defer s.alloc.free(init_result);
     writeResult(s.alloc, s.stdout, id, init_result);
+}
+
+/// Versions of the MCP spec this server has been verified against. Listed
+/// newest-first because clients that send a newer version than we know
+/// should still get our newest known version back, not an old one.
+const SUPPORTED_PROTOCOL_VERSIONS = [_][]const u8{
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+};
+
+/// Pick the protocol version to send back in initialize. Returns the
+/// client's requested version if we recognize it, the latest version we
+/// know about if the request is newer than that, or null if the request
+/// looks malformed and the caller should fall back to a default. See
+/// #505 / #506 — older clients (Zed, certain opencode versions) reject
+/// a server reply with a protocolVersion they don't understand.
+pub fn negotiateProtocolVersion(requested: []const u8) ?[]const u8 {
+    if (requested.len == 0) return null;
+    for (SUPPORTED_PROTOCOL_VERSIONS) |v| {
+        if (std.mem.eql(u8, v, requested)) return v;
+    }
+    // Unknown version. If it looks like a future date (lex-greater than our
+    // latest), reply with our latest. Otherwise reply with our oldest known
+    // version so older clients at least get a compatible-shaped response.
+    if (std.mem.order(u8, requested, SUPPORTED_PROTOCOL_VERSIONS[0]) == .gt) {
+        return SUPPORTED_PROTOCOL_VERSIONS[0];
+    }
+    return SUPPORTED_PROTOCOL_VERSIONS[SUPPORTED_PROTOCOL_VERSIONS.len - 1];
 }
 
 fn requestRoots(s: *Session) void {
@@ -2957,6 +2997,33 @@ fn handleRemote(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         out.appendSlice(alloc, " — ") catch {};
         out.appendSlice(alloc, remote.captured.stderr[0..@min(remote.captured.stderr.len, 200)]) catch {};
     }
+
+    // #508: actionable hint based on the HTTP status / Cloudflare body.
+    // Distinguishes "service down" (530 + Cloudflare 1033/1034) from
+    // "repo or path not indexed" (404) from "rate limited" (429) so
+    // agents and humans can decide whether to retry or take a different
+    // path (e.g. clone the repo locally) without parsing the raw error.
+    appendRemoteErrorHint(alloc, out, remote.status, body);
+}
+
+pub fn appendRemoteErrorHint(alloc: std.mem.Allocator, out: *std.ArrayList(u8), status: u16, body: []const u8) void {
+    const has_cf_origin_down =
+        std.mem.indexOf(u8, body, "error code: 1033") != null or
+        std.mem.indexOf(u8, body, "error code: 1034") != null or
+        std.mem.indexOf(u8, body, "Argo Tunnel error") != null;
+
+    const hint: ?[]const u8 = switch (status) {
+        530 => if (has_cf_origin_down)
+            "\n  hint: api.wiki.codes origin is unreachable (Cloudflare). The service is temporarily down — retry in a few minutes, or query the repo locally via `codedb_index` after cloning."
+        else
+            "\n  hint: upstream returned 530. Retry in a few minutes; if it persists, the repo may not be indexed.",
+        404 => "\n  hint: repo or path not indexed by api.wiki.codes. Verify the slug, or clone + `codedb_index` locally.",
+        429 => "\n  hint: rate limited by api.wiki.codes. Wait and retry, or batch fewer requests.",
+        500, 502, 503 => "\n  hint: upstream server error. Retry — if it persists, the service is having a bad time.",
+        504 => "\n  hint: upstream gateway timeout. Retry; the wiki may still be indexing this repo.",
+        else => null,
+    };
+    if (hint) |h| out.appendSlice(alloc, h) catch {};
 }
 
 // ── Local project tools ─────────────────────────────────────────────────────
