@@ -86,6 +86,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var bench_ctx = mcp.BenchContext.init(allocator, tmp_root, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer bench_ctx.deinit();
 
+    try std.process.setCurrentPath(io, tmp_root);
+    defer std.process.setCurrentPath(io, repo_root) catch {};
+
     var telem_off = telemetry.Telemetry{ .enabled = false };
     var telem_on = telemetry.Telemetry{ .enabled = true };
 

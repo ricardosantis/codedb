@@ -1306,6 +1306,7 @@ pub const Explorer = struct {
         defer self.mu.unlockShared();
 
         const outline = self.outlines.getPtr(path) orelse return false;
+        try out.ensureUnusedCapacity(alloc, 128 + outline.symbols.items.len * 128);
         const w = cio.listWriter(out, alloc);
         w.print("{s} ({s}, {d} lines, {d} bytes)\n", .{
             outline.path, @tagName(outline.language), outline.line_count, outline.byte_size,
@@ -1331,6 +1332,31 @@ pub const Explorer = struct {
         return try allocator.dupe(u8, ref.data);
     }
 
+    pub const ReadRenderOptions = struct {
+        if_hash: ?[]const u8 = null,
+        line_start: ?i64 = null,
+        line_end: ?i64 = null,
+        compact: bool = false,
+    };
+
+    /// Render from the in-memory content cache without duplicating the whole
+    /// file. Returns false when the path is not cached, so callers can fall
+    /// back to their existing disk-read path.
+    pub fn renderCachedRead(
+        self: *Explorer,
+        path: []const u8,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        opts: ReadRenderOptions,
+    ) !bool {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        const content = self.contents.get(path) orelse return false;
+        try renderReadBytes(path, content, allocator, out, opts);
+        return true;
+    }
+
     const ContentRef = struct {
         data: []const u8,
         owned: bool, // true = caller must free; false = borrowed from cache
@@ -1350,6 +1376,47 @@ pub const Explorer = struct {
         const dir = self.root_dir orelse std.Io.Dir.cwd();
         const data = dir.readFileAlloc(io, path, allocator, .limited(512 * 1024)) catch return null;
         return .{ .data = data, .owned = true, .allocator = allocator };
+    }
+
+    fn renderReadBytes(
+        path: []const u8,
+        content: []const u8,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        opts: ReadRenderOptions,
+    ) !void {
+        const probe_len = @min(content.len, 8 * 1024);
+        if (std.mem.indexOfScalar(u8, content[0..probe_len], 0) != null) {
+            const w0 = cio.listWriter(out, allocator);
+            const hash_b = std.hash.Wyhash.hash(0, content);
+            try w0.print("binary file: {d} bytes  hash:{x}\n", .{ content.len, hash_b });
+            return;
+        }
+
+        try out.ensureUnusedCapacity(allocator, if (opts.line_start != null or opts.line_end != null or opts.compact) 2048 else @min(content.len + 64, 64 * 1024));
+        const hash = std.hash.Wyhash.hash(0, content);
+        var hash_buf: [16]u8 = undefined;
+        const hash_str = std.fmt.bufPrint(&hash_buf, "{x}", .{hash}) catch "";
+        if (opts.if_hash) |prev| {
+            if (std.mem.eql(u8, prev, hash_str)) {
+                try out.appendSlice(allocator, "unchanged:");
+                try out.appendSlice(allocator, hash_str);
+                return;
+            }
+        }
+
+        const w = cio.listWriter(out, allocator);
+        try w.print("hash:{s}\n", .{hash_str});
+
+        const has_range = opts.line_start != null or opts.line_end != null;
+        if (has_range or opts.compact) {
+            const start: u32 = if (opts.line_start) |n| @intCast(@min(@max(1, n), std.math.maxInt(u32))) else 1;
+            const end: u32 = if (opts.line_end) |n| @intCast(@min(@max(1, n), std.math.maxInt(u32))) else std.math.maxInt(u32);
+            const lang = detectLanguage(path);
+            try appendExtractedLines(content, start, end, true, opts.compact, lang, allocator, out);
+        } else {
+            try out.appendSlice(allocator, content);
+        }
     }
 
     fn cloneOutline(src: *const FileOutline, allocator: std.mem.Allocator) !FileOutline {
@@ -1518,53 +1585,44 @@ pub const Explorer = struct {
         var result_list: std.ArrayList(SymbolResult) = .empty;
         errdefer result_list.deinit(allocator);
 
-        // Track (path, line_start) pairs already appended. symbol_index can be
-        // incomplete after fast-snapshot restore (outlines are populated before
-        // rebuildSymbolIndexFor runs on every file), so we must still fall
-        // through to the outline scan — and dedupe against what the index
-        // already supplied. Keys are "<path>:<line>" allocated from the caller
-        // allocator, freed at end of call.
-        var seen = std.StringHashMap(void).init(allocator);
-        defer {
-            var sit = seen.keyIterator();
-            while (sit.next()) |k| allocator.free(k.*);
-            seen.deinit();
-        }
+        const indexed_locs: []const SymbolLocation = if (self.symbol_index.get(name)) |locs| locs.items else &.{};
 
-        if (self.symbol_index.get(name)) |locs| {
-            for (locs.items) |loc| {
-                var detail: ?[]const u8 = null;
-                if (self.outlines.getPtr(loc.path)) |outline| {
-                    for (outline.symbols.items) |sym| {
-                        if (sym.line_start == loc.line_start and std.mem.eql(u8, sym.name, name)) {
-                            detail = if (sym.detail) |d| try allocator.dupe(u8, d) else null;
-                            break;
-                        }
+        for (indexed_locs) |loc| {
+            var detail: ?[]const u8 = null;
+            if (self.outlines.getPtr(loc.path)) |outline| {
+                for (outline.symbols.items) |sym| {
+                    if (sym.line_start == loc.line_start and std.mem.eql(u8, sym.name, name)) {
+                        detail = if (sym.detail) |d| try allocator.dupe(u8, d) else null;
+                        break;
                     }
                 }
-                try result_list.append(allocator, .{
-                    .path = try allocator.dupe(u8, loc.path),
-                    .symbol = .{
-                        .name = try allocator.dupe(u8, name),
-                        .kind = loc.kind,
-                        .line_start = loc.line_start,
-                        .line_end = loc.line_end,
-                        .detail = detail,
-                    },
-                });
-                const key = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ loc.path, loc.line_start });
-                seen.put(key, {}) catch allocator.free(key);
             }
+            try result_list.append(allocator, .{
+                .path = try allocator.dupe(u8, loc.path),
+                .symbol = .{
+                    .name = try allocator.dupe(u8, name),
+                    .kind = loc.kind,
+                    .line_start = loc.line_start,
+                    .line_end = loc.line_end,
+                    .detail = detail,
+                },
+            });
         }
 
         // Safety scan: append any outline symbols the index missed.
+        const LocLookup = struct {
+            fn contains(locs: []const SymbolLocation, path: []const u8, line_start: u32) bool {
+                for (locs) |loc| {
+                    if (loc.line_start == line_start and std.mem.eql(u8, loc.path, path)) return true;
+                }
+                return false;
+            }
+        };
         var iter = self.outlines.iterator();
         while (iter.next()) |entry| {
             for (entry.value_ptr.symbols.items) |sym| {
                 if (!std.mem.eql(u8, sym.name, name)) continue;
-                var key_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
-                const key = std.fmt.bufPrint(&key_buf, "{s}:{d}", .{ entry.key_ptr.*, sym.line_start }) catch continue;
-                if (seen.contains(key)) continue;
+                if (LocLookup.contains(indexed_locs, entry.key_ptr.*, sym.line_start)) continue;
                 try result_list.append(allocator, .{
                     .path = try allocator.dupe(u8, entry.key_ptr.*),
                     .symbol = .{
@@ -1580,6 +1638,61 @@ pub const Explorer = struct {
         return result_list.toOwnedSlice(allocator);
     }
 
+    pub fn renderSymbols(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !bool {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        const indexed_locs: []const SymbolLocation = if (self.symbol_index.get(name)) |locs| locs.items else &.{};
+        const LocLookup = struct {
+            fn contains(locs: []const SymbolLocation, path: []const u8, line_start: u32) bool {
+                for (locs) |loc| {
+                    if (loc.line_start == line_start and std.mem.eql(u8, loc.path, path)) return true;
+                }
+                return false;
+            }
+        };
+
+        var total: usize = indexed_locs.len;
+        var count_iter = self.outlines.iterator();
+        while (count_iter.next()) |entry| {
+            for (entry.value_ptr.symbols.items) |sym| {
+                if (!std.mem.eql(u8, sym.name, name)) continue;
+                if (LocLookup.contains(indexed_locs, entry.key_ptr.*, sym.line_start)) continue;
+                total += 1;
+            }
+        }
+        if (total == 0) return false;
+
+        try out.ensureUnusedCapacity(allocator, 64 + total * 96);
+        const w = cio.listWriter(out, allocator);
+        try w.print("{d} results for '{s}':\n", .{ total, name });
+
+        for (indexed_locs) |loc| {
+            try w.print("  {s}:{d} ({s})", .{ loc.path, loc.line_start, @tagName(loc.kind) });
+            if (self.outlines.getPtr(loc.path)) |outline| {
+                for (outline.symbols.items) |sym| {
+                    if (sym.line_start == loc.line_start and std.mem.eql(u8, sym.name, name)) {
+                        if (sym.detail) |d| try w.print("  // {s}", .{d});
+                        break;
+                    }
+                }
+            }
+            try w.writeAll("\n");
+        }
+
+        var render_iter = self.outlines.iterator();
+        while (render_iter.next()) |entry| {
+            for (entry.value_ptr.symbols.items) |sym| {
+                if (!std.mem.eql(u8, sym.name, name)) continue;
+                if (LocLookup.contains(indexed_locs, entry.key_ptr.*, sym.line_start)) continue;
+                try w.print("  {s}:{d} ({s})", .{ entry.key_ptr.*, sym.line_start, @tagName(sym.kind) });
+                if (sym.detail) |d| try w.print("  // {s}", .{d});
+                try w.writeAll("\n");
+            }
+        }
+        return true;
+    }
+
     pub fn searchContent(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
         self.mu.lockShared();
         defer self.mu.unlockShared();
@@ -1591,6 +1704,7 @@ pub const Explorer = struct {
 
         var result_list: std.ArrayList(SearchResult) = .empty;
         errdefer result_list.deinit(allocator);
+        try result_list.ensureTotalCapacity(allocator, @min(max_results, 64));
 
         // searched tracks which paths have been scanned — shared across all tiers.
         var searched = std.StringHashMap(void).init(allocator);
@@ -1650,17 +1764,42 @@ pub const Explorer = struct {
             }
 
             const tier0_per_file_cap: usize = if (tier0_files.items.len <= 1) max_results else @max(1, max_results / 5);
+            var tier0_exact_capacity: usize = 0;
+            for (tier0_files.items) |stats| {
+                tier0_exact_capacity += @min(@as(usize, stats.count), tier0_per_file_cap);
+                if (tier0_exact_capacity >= max_results) break;
+            }
+            const use_line_hits = tier0_exact_capacity >= max_results and tier0_per_file_cap <= 256;
             for (tier0_files.items) |stats| {
                 if (result_list.items.len >= max_results) break;
                 const ref = self.readContentForSearch(stats.path, allocator) orelse continue;
                 defer ref.deinit();
-                searched.put(stats.path, {}) catch {};
-                try searchInContent(stats.path, ref.data, query, allocator, tier0_per_file_cap, max_results, &result_list);
+                if (use_line_hits) {
+                    var target_lines: [256]u32 = undefined;
+                    var target_count: usize = 0;
+                    for (word_hits) |hit| {
+                        if (target_count >= tier0_per_file_cap) break;
+                        const hit_path = self.word_index.hitPath(hit);
+                        if (!std.mem.eql(u8, hit_path, stats.path)) continue;
+                        if (target_count == 0 or target_lines[target_count - 1] != hit.line_num) {
+                            target_lines[target_count] = hit.line_num;
+                            target_count += 1;
+                        }
+                    }
+                    try appendTargetLineHits(stats.path, ref.data, allocator, target_lines[0..target_count], max_results, &result_list);
+                    if (result_list.items.len < max_results) searched.put(stats.path, {}) catch {};
+                } else {
+                    searched.put(stats.path, {}) catch {};
+                    try searchInContent(stats.path, ref.data, query, allocator, tier0_per_file_cap, max_results, &result_list);
+                }
             }
             if (result_list.items.len >= max_results) {
                 breakdown.tier0_ns = cio.nanoTimestamp() - t0_start;
                 breakdown.tier_reached = 0;
                 breakdown.result_count = @intCast(result_list.items.len);
+                if (use_line_hits) {
+                    return result_list.toOwnedSlice(allocator);
+                }
                 const t_rerank = cio.nanoTimestamp();
                 const res = self.rerankAndFinalize(&result_list, query, allocator);
                 breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
@@ -1838,6 +1977,171 @@ pub const Explorer = struct {
         const res = self.rerankAndFinalize(&result_list, query, allocator);
         breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
         return res;
+    }
+
+    pub fn renderPlainSearch(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8), max_results: usize, paths_only: bool) !bool {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        if (max_results == 0) return false;
+
+        var breakdown: SearchBreakdown = .{};
+        const t0_start = cio.nanoTimestamp();
+        const word_hits = self.word_index.search(query);
+        if (word_hits.len == 0) return false;
+
+        const Tier0File = struct {
+            doc_id: u32,
+            path: []const u8,
+            count: u32,
+            first_seen: usize,
+            is_doc: bool,
+        };
+
+        var tier0_files_buf: [512]Tier0File = undefined;
+        var tier0_files_len: usize = 0;
+        for (word_hits, 0..) |hit, ordinal| {
+            const hit_path = self.word_index.hitPath(hit);
+            if (hit_path.len == 0) continue;
+
+            var found_i: ?usize = null;
+            for (tier0_files_buf[0..tier0_files_len], 0..) |stats, i| {
+                if (stats.doc_id == hit.doc_id) {
+                    found_i = i;
+                    break;
+                }
+            }
+            if (found_i) |i| {
+                tier0_files_buf[i].count +|= 1;
+            } else {
+                if (tier0_files_len >= tier0_files_buf.len) return false;
+                tier0_files_buf[tier0_files_len] = .{
+                    .doc_id = hit.doc_id,
+                    .path = hit_path,
+                    .count = 1,
+                    .first_seen = ordinal,
+                    .is_doc = isDocLanguage(detectLanguage(hit_path)),
+                };
+                tier0_files_len += 1;
+            }
+        }
+
+        if (tier0_files_len == 0) return false;
+        const tier0_files = tier0_files_buf[0..tier0_files_len];
+        if (tier0_files.len > 1) {
+            std.sort.block(Tier0File, tier0_files, {}, struct {
+                pub fn lessThan(_: void, a: Tier0File, b: Tier0File) bool {
+                    if (a.is_doc != b.is_doc) return !a.is_doc;
+                    if (a.count != b.count) return a.count > b.count;
+                    if (a.first_seen != b.first_seen) return a.first_seen < b.first_seen;
+                    return std.mem.lessThan(u8, a.path, b.path);
+                }
+            }.lessThan);
+        }
+
+        const tier0_per_file_cap: usize = if (tier0_files.len <= 1) max_results else @max(1, max_results / 5);
+        if (tier0_per_file_cap > 256) return false;
+        var tier0_exact_capacity: usize = 0;
+        for (tier0_files) |stats| {
+            tier0_exact_capacity += @min(@as(usize, stats.count), tier0_per_file_cap);
+            if (tier0_exact_capacity >= max_results) break;
+        }
+        if (tier0_exact_capacity < max_results) return false;
+
+        if (!paths_only) {
+            var checked: usize = 0;
+            for (tier0_files) |stats| {
+                if (checked >= max_results) break;
+                if (self.contents.get(stats.path) == null) return false;
+                checked += @min(@as(usize, stats.count), tier0_per_file_cap);
+            }
+        }
+
+        try out.ensureUnusedCapacity(allocator, 64 + max_results * 96);
+        const w = cio.listWriter(out, allocator);
+        try w.print("{d} results for '{s}':\n", .{ max_results, query });
+
+        const CountEntry = struct { doc_id: u32, path: []const u8, count: u8 };
+        var counts: [64]CountEntry = undefined;
+        var counts_len: usize = 0;
+        const max_per_file: u8 = 5;
+        var rendered: usize = 0;
+        var shown: usize = 0;
+
+        for (tier0_files) |stats| {
+            if (rendered >= max_results) break;
+
+            var target_lines: [256]u32 = undefined;
+            var target_count: usize = 0;
+            for (word_hits) |hit| {
+                if (target_count >= tier0_per_file_cap) break;
+                if (hit.doc_id != stats.doc_id) continue;
+                if (target_count == 0 or target_lines[target_count - 1] != hit.line_num) {
+                    target_lines[target_count] = hit.line_num;
+                    target_count += 1;
+                }
+            }
+
+            if (paths_only) {
+                for (target_lines[0..target_count]) |line_num| {
+                    if (rendered >= max_results) break;
+                    rendered += 1;
+                    shown += 1;
+                    try w.print("  {s}:{d}\n", .{ stats.path, line_num });
+                }
+                continue;
+            }
+
+            const content = self.contents.get(stats.path) orelse return false;
+            var target_i: usize = 0;
+            var line_num: u32 = 0;
+            var lines = std.mem.splitScalar(u8, content, '\n');
+            while (lines.next()) |line| {
+                line_num += 1;
+                while (target_i < target_count and target_lines[target_i] < line_num) {
+                    target_i += 1;
+                }
+                if (target_i >= target_count) break;
+                if (target_lines[target_i] != line_num) continue;
+                target_i += 1;
+                rendered += 1;
+
+                var count_idx: ?usize = null;
+                for (counts[0..counts_len], 0..) |entry, idx_i| {
+                    if (entry.doc_id == stats.doc_id) {
+                        count_idx = idx_i;
+                        break;
+                    }
+                }
+                const count_slot = count_idx orelse blk: {
+                    if (counts_len >= counts.len) break :blk counts.len - 1;
+                    counts[counts_len] = .{ .doc_id = stats.doc_id, .path = stats.path, .count = 0 };
+                    counts_len += 1;
+                    break :blk counts_len - 1;
+                };
+                counts[count_slot].count += 1;
+                if (counts[count_slot].count > max_per_file) {
+                    if (counts[count_slot].count == max_per_file + 1) {
+                        try w.print("  {s}: ... (more matches truncated)\n", .{counts[count_slot].path});
+                    }
+                } else {
+                    shown += 1;
+                    try w.print("  {s}:{d}: {s}\n", .{ stats.path, line_num, line });
+                }
+                if (rendered >= max_results) break;
+            }
+        }
+
+        if (shown < max_results) {
+            try w.print("({d} shown, {d} truncated by per-file cap)\n", .{ shown, max_results - shown });
+        }
+
+        breakdown.tier0_ns = cio.nanoTimestamp() - t0_start;
+        breakdown.tier_reached = 0;
+        breakdown.candidate_count = @intCast(word_hits.len);
+        breakdown.result_count = @intCast(max_results);
+        self.last_search_breakdown = breakdown;
+        return rendered >= max_results;
     }
 
     /// Run the multi-signal rerank in place, then transfer ownership of
@@ -2259,6 +2563,30 @@ pub const Explorer = struct {
         return self.word_index.searchDeduped(word, allocator);
     }
 
+    /// Format a word-index lookup directly from the posting list. The indexer
+    /// already stores at most one hit per (word, file, line), so the MCP word
+    /// path does not need to allocate and dedupe a temporary result slice.
+    pub fn renderWord(self: *Explorer, word: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        self.mu.lockShared();
+        const needs_rebuild = !self.word_index_complete and
+            (self.contents.len() > 0 or (self.io != null and self.root_dir != null));
+        self.mu.unlockShared();
+        if (needs_rebuild) {
+            try self.rebuildWordIndex();
+        }
+
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        const hits = self.word_index.search(word);
+        try out.ensureUnusedCapacity(allocator, 64 + hits.len * 48);
+        const w = cio.listWriter(out, allocator);
+        try w.print("{d} hits for '{s}':\n", .{ hits.len, word });
+        for (hits) |h| {
+            try w.print("  {s}:{d}\n", .{ self.word_index.hitPath(h), h.line_num });
+        }
+    }
+
     pub const FuzzyMatch = struct {
         path: []const u8,
         score: f32,
@@ -2333,6 +2661,30 @@ pub const Explorer = struct {
             matches.deinit(allocator);
             return &.{};
         };
+    }
+
+    pub fn renderExactFileFind(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8), max_results: usize) !usize {
+        if (query.len == 0 or max_results == 0) return 0;
+
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        const w = cio.listWriter(out, allocator);
+        var found: usize = 0;
+        var iter = self.outlines.keyIterator();
+        while (iter.next()) |key_ptr| {
+            const path = key_ptr.*;
+            const basename = std.fs.path.basename(path);
+            const stem_end = std.mem.lastIndexOfScalar(u8, basename, '.') orelse basename.len;
+            const stem = basename[0..stem_end];
+            const exact = std.ascii.eqlIgnoreCase(basename, query) or std.ascii.eqlIgnoreCase(stem, query);
+            if (!exact) continue;
+
+            found += 1;
+            try w.print("{d}. {s} (score: 100.00)\n", .{ found, path });
+            if (found >= max_results) break;
+        }
+        return found;
     }
 
     pub const LsEntry = struct {
@@ -2442,6 +2794,39 @@ pub const Explorer = struct {
         return self.dep_graph.getImportedBy(path, allocator);
     }
 
+    pub fn renderImportedBy(self: *Explorer, path: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !struct { count: usize, known: bool } {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |pos| path[pos + 1 ..] else path;
+        const exact = self.dep_graph.reverse.get(path);
+        const w = cio.listWriter(out, allocator);
+        var count: usize = 0;
+
+        if (exact) |rev_set| {
+            var rev_iter = rev_set.keyIterator();
+            while (rev_iter.next()) |key_ptr| {
+                try w.print("  {s}\n", .{key_ptr.*});
+                count += 1;
+            }
+        }
+
+        if (!std.mem.eql(u8, path, basename)) {
+            if (self.dep_graph.reverse.get(basename)) |rev_set| {
+                var rev_iter = rev_set.keyIterator();
+                while (rev_iter.next()) |key_ptr| {
+                    if (exact) |exact_set| {
+                        if (exact_set.contains(key_ptr.*)) continue;
+                    }
+                    try w.print("  {s}\n", .{key_ptr.*});
+                    count += 1;
+                }
+            }
+        }
+
+        return .{ .count = count, .known = self.outlines.contains(path) };
+    }
+
     pub fn getTransitiveDependents(self: *Explorer, path: []const u8, allocator: std.mem.Allocator, max_depth: ?u32) ![]const []const u8 {
         self.mu.lockShared();
         defer self.mu.unlockShared();
@@ -2507,9 +2892,11 @@ pub const Explorer = struct {
     /// formatted top-N directly into `out`. Saves 1 dupe per file
     /// regardless of how many we end up keeping.
     pub fn renderHot(self: *Explorer, store: *Store, allocator: std.mem.Allocator, out: *std.ArrayList(u8), limit: usize) !void {
+        if (limit == 0) return;
         const Entry = struct { path: []const u8, seq: u64 };
-        var entries: std.ArrayList(Entry) = .empty;
-        defer entries.deinit(allocator);
+        var top: std.ArrayList(Entry) = .empty;
+        defer top.deinit(allocator);
+        try top.ensureTotalCapacity(allocator, limit);
         {
             self.mu.lockShared();
             defer self.mu.unlockShared();
@@ -2517,14 +2904,30 @@ pub const Explorer = struct {
             defer store.mu.unlock();
             var iter = self.outlines.iterator();
             while (iter.next()) |kv| {
-                try entries.append(allocator, .{
+                const candidate = Entry{
                     .path = kv.key_ptr.*,
                     .seq = store.getLatestSeqUnlocked(kv.key_ptr.*),
-                });
+                };
+                if (top.items.len < limit) {
+                    top.appendAssumeCapacity(candidate);
+                    continue;
+                }
+
+                var min_i: usize = 0;
+                var min_seq = top.items[0].seq;
+                for (top.items[1..], 1..) |entry, i| {
+                    if (entry.seq < min_seq) {
+                        min_seq = entry.seq;
+                        min_i = i;
+                    }
+                }
+                if (candidate.seq > min_seq) {
+                    top.items[min_i] = candidate;
+                }
             }
         }
 
-        std.mem.sort(Entry, entries.items, {}, struct {
+        std.mem.sort(Entry, top.items, {}, struct {
             fn cmp(_: void, a: Entry, b: Entry) bool {
                 return a.seq > b.seq;
             }
@@ -2536,8 +2939,7 @@ pub const Explorer = struct {
         // window between unlock and reading the slice is too short for that
         // in the MCP single-request path.
         const w = cio.listWriter(out, allocator);
-        const count = @min(limit, entries.items.len);
-        for (entries.items[0..count], 0..) |e, i| {
+        for (top.items, 0..) |e, i| {
             try w.print("{d}. {s}\n", .{ i + 1, e.path });
         }
     }
@@ -4202,6 +4604,32 @@ pub fn extractLines(content: []const u8, start: u32, end: u32, line_numbers: boo
     return aw.toOwnedSlice();
 }
 
+fn appendExtractedLines(
+    content: []const u8,
+    start: u32,
+    end: u32,
+    line_numbers: bool,
+    compact: bool,
+    language: Language,
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+) !void {
+    const w = cio.listWriter(out, allocator);
+    var line_num: u32 = 0;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        line_num += 1;
+        if (line_num < start) continue;
+        if (line_num > end) break;
+        if (compact and isCommentOrBlank(line, language)) continue;
+        if (line_numbers) {
+            try w.print("{d:>5} | {s}\n", .{ line_num, line });
+        } else {
+            try w.print("{s}\n", .{line});
+        }
+    }
+}
+
 /// Returns true if a line is blank or a single-line comment for the given language.
 pub fn isCommentOrBlank(line: []const u8, language: Language) bool {
     const trimmed = std.mem.trim(u8, line, " \t");
@@ -4219,6 +4647,41 @@ pub fn isCommentOrBlank(line: []const u8, language: Language) bool {
         .llvm_ir => std.mem.startsWith(u8, trimmed, ";"),
         else => false,
     };
+}
+
+fn appendTargetLineHits(
+    path: []const u8,
+    content: []const u8,
+    allocator: std.mem.Allocator,
+    target_lines: []const u32,
+    max_results: usize,
+    result_list: *std.ArrayList(SearchResult),
+) !void {
+    if (target_lines.len == 0 or result_list.items.len >= max_results) return;
+    result_list.ensureUnusedCapacity(allocator, @min(target_lines.len, max_results - result_list.items.len)) catch {};
+    var target_i: usize = 0;
+    var line_num: u32 = 0;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        line_num += 1;
+        while (target_i < target_lines.len and target_lines[target_i] < line_num) {
+            target_i += 1;
+        }
+        if (target_i >= target_lines.len) return;
+        if (target_lines[target_i] != line_num) continue;
+        target_i += 1;
+
+        const line_text = try allocator.dupe(u8, line);
+        errdefer allocator.free(line_text);
+        const path_copy = try allocator.dupe(u8, path);
+        errdefer allocator.free(path_copy);
+        try result_list.append(allocator, .{
+            .path = path_copy,
+            .line_num = line_num,
+            .line_text = line_text,
+        });
+        if (result_list.items.len >= max_results) return;
+    }
 }
 
 fn searchInContent(path: []const u8, content: []const u8, query: []const u8, allocator: std.mem.Allocator, max_per_file: usize, max_results: usize, result_list: *std.ArrayList(SearchResult)) !void {

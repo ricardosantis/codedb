@@ -395,51 +395,27 @@ fn writeLanguages(writer: anytype, language_mask: u32) !void {
     }
 }
 
-/// Cache for approxIndexSizeBytes — the iteration is O(unique-trigrams +
-/// unique-words + sparse-ngrams) which got 2x slower after the trigram cap
-/// was lifted to 1MB (more files indexed). codedb_status is the only caller
-/// and a 5-second stale-tolerance is fine for a "this is approximate"
-/// memory metric.
-var size_cache_value: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
-var size_cache_at_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0);
-const SIZE_CACHE_TTL_MS: i64 = 5_000;
-
 pub fn approxIndexSizeBytes(explorer: *const explore.Explorer) u64 {
-    const now = cio.milliTimestamp();
-    const cached_at = size_cache_at_ms.load(.monotonic);
-    if (cached_at != 0 and now - cached_at < SIZE_CACHE_TTL_MS) {
-        return size_cache_value.load(.monotonic);
-    }
+    // Aggregate-only estimate. Keep this O(1): status and startup telemetry call
+    // it on hot paths, and exact allocator accounting would require walking all
+    // word/trigram posting lists.
     var total: u64 = 0;
 
-    var word_iter = explorer.word_index.index.iterator();
-    while (word_iter.next()) |entry| {
-        total +|= entry.key_ptr.*.len;
-        total +|= entry.value_ptr.items.len * @sizeOf(@TypeOf(entry.value_ptr.items[0]));
-    }
-
-    var file_words_iter = explorer.word_index.file_words.iterator();
-    while (file_words_iter.next()) |entry| {
-        total +|= entry.value_ptr.len * @sizeOf(usize);
-    }
+    total +|= @as(u64, @intCast(explorer.word_index.index.count())) * 40;
+    total +|= explorer.word_index.total_tokens * @sizeOf(index.WordHit);
+    total +|= @as(u64, @intCast(explorer.word_index.file_words.count())) * 128;
+    total +|= @as(u64, @intCast(explorer.word_index.doc_lengths.count())) * (@sizeOf(u32) + @sizeOf(u32));
+    total +|= @as(u64, @intCast(explorer.word_index.id_to_path.items.len)) * @sizeOf([]const u8);
 
     switch (explorer.trigram_index) {
         .heap => |heap| {
-            var trigram_iter = heap.index.iterator();
-            while (trigram_iter.next()) |entry| {
-                total +|= @sizeOf(@TypeOf(entry.key_ptr.*));
-                total +|= entry.value_ptr.count() * (@sizeOf(usize) + @sizeOf(index.PostingMask));
-            }
-            var file_trigrams_iter = heap.file_trigrams.iterator();
-            while (file_trigrams_iter.next()) |entry| {
-                total +|= entry.value_ptr.items.len * @sizeOf(@TypeOf(entry.value_ptr.items[0]));
-            }
+            total +|= @as(u64, @intCast(heap.index.count())) * 48;
+            total +|= @as(u64, @intCast(heap.file_trigrams.count())) * 512;
+            total +|= @as(u64, @intCast(heap.id_to_path.items.len)) * @sizeOf([]const u8);
+            total +|= @as(u64, @intCast(heap.free_ids.items.len)) * @sizeOf(u32);
         },
         .mmap, .mmap_overlay => {},
     }
 
-
-    size_cache_value.store(total, .monotonic);
-    size_cache_at_ms.store(now, .monotonic);
     return total;
 }
