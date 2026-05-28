@@ -1659,18 +1659,35 @@ fn triggerScanFromRoots(ctx: *mcp_server.DeferredScan, abs_root: []const u8) voi
 fn watcherDeferredLoop(ctx: *mcp_server.DeferredScan) void {
     const t0 = cio.milliTimestamp();
     const fallback_after_ms: i64 = 3000;
+    // #502: after the 3s fallback fires, give the cwd-policy check a
+    // little more time, then unblock. Previously, when fallback_cwd was
+    // non-indexable (e.g. `/`, `/tmp`, or any other path that fails
+    // isIndexableRoot), `triggerDeferredScanWithFallback` would return
+    // false, leave `triggered=false`, leave `scan_done=false`, and this
+    // loop would poll forever — tool calls saw scan=loading_snapshot
+    // indefinitely and the server hung from the user's POV.
+    const give_up_after_ms: i64 = 13000;
     var fallback_attempted = false;
     while (!ctx.scan_done.load(.acquire) and !ctx.shutdown.load(.acquire)) {
         cio.sleepMs(50);
-        if (!fallback_attempted and cio.milliTimestamp() - t0 >= fallback_after_ms) {
+        const elapsed = cio.milliTimestamp() - t0;
+        if (!fallback_attempted and elapsed >= fallback_after_ms) {
             fallback_attempted = true;
             // Client never sent indexable roots — fall back to cwd so the
             // server doesn't sit in loading_snapshot forever.
             const empty_roots: []const mcp_server.Root = &.{};
             _ = mcp_server.triggerDeferredScanWithFallback(ctx, empty_roots, ctx.fallback_cwd);
         }
+        if (fallback_attempted and elapsed >= give_up_after_ms and !ctx.triggered.load(.acquire)) {
+            std.log.warn("codedb mcp: no indexable root found after {d}ms — exiting deferred mode with empty index. set CODEDB_ROOT or pass `codedb <path> mcp` to fix.", .{give_up_after_ms});
+            ctx.scan_done.store(true, .release);
+            return;
+        }
     }
     if (ctx.shutdown.load(.acquire)) return;
+    // If we exited the loop without ever triggering a scan (give-up path),
+    // resolved_root is empty — skip incrementalLoop so we don't crash.
+    if (!ctx.triggered.load(.acquire)) return;
     watcher.incrementalLoop(ctx.io, ctx.store, ctx.explorer, ctx.queue, ctx.resolved_root, ctx.shutdown, ctx.scan_done);
 }
 
