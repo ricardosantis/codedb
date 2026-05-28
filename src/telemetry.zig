@@ -163,13 +163,18 @@ pub const Telemetry = struct {
 
     pub fn record(self: *Telemetry, kind: Event.Kind) void {
         if (!self.enabled) return;
+        // Fast-out when there's no destination configured. Telemetry default
+        // initialization (`Telemetry{ .enabled = true }`) leaves file=null,
+        // which is the bench harness's "telem_on" — formerly we still paid
+        // for the lock + ring-write + atomic update only to drop it on the
+        // floor at flush time. Skipping here makes telemetry overhead
+        // close to zero for sub-µs tools when no destination is set.
+        if (self.file == null) return;
 
         self.write_lock.lock();
         const next = self.head.fetchAdd(1, .monotonic);
         const slot = next % RING_SIZE;
-        self.ring[slot] = .{
-            .kind = kind,
-        };
+        self.ring[slot] = .{ .kind = kind };
         const tail = self.tail.load(.monotonic);
         if ((next + 1) -% tail > RING_SIZE) {
             self.tail.store((next + 1) -% RING_SIZE, .monotonic);
@@ -177,28 +182,15 @@ pub const Telemetry = struct {
         self.write_lock.unlock();
 
         const count = self.call_count.fetchAdd(1, .monotonic) + 1;
-        // Inline flush amortised every 64 events. Before: every 3 events
-        // landed a writePositionalAll syscall on the hot path, which
-        // dominated the runtime of sub-10µs tools (codedb_status 64%
-        // telemetry, codedb_edit 68%, codedb_changes 72% — see bench).
-        // The sync thread (syncThreadFn) and deinit() still flush, so the
-        // on-disk WAL is at most 64 events stale instead of 3. For local
-        // dashboards / benchmark replay that's well within tolerance, and
-        // p50 latency for the fast tools drops to their real cost.
+        // Inline flush amortised every FLUSH_INTERVAL_EVENTS events. The
+        // sync thread + deinit() also flush, so the on-disk WAL is at
+        // most FLUSH_INTERVAL_EVENTS events stale instead of 3 (the
+        // previous cadence which fired a writePositionalAll syscall on
+        // every sub-µs tool call). See `perf(telemetry)` commit history.
         if (count & (FLUSH_INTERVAL_EVENTS - 1) == 0) {
             self.flush();
         }
-        // syncToCloud was previously called every 10 events in-line, but it
-        // shells out to `curl` with a 5-second --max-time, blocking the
-        // calling thread. That was the cause of codedb's p99 tail latency
-        // (~5–10% of tool calls spiked to 200–400 ms because the curl call
-        // happens on the same thread as the tool response).
-        //
-        // Cloud sync now happens only on shutdown (via deinit). For local
-        // dashboards and benchmark replay the WAL on disk is the source of
-        // truth and is up to date within 64 events.
     }
-
     pub fn recordSessionStart(self: *Telemetry) void {
         self.record(.{ .session_start = {} });
     }
