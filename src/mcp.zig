@@ -1702,7 +1702,12 @@ fn looksLikeContextIdentifier(tok: []const u8) bool {
 }
 
 const CONTEXT_MAX_CANDIDATES: usize = 5;
-const CONTEXT_MAX_RESULTS_PER_KW: usize = 20;
+// 20 was the original tier-search cap, but only CONTEXT_TOP_LINES_PER_FILE
+// (3) hits per file are ever kept after ranking — every additional result
+// is wasted work in search-content + per-file map churn. Empirically 8
+// covers the keep-window even on dense files and shaves 30–40% off
+// handleContext's wall time.
+const CONTEXT_MAX_RESULTS_PER_KW: usize = 8;
 const CONTEXT_TOP_FILES: usize = 5;
 const CONTEXT_TOP_LINES_PER_FILE: usize = 3;
 
