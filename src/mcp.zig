@@ -2957,6 +2957,33 @@ fn handleRemote(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         out.appendSlice(alloc, " — ") catch {};
         out.appendSlice(alloc, remote.captured.stderr[0..@min(remote.captured.stderr.len, 200)]) catch {};
     }
+
+    // #508: actionable hint based on the HTTP status / Cloudflare body.
+    // Distinguishes "service down" (530 + Cloudflare 1033/1034) from
+    // "repo or path not indexed" (404) from "rate limited" (429) so
+    // agents and humans can decide whether to retry or take a different
+    // path (e.g. clone the repo locally) without parsing the raw error.
+    appendRemoteErrorHint(alloc, out, remote.status, body);
+}
+
+pub fn appendRemoteErrorHint(alloc: std.mem.Allocator, out: *std.ArrayList(u8), status: u16, body: []const u8) void {
+    const has_cf_origin_down =
+        std.mem.indexOf(u8, body, "error code: 1033") != null or
+        std.mem.indexOf(u8, body, "error code: 1034") != null or
+        std.mem.indexOf(u8, body, "Argo Tunnel error") != null;
+
+    const hint: ?[]const u8 = switch (status) {
+        530 => if (has_cf_origin_down)
+            "\n  hint: api.wiki.codes origin is unreachable (Cloudflare). The service is temporarily down — retry in a few minutes, or query the repo locally via `codedb_index` after cloning."
+        else
+            "\n  hint: upstream returned 530. Retry in a few minutes; if it persists, the repo may not be indexed.",
+        404 => "\n  hint: repo or path not indexed by api.wiki.codes. Verify the slug, or clone + `codedb_index` locally.",
+        429 => "\n  hint: rate limited by api.wiki.codes. Wait and retry, or batch fewer requests.",
+        500, 502, 503 => "\n  hint: upstream server error. Retry — if it persists, the service is having a bad time.",
+        504 => "\n  hint: upstream gateway timeout. Retry; the wiki may still be indexing this repo.",
+        else => null,
+    };
+    if (hint) |h| out.appendSlice(alloc, h) catch {};
 }
 
 // ── Local project tools ─────────────────────────────────────────────────────

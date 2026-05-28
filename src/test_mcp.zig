@@ -1715,6 +1715,46 @@ test "issue-502: findGitRootFrom returns null when no .git is found upward" {
     }
 }
 
+test "issue-508: appendRemoteErrorHint differentiates Cloudflare 530 from 404/429" {
+    // Cloudflare 530 + error code 1033 → "origin unreachable" hint with the
+    // local-clone fallback. Plain 530 (no Cloudflare body) → softer "retry"
+    // hint. 404 → "repo not indexed". 429 → "rate limited". This is the
+    // actionable bit the user from #508 was missing.
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        mcp_mod.appendRemoteErrorHint(testing.allocator, &out, 530, "error code: 1033");
+        try testing.expect(std.mem.indexOf(u8, out.items, "origin is unreachable") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "codedb_index") != null);
+    }
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        mcp_mod.appendRemoteErrorHint(testing.allocator, &out, 530, "");
+        try testing.expect(std.mem.indexOf(u8, out.items, "Retry") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "origin is unreachable") == null);
+    }
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        mcp_mod.appendRemoteErrorHint(testing.allocator, &out, 404, "");
+        try testing.expect(std.mem.indexOf(u8, out.items, "not indexed") != null);
+    }
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        mcp_mod.appendRemoteErrorHint(testing.allocator, &out, 429, "");
+        try testing.expect(std.mem.indexOf(u8, out.items, "rate limited") != null);
+    }
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        mcp_mod.appendRemoteErrorHint(testing.allocator, &out, 200, "");
+        // Successful status → no hint appended.
+        try testing.expectEqual(@as(usize, 0), out.items.len);
+    }
+}
+
 test "issue-507: indexFileOutlineOnly files remain searchable via tier 3" {
     // Repro for #507: after a snapshot rebuild, certain files showed up in
     // `tree` and `read` but searchContent returned 0 hits for substrings
@@ -1727,8 +1767,6 @@ test "issue-507: indexFileOutlineOnly files remain searchable via tier 3" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
 
-    // A representative file from the upstream report — extension-less shell
-    // script that ends up with language=unknown but still has searchable text.
     const path = "bin/orchestrator";
     const content =
         \\#!/usr/bin/env bash
