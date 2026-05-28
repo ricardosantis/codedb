@@ -57,6 +57,16 @@ const Out = struct {
         self.file.writeAll(self.buf[0..self.used]) catch {};
         self.used = 0;
     }
+
+    /// Print + flush + exit. `std.process.exit(_)` skips the deferred
+    /// `out.flush()`, which used to silently swallow usage and error
+    /// messages on any failure path — `codedb` with no args printed
+    /// nothing and just exited 1 (#504). Use this anywhere we'd
+    /// otherwise call exit() directly after writing user-facing output.
+    fn exitWithFlush(self: *Out, code: u8) noreturn {
+        self.flush();
+        std.process.exit(code);
+    }
 };
 
 /// The real entry point.  In Debug builds, Zig may merge all command-branch
@@ -172,7 +182,7 @@ fn mainImpl() !void {
     const parsed = parsePositional(args);
     if (parsed.usage_exit) {
         printUsage(&out, s);
-        std.process.exit(1);
+        out.exitWithFlush(1);
     }
     root = parsed.root;
     cmd = parsed.cmd;
@@ -233,7 +243,7 @@ fn mainImpl() !void {
                     s.bold, s.reset,
                     s.bold, s.reset,
                 });
-                std.process.exit(1);
+                out.exitWithFlush(1);
             }
         }
     }
@@ -271,7 +281,7 @@ fn mainImpl() !void {
         out.p("{s}\xe2\x9c\x97{s} cannot resolve root: {s}{s}{s}\n", .{
             s.red, s.reset, s.bold, root, s.reset,
         });
-        std.process.exit(1);
+        out.exitWithFlush(1);
     };
     // For `codedb mcp` from cwd, always go through deferred mode: we need the
     // initialize handshake first to know whether the client is going to send
@@ -285,7 +295,7 @@ fn mainImpl() !void {
         out.p("{s}\xe2\x9c\x97{s} refusing to index temporary root: {s}{s}{s}\n", .{
             s.red, s.reset, s.bold, abs_root, s.reset,
         });
-        std.process.exit(1);
+        out.exitWithFlush(1);
     }
 
     const data_dir = try getDataDir(io, allocator, abs_root);
