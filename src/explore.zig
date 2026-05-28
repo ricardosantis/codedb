@@ -688,11 +688,15 @@ pub const Explorer = struct {
             }
             if (!skip_trigram) {
                 try self.trigram_index.indexFile(stable_path, content);
-                try self.sparse_ngram_index.indexFile(stable_path, content);
+                // sparse_ngram_index population removed — it duplicates
+                // ~70% of trigram_index's recall on niche fuzzy queries
+                // at the cost of substantial RSS. Tier 2 (sparse) in
+                // searchContent now no-ops; tier 3 (skip_trigram_files)
+                // + tier 5 (full-scan when !trigram_ruled_out) cover
+                // the same surface area.
                 _ = self.skip_trigram_files.remove(stable_path);
             } else {
                 self.trigram_index.removeFile(stable_path);
-                self.sparse_ngram_index.removeFile(stable_path);
                 try self.skip_trigram_files.put(stable_path, {});
             }
         } else {
