@@ -538,12 +538,19 @@ pub const Explorer = struct {
     search_tier5_count: u64 = 0,
     last_search_breakdown: SearchBreakdown = .{},
 
-    pub const DEFAULT_CONTENT_CACHE_CAPACITY: u32 = 16384;
+    /// Default file-content cache capacity. Was 16384, but on typical
+    /// projects (≤2000 files) the cache only ever holds a few hundred
+    /// entries — the other 14000+ slots are pure overhead (786 KB of
+    /// metadata alone for the 16 384-slot Slot array). 4096 is plenty
+    /// for 99% of repos; large monorepos can override via config or
+    /// pass a custom value to Explorer.init.
+    pub const DEFAULT_CONTENT_CACHE_CAPACITY: u32 = 4096;
 
     pub fn setRoot(self: *Explorer, io: std.Io, root_path: []const u8) void {
         self.io = io;
         self.root_dir = std.Io.Dir.cwd().openDir(io, root_path, .{}) catch null;
     }
+
     pub fn init(allocator: std.mem.Allocator, content_cache_capacity: u32) Explorer {
         return .{
             .outlines = std.StringHashMap(FileOutline).init(allocator),
