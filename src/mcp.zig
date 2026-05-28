@@ -1939,8 +1939,15 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
             var any_callers = false;
             var seen_caller = std.StringHashMap(void).init(A);
             var total_shown: u32 = 0;
+            // Dedupe scoped searches by keyword — multiple sym_refs often
+            // share the same kw (same symbol defined in multiple files);
+            // running searchContentWithScope per sym_ref was 30 µs × 6
+            // searches = 180 µs of redundant work on the bench task.
+            var searched_kw = std.StringHashMap(void).init(A);
             for (sym_refs.items) |sr| {
                 if (total_shown >= 6) break;
+                if (searched_kw.contains(sr.kw)) continue;
+                searched_kw.put(sr.kw, {}) catch {};
                 const scoped = explorer.searchContentWithScope(sr.kw, A, 30) catch continue;
                 var shown_for_sym: u32 = 0;
                 for (scoped) |r| {
@@ -1948,7 +1955,6 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                     if (!langHasCallSites(explore_mod.detectLanguage(r.path))) continue;
                     // Skip the definition site itself
                     if (r.line_num == sr.line and std.mem.eql(u8, r.path, sr.path)) continue;
-                    // Skip test/spec/fixture paths
                     // Skip test/spec/fixture paths
                     const is_test = std.mem.startsWith(u8, r.path, "tests/") or
                         std.mem.startsWith(u8, r.path, "test/") or
@@ -1959,12 +1965,9 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                         std.mem.indexOf(u8, r.path, "/spec/") != null or
                         std.mem.indexOf(u8, r.path, "/fixtures/") != null;
                     if (is_test) continue;
-                    // Skip matches inside import statements / module-level type
-                    // declarations — those are signature noise, not real callers
                     if (r.scope_kind) |sk| {
                         if (sk == .import or sk == .type_alias or sk == .constant) continue;
                     }
-                    // Dedupe across sym_refs by path:line
                     const dedup_key = std.fmt.allocPrint(A, "{s}:{d}", .{ r.path, r.line_num }) catch continue;
                     if (seen_caller.contains(dedup_key)) continue;
                     seen_caller.put(dedup_key, {}) catch {};
