@@ -5,6 +5,29 @@ const explore = @import("explore.zig");
 const index = @import("index.zig");
 
 const RING_SIZE = 256;
+/// Inline flush cadence. Must be a power of two so the hot path can mask
+/// instead of mod. Sized so a busy session still flushes within the
+/// background sync window. RING_SIZE / FLUSH_INTERVAL_EVENTS ≥ 4 means
+const FLUSH_INTERVAL_EVENTS: u64 = 64;
+
+/// Tiny CAS-based spinlock. record() is the WAL hot path so the lock has
+/// to be cheaper than pthread_mutex (~150 ns) and std.Io.Mutex is
+/// async-context aware and overkill for an SPSC ring. Uncontended
+/// lock+unlock is ~5–10 ns. spinLoopHint keeps power down on the rare
+/// contended case (typically only when flush is concurrent with record).
+const SpinLock = struct {
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
+    fn lock(self: *SpinLock) void {
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic)) |_| {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlock(self: *SpinLock) void {
+        self.state.store(0, .release);
+    }
+};
 const CLOUD_URL = "https://codedb.codegraff.com/telemetry/ingest";
 const VERSION = @import("release_info.zig").semver;
 const PLATFORM = std.fmt.comptimePrint("{s}-{s}", .{ @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) });
@@ -56,7 +79,12 @@ pub const Telemetry = struct {
     path_buf: [std.fs.max_path_bytes]u8 = undefined,
     path_len: usize = 0,
     call_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    write_lock: cio.Mutex = .{},
+    /// Compact spinlock for the WAL ring. Uncontended lock is ~5–10 ns
+    /// (single CAS + acquire fence), vs ~100–200 ns for pthread_mutex via
+    /// libc on macOS. record() is the only writer except during the
+    /// rare flush(), so contention is effectively zero — spinning is
+    /// strictly cheaper than the futex/syscall path. See #504-bench.
+    write_lock: SpinLock = .{},
     /// Background sync thread (set by startSyncThread). Cloud sync runs on
     /// this thread so it never blocks the tool-call response path.
     sync_thread: ?std.Thread = null,
@@ -149,8 +177,15 @@ pub const Telemetry = struct {
         self.write_lock.unlock();
 
         const count = self.call_count.fetchAdd(1, .monotonic) + 1;
-        // Flush local WAL every 3 events — fast (local file write).
-        if (count % 3 == 0) {
+        // Inline flush amortised every 64 events. Before: every 3 events
+        // landed a writePositionalAll syscall on the hot path, which
+        // dominated the runtime of sub-10µs tools (codedb_status 64%
+        // telemetry, codedb_edit 68%, codedb_changes 72% — see bench).
+        // The sync thread (syncThreadFn) and deinit() still flush, so the
+        // on-disk WAL is at most 64 events stale instead of 3. For local
+        // dashboards / benchmark replay that's well within tolerance, and
+        // p50 latency for the fast tools drops to their real cost.
+        if (count & (FLUSH_INTERVAL_EVENTS - 1) == 0) {
             self.flush();
         }
         // syncToCloud was previously called every 10 events in-line, but it
@@ -161,7 +196,7 @@ pub const Telemetry = struct {
         //
         // Cloud sync now happens only on shutdown (via deinit). For local
         // dashboards and benchmark replay the WAL on disk is the source of
-        // truth and is up to date within 3 events.
+        // truth and is up to date within 64 events.
     }
 
     pub fn recordSessionStart(self: *Telemetry) void {
