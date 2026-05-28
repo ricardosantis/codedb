@@ -1,6 +1,30 @@
 # Changelog
 
 
+## 0.2.5821 - 2026-05-28
+
+Bundle of seven fixes from the open-issue triage on 2026-05-28.
+
+### MCP server fixes
+
+- **#502 + #503 — arg parser overhaul.** `codedb mcp <path>` no longer hangs forever in deferred mode (it now honors the path as root). `codedb mcp --help` prints usage instead of starting the server. Unknown post-`mcp` flags (e.g. `codedb mcp --snapshot`) are now rejected with a listed-valid-flags error. `codedb mcp` from a git-repo subdirectory walks up to the repo root. The deferred-scan path can no longer hang in `loading_snapshot` forever when the cwd isn't indexable — gives up after 13 s and unblocks `scan_done`.
+- **#505 + #506 — MCP protocol version negotiation.** The server previously hardcoded `protocolVersion: "2025-06-18"`, which older Zed and certain opencode versions rejected with a startup timeout / "No MCP tools". Now echoes the client's version when it's one we've verified against (`2024-11-05`, `2025-03-26`, `2025-06-18`); for newer-than-known clients we return our latest known version.
+- **#507 — search misses content after snapshot rebuild.** Files routed through `indexFileOutlineOnly` (snapshot load fallback, watcher incremental updates, WASM fast-path) were registered in `outlines` and `contents` but not in any search index. They were invisible to every search tier — including the tier-5 full-scan fallback, which short-circuited because the trigram index returned a non-null empty candidate set. Fixed by registering outline-only files in `skip_trigram_files` so tier 3 substring-scans them.
+- **#508 — actionable `codedb_remote` errors.** The remote tool now distinguishes Cloudflare 530 / 1033 origin-unreachable from 404 (repo not indexed), 429 (rate limited), and 5xx (upstream error) with retry / local-fallback hints. The server-side outage at `api.wiki.codes` is not fixed by this change; the UX is.
+
+### Startup / platform
+
+- **#504 — macOS Intel x64 segfault on bare `codedb`.** Bisected via Rosetta: Zig 0.16's runtime wrapper around `pub fn main(...) !void` crashes at startup on signed x86_64-macos binaries. The user saw `codedb` segfault before any output reached the terminal. Fix: `pub fn main(...) void` (infallible) + `mainTrampoline()` for the fallible work + a `handleFastPath` short-circuit for bare/`--version` invocations that writes via raw `std.c.write` and bypasses the worker-thread trampoline entirely. Also fixes a related "output silently lost on early exit" bug where `std.process.exit(_)` skipped the deferred `Out.flush()`; `Out.exitWithFlush` now handles the common usage / error-message exit paths.
+
+### Distribution
+
+- **#501 — npm/npx distribution.** Published [`codedeebee`](https://www.npmjs.com/package/codedeebee) as the npx-friendly sibling of `codedb`. `npx -y codedeebee mcp` does a one-shot install: thin Node launcher + `postinstall` that downloads the matching native binary from this GitHub release and SHA256-verifies against `checksums.sha256`. The bare `codedb` name is restricted on npm; the package is `codedeebee` but the CLI it installs is still called `codedb`.
+
+### Installer
+
+- **Hook-priority race.** `install/install.sh` now detects competing legacy-tools hooks (`block-legacy-tools.sh`, muonry, zigrep, zigread) and inserts codedb's hook at index 0 instead of appending. Re-runs reshuffle an already-registered codedb hook to the front if a competitor has appeared since the previous install.
+
+
 ## 0.2.5813 - 2026-05-12
 
 `0.2.5813` ships three structural improvements: a Tier 0 search-quality rewrite, a 4-6x faster regex matcher, and a bounded-memory content cache.
