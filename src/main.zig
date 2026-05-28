@@ -57,6 +57,16 @@ const Out = struct {
         self.file.writeAll(self.buf[0..self.used]) catch {};
         self.used = 0;
     }
+
+    /// Print + flush + exit. `std.process.exit(_)` skips the deferred
+    /// `out.flush()`, which used to silently swallow usage and error
+    /// messages on any failure path — `codedb` with no args printed
+    /// nothing and just exited 1 (#504). Use this anywhere we'd
+    /// otherwise call exit() directly after writing user-facing output.
+    fn exitWithFlush(self: *Out, code: u8) noreturn {
+        self.flush();
+        std.process.exit(code);
+    }
 };
 
 /// The real entry point.  In Debug builds, Zig may merge all command-branch
@@ -64,11 +74,66 @@ const Out = struct {
 /// so we trampoline through a thread with an explicit 64 MB stack.
 /// In optimised builds the merged frame is ~190 KB, so 8 MB is ample and
 /// avoids triggering Rosetta 2's 64 MB stack allocation bug on x86_64-macos.
-pub fn main(init: std.process.Init.Minimal) !void {
+///
+/// #504: must have a non-error-union return type. A Zig binary with
+/// `pub fn main(...) !void` ad-hoc-signed and run via Rosetta (or, in the
+/// user-reported case, on a native macOS Intel build that ends up with a
+/// similar startup-path tripwire) segfaults BEFORE main runs — the runtime's
+/// error-handling wrapper is what crashes. Verified with a minimal repro:
+/// `pub fn main(init) void { ... }` works; `!void` does not. Same crash
+/// happens if the entry point spawns a thread before writing to stderr.
+/// So we keep the entry point synchronous + infallible, and push any
+/// fallible work into mainImpl which runs after we've already had a chance
+/// to surface usage / --version output via the fast path.
+pub fn main(init: std.process.Init.Minimal) void {
     cio.setProcessArgs(init.args.vector);
+    if (handleFastPath(init.args.vector)) return;
+    mainTrampoline() catch |err| {
+        // Surface the failure on stderr so users see something even if the
+        // worker thread crashes during startup.
+        var buf: [256]u8 = undefined;
+        if (std.fmt.bufPrint(&buf, "codedb: fatal startup error: {s}\n", .{@errorName(err)})) |msg| {
+            _ = std.c.write(2, msg.ptr, msg.len);
+        } else |_| {}
+        std.process.exit(1);
+    };
+}
+
+fn mainTrampoline() !void {
     const stack_size: usize = if (builtin.mode == .Debug) 64 * 1024 * 1024 else 8 * 1024 * 1024;
     const thread = try std.Thread.spawn(.{ .stack_size = stack_size }, mainInner, .{});
     thread.join();
+}
+
+/// Returns true if the invocation was handled and `main` should exit.
+/// Designed to be the cheapest possible path — uses raw stdout writes
+/// instead of any of the heavier init machinery in mainImpl, so a bug
+/// further down the stack can't take out plain `codedb` / `--help` /
+/// `--version` invocations.
+fn handleFastPath(argv: []const [*:0]const u8) bool {
+    const stdout_fd: c_int = 1;
+    const stderr_fd: c_int = 2;
+
+    if (argv.len < 2) {
+        const msg =
+            "codedb  code intelligence server\n\n" ++
+            "  usage: codedb [root] <command> [args...]\n\n" ++
+            "  run `codedb --help` for the full command list.\n";
+        _ = std.c.write(stderr_fd, msg.ptr, msg.len);
+        std.process.exit(1);
+    }
+
+    const a1 = std.mem.span(argv[1]);
+    if (std.mem.eql(u8, a1, "--version") or std.mem.eql(u8, a1, "-v") or std.mem.eql(u8, a1, "version")) {
+        var buf: [128]u8 = undefined;
+        const out = std.fmt.bufPrint(&buf, "codedb {s}\n", .{release_info.semver}) catch {
+            std.process.exit(0);
+        };
+        _ = std.c.write(stdout_fd, out.ptr, out.len);
+        std.process.exit(0);
+    }
+
+    return false;
 }
 
 fn mainInner() void {
@@ -128,38 +193,15 @@ fn mainImpl() !void {
     var cmd_args_start: usize = undefined;
     var root_is_explicit: bool = false;
 
-    if (args.len >= 2 and std.mem.eql(u8, args[1], "--mcp")) {
-        root = ".";
-        cmd = "mcp";
-        cmd_args_start = 2;
-    } else if (args.len >= 2 and (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "-v"))) {
-        root = ".";
-        cmd = "--version";
-        cmd_args_start = 2;
-    } else if (args.len >= 2 and
-        (std.mem.eql(u8, args[1], "--help") or
-            std.mem.eql(u8, args[1], "-h") or
-            std.mem.eql(u8, args[1], "help")))
-    {
-        root = ".";
-        cmd = args[1];
-        cmd_args_start = 2;
-    } else if (args.len < 2) {
+    const parsed = parsePositional(args);
+    if (parsed.usage_exit) {
         printUsage(&out, s);
-        std.process.exit(1);
-    } else if (isCommand(args[1])) {
-        root = ".";
-        cmd = args[1];
-        cmd_args_start = 2;
-    } else if (args.len >= 3) {
-        root = args[1];
-        cmd = args[2];
-        cmd_args_start = 3;
-        root_is_explicit = true;
-    } else {
-        printUsage(&out, s);
-        std.process.exit(1);
+        out.exitWithFlush(1);
     }
+    root = parsed.root;
+    cmd = parsed.cmd;
+    cmd_args_start = parsed.cmd_args_start;
+    root_is_explicit = parsed.root_is_explicit;
 
     // CODEDB_ROOT env var lets clients (Claude Code MCP, shell scripts) pin
     // the root without needing to pass a positional arg. Treated as explicit
@@ -175,11 +217,49 @@ fn mainImpl() !void {
         }
     }
 
+    // #502: when `codedb mcp` is launched from a subdirectory of a git
+    // repo (e.g. opencode/Zed spawning from the buffer's directory), walk
+    // up to the repo root so the user gets the whole project indexed
+    // rather than the subdir they happen to be in. Skipped if the env var
+    // or a positional arg already pinned the root, or if no .git is found.
+    var git_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (std.mem.eql(u8, cmd, "mcp") and std.mem.eql(u8, root, ".") and !root_is_explicit) {
+        if (findGitRoot(io, &git_root_buf)) |git_root| {
+            root = git_root;
+            root_is_explicit = true;
+        }
+    }
+
     // MCP stdio reserves stdout for JSON-RPC — route status/error output to
     // stderr so startup/failure paths don't corrupt the protocol stream.
     // See #304.
     if (std.mem.eql(u8, cmd, "mcp")) {
         out.file = cio.File.stderr();
+        // #502: reject unknown flags after `mcp` (e.g. `codedb mcp --snapshot`
+        // was previously consumed silently and the server started anyway,
+        // hiding the typo). Whitelist via isValidMcpFlag.
+        // Handle `--help` here too — parsePositional only catches it when it
+        // sits immediately after `mcp`; combos like `mcp --no-telemetry --help`
+        // need their own bypass.
+        for (args[cmd_args_start..]) |a| {
+            if (a.len == 0 or a[0] != '-') continue;
+            if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "help")) {
+                out.file = stdout;
+                printUsage(&out, s);
+                return;
+            }
+            if (!isValidMcpFlag(a)) {
+                out.p("{s}\xe2\x9c\x97{s} unknown flag for {s}mcp{s}: {s}{s}{s}\n  valid: {s}--no-telemetry{s}, {s}--help{s}, {s}--config-file=<path>{s}\n", .{
+                    s.red,  s.reset,
+                    s.bold, s.reset,
+                    s.bold, a,      s.reset,
+                    s.bold, s.reset,
+                    s.bold, s.reset,
+                    s.bold, s.reset,
+                });
+                out.exitWithFlush(1);
+            }
+        }
     }
 
     // Handle --version early (no root needed)
@@ -215,7 +295,7 @@ fn mainImpl() !void {
         out.p("{s}\xe2\x9c\x97{s} cannot resolve root: {s}{s}{s}\n", .{
             s.red, s.reset, s.bold, root, s.reset,
         });
-        std.process.exit(1);
+        out.exitWithFlush(1);
     };
     // For `codedb mcp` from cwd, always go through deferred mode: we need the
     // initialize handshake first to know whether the client is going to send
@@ -229,7 +309,7 @@ fn mainImpl() !void {
         out.p("{s}\xe2\x9c\x97{s} refusing to index temporary root: {s}{s}{s}\n", .{
             s.red, s.reset, s.bold, abs_root, s.reset,
         });
-        std.process.exit(1);
+        out.exitWithFlush(1);
     }
 
     const data_dir = try getDataDir(io, allocator, abs_root);
@@ -1068,6 +1148,104 @@ fn mainImpl() !void {
         std.process.exit(1);
     }
 }
+
+pub const ParsedPositional = struct {
+    root: []const u8,
+    cmd: []const u8,
+    cmd_args_start: usize,
+    root_is_explicit: bool,
+    usage_exit: bool = false,
+};
+
+/// Parse positional args into root/cmd. Pure, side-effect-free — caller is
+/// responsible for printUsage()/exit when `usage_exit` is set.
+///
+/// Special cases:
+///   - `codedb mcp <path>` is honored as `codedb <path> mcp` (issue #503).
+///     The wrong arg order is a frequent typo from users who think `mcp` is
+///     a normal subcommand. Treating the path as root prevents the deferred
+///     scan from hanging forever waiting for a `roots/list` that never comes.
+///   - `codedb mcp --help` (or `-h`/`help`) prints usage instead of starting
+///     the MCP server (issue #502).
+pub fn parsePositional(args: []const []const u8) ParsedPositional {
+    if (args.len < 2) {
+        return .{ .root = "", .cmd = "", .cmd_args_start = 0, .root_is_explicit = false, .usage_exit = true };
+    }
+    const a1 = args[1];
+    if (std.mem.eql(u8, a1, "--mcp")) {
+        return .{ .root = ".", .cmd = "mcp", .cmd_args_start = 2, .root_is_explicit = false };
+    }
+    if (std.mem.eql(u8, a1, "--version") or std.mem.eql(u8, a1, "-v")) {
+        return .{ .root = ".", .cmd = "--version", .cmd_args_start = 2, .root_is_explicit = false };
+    }
+    if (std.mem.eql(u8, a1, "--help") or std.mem.eql(u8, a1, "-h") or std.mem.eql(u8, a1, "help")) {
+        return .{ .root = ".", .cmd = a1, .cmd_args_start = 2, .root_is_explicit = false };
+    }
+    if (isCommand(a1)) {
+        // `codedb mcp --help` → print help, do not start server. #502.
+        if (std.mem.eql(u8, a1, "mcp") and args.len >= 3) {
+            const a2 = args[2];
+            if (std.mem.eql(u8, a2, "--help") or std.mem.eql(u8, a2, "-h") or std.mem.eql(u8, a2, "help")) {
+                return .{ .root = ".", .cmd = "--help", .cmd_args_start = 3, .root_is_explicit = false };
+            }
+            // `codedb mcp <path>` → honor path as root. #503.
+            // Only when args[2] doesn't look like a flag; otherwise it's a
+            // legitimate command-arg that the mcp subcommand may consume.
+            if (a2.len > 0 and a2[0] != '-') {
+                return .{ .root = a2, .cmd = "mcp", .cmd_args_start = 3, .root_is_explicit = true };
+            }
+        }
+        return .{ .root = ".", .cmd = a1, .cmd_args_start = 2, .root_is_explicit = false };
+    }
+    if (args.len >= 3) {
+        return .{ .root = a1, .cmd = args[2], .cmd_args_start = 3, .root_is_explicit = true };
+    }
+    return .{ .root = "", .cmd = "", .cmd_args_start = 0, .root_is_explicit = false, .usage_exit = true };
+}
+
+/// Walk up from cwd looking for a `.git` directory or file (git worktree).
+/// Returns a slice into `buf` containing the absolute path, or null if no
+/// repo root is found before reaching the filesystem root. Used to make
+/// `codedb mcp` from inside a subdir of a git repo Just Work (#502).
+pub fn findGitRoot(io: std.Io, buf: *[std.fs.max_path_bytes]u8) ?[]const u8 {
+    const cwd_len = std.Io.Dir.cwd().realPathFile(io, ".", buf) catch return null;
+    return findGitRootFrom(io, buf, cwd_len);
+}
+
+/// Test-friendly variant: walk up from `buf[0..start_len]` (must already be
+/// an absolute path) looking for `.git`. Mutates buf in place. Returns slice
+/// or null. Kept separate so tests can hand in synthetic absolute paths
+/// without chdir'ing the process.
+pub fn findGitRootFrom(io: std.Io, buf: *[std.fs.max_path_bytes]u8, start_len: usize) ?[]const u8 {
+    var len = start_len;
+    var probe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    while (len > 0) {
+        const here = buf[0..len];
+        const probe = std.fmt.bufPrint(&probe_buf, "{s}/.git", .{here}) catch return null;
+        if (std.Io.Dir.cwd().statFile(io, probe, .{})) |_| {
+            return here;
+        } else |_| {}
+        if (std.mem.lastIndexOfScalar(u8, here, '/')) |slash| {
+            if (slash == 0) {
+                // Reached "/<dir>"; one more step to filesystem root, no match.
+                return null;
+            }
+            len = slash;
+        } else {
+            return null;
+        }
+    }
+    return null;
+}
+/// Whitelist of post-command flags accepted by `codedb mcp`. Anything else
+/// starting with `-` is rejected at startup (#502). `--config-file=<path>`
+/// is stripped before positional parsing and never reaches this whitelist;
+/// `--help`/`-h`/`help` are rewritten by parsePositional and also never
+/// reach here as a command arg.
+pub fn isValidMcpFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--no-telemetry");
+}
+
 fn isCommand(arg: []const u8) bool {
     const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "snapshot", "serve", "mcp", "update", "nuke" };
     for (commands) |c| {
@@ -1546,18 +1724,35 @@ fn triggerScanFromRoots(ctx: *mcp_server.DeferredScan, abs_root: []const u8) voi
 fn watcherDeferredLoop(ctx: *mcp_server.DeferredScan) void {
     const t0 = cio.milliTimestamp();
     const fallback_after_ms: i64 = 3000;
+    // #502: after the 3s fallback fires, give the cwd-policy check a
+    // little more time, then unblock. Previously, when fallback_cwd was
+    // non-indexable (e.g. `/`, `/tmp`, or any other path that fails
+    // isIndexableRoot), `triggerDeferredScanWithFallback` would return
+    // false, leave `triggered=false`, leave `scan_done=false`, and this
+    // loop would poll forever — tool calls saw scan=loading_snapshot
+    // indefinitely and the server hung from the user's POV.
+    const give_up_after_ms: i64 = 13000;
     var fallback_attempted = false;
     while (!ctx.scan_done.load(.acquire) and !ctx.shutdown.load(.acquire)) {
         cio.sleepMs(50);
-        if (!fallback_attempted and cio.milliTimestamp() - t0 >= fallback_after_ms) {
+        const elapsed = cio.milliTimestamp() - t0;
+        if (!fallback_attempted and elapsed >= fallback_after_ms) {
             fallback_attempted = true;
             // Client never sent indexable roots — fall back to cwd so the
             // server doesn't sit in loading_snapshot forever.
             const empty_roots: []const mcp_server.Root = &.{};
             _ = mcp_server.triggerDeferredScanWithFallback(ctx, empty_roots, ctx.fallback_cwd);
         }
+        if (fallback_attempted and elapsed >= give_up_after_ms and !ctx.triggered.load(.acquire)) {
+            std.log.warn("codedb mcp: no indexable root found after {d}ms — exiting deferred mode with empty index. set CODEDB_ROOT or pass `codedb <path> mcp` to fix.", .{give_up_after_ms});
+            ctx.scan_done.store(true, .release);
+            return;
+        }
     }
     if (ctx.shutdown.load(.acquire)) return;
+    // If we exited the loop without ever triggering a scan (give-up path),
+    // resolved_root is empty — skip incrementalLoop so we don't crash.
+    if (!ctx.triggered.load(.acquire)) return;
     watcher.incrementalLoop(ctx.io, ctx.store, ctx.explorer, ctx.queue, ctx.resolved_root, ctx.shutdown, ctx.scan_done);
 }
 

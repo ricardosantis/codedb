@@ -1566,3 +1566,248 @@ test "issue-437: codedb_bundle ops items schema has discriminated oneOf per sub-
     }
 }
 
+
+test "issue-503: parsePositional treats `codedb mcp <path>` as path-as-root" {
+    // Before fix: parser took the isCommand("mcp") branch, set root=".",
+    // root_is_explicit=false, and silently dropped /tmp/proj. That tripped
+    // the deferred-scan branch in mainImpl() which waited forever for an
+    // MCP `roots/list` message that a user invoking from a shell will never
+    // send.
+    const argv = [_][]const u8{ "codedb", "mcp", "/tmp/proj" };
+    const p = main_mod.parsePositional(&argv);
+    try testing.expect(!p.usage_exit);
+    try testing.expectEqualStrings("/tmp/proj", p.root);
+    try testing.expectEqualStrings("mcp", p.cmd);
+    try testing.expect(p.root_is_explicit);
+}
+
+test "issue-503: `codedb <path> mcp` still works (original order)" {
+    const argv = [_][]const u8{ "codedb", "/tmp/proj", "mcp" };
+    const p = main_mod.parsePositional(&argv);
+    try testing.expect(!p.usage_exit);
+    try testing.expectEqualStrings("/tmp/proj", p.root);
+    try testing.expectEqualStrings("mcp", p.cmd);
+    try testing.expect(p.root_is_explicit);
+}
+
+test "issue-503: `codedb mcp` alone keeps cwd-as-root deferred behavior" {
+    // The deferred-mode behavior is intentional when no path is given —
+    // an MCP client may still send roots/list. Don't break that path.
+    const argv = [_][]const u8{ "codedb", "mcp" };
+    const p = main_mod.parsePositional(&argv);
+    try testing.expect(!p.usage_exit);
+    try testing.expectEqualStrings(".", p.root);
+    try testing.expectEqualStrings("mcp", p.cmd);
+    try testing.expect(!p.root_is_explicit);
+}
+
+test "issue-502: `codedb mcp --help` rewrites to --help, does not start server" {
+    const argv = [_][]const u8{ "codedb", "mcp", "--help" };
+    const p = main_mod.parsePositional(&argv);
+    try testing.expect(!p.usage_exit);
+    try testing.expectEqualStrings("--help", p.cmd);
+}
+
+test "issue-502: `codedb mcp -h` rewrites to --help" {
+    const argv = [_][]const u8{ "codedb", "mcp", "-h" };
+    const p = main_mod.parsePositional(&argv);
+    try testing.expect(!p.usage_exit);
+    try testing.expectEqualStrings("--help", p.cmd);
+}
+
+test "parsePositional: existing commands still parse correctly (regression)" {
+    // `codedb tree` → cwd-as-root tree
+    {
+        const argv = [_][]const u8{ "codedb", "tree" };
+        const p = main_mod.parsePositional(&argv);
+        try testing.expectEqualStrings(".", p.root);
+        try testing.expectEqualStrings("tree", p.cmd);
+        try testing.expect(!p.root_is_explicit);
+    }
+    // `codedb /path/to/root tree` → explicit-root tree
+    {
+        const argv = [_][]const u8{ "codedb", "/path/to/root", "tree" };
+        const p = main_mod.parsePositional(&argv);
+        try testing.expectEqualStrings("/path/to/root", p.root);
+        try testing.expectEqualStrings("tree", p.cmd);
+        try testing.expect(p.root_is_explicit);
+    }
+    // `codedb --version` → version
+    {
+        const argv = [_][]const u8{ "codedb", "--version" };
+        const p = main_mod.parsePositional(&argv);
+        try testing.expectEqualStrings("--version", p.cmd);
+    }
+    // `codedb --help` → help
+    {
+        const argv = [_][]const u8{ "codedb", "--help" };
+        const p = main_mod.parsePositional(&argv);
+        try testing.expectEqualStrings("--help", p.cmd);
+    }
+    // no args → usage exit
+    {
+        const argv = [_][]const u8{"codedb"};
+        const p = main_mod.parsePositional(&argv);
+        try testing.expect(p.usage_exit);
+    }
+    // `codedb --mcp` → mcp command (legacy alias)
+    {
+        const argv = [_][]const u8{ "codedb", "--mcp" };
+        const p = main_mod.parsePositional(&argv);
+        try testing.expectEqualStrings("mcp", p.cmd);
+    }
+}
+
+
+test "issue-502: isValidMcpFlag whitelist rejects unknown flags" {
+    // Before fix: `codedb mcp --snapshot` silently swallowed the flag and
+    // started the server with surprising state. After fix, mainImpl rejects
+    // any non-whitelisted flag with a clear error and exit 1.
+    try testing.expect(main_mod.isValidMcpFlag("--no-telemetry"));
+    try testing.expect(!main_mod.isValidMcpFlag("--snapshot"));
+    try testing.expect(!main_mod.isValidMcpFlag("-x"));
+    try testing.expect(!main_mod.isValidMcpFlag("--help")); // rewritten by parsePositional before reaching here
+    try testing.expect(!main_mod.isValidMcpFlag(""));
+}
+
+
+test "issue-502: findGitRootFrom walks up to a .git directory" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, ".git");
+    try tmp.dir.createDirPath(io, "sub/deep");
+
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp.dir.realPathFile(io, ".", &tmp_buf);
+    const tmp_path = tmp_buf[0..tmp_path_len];
+
+    // Build absolute path tmp/sub/deep without changing the process cwd.
+    var probe: [std.fs.max_path_bytes]u8 = undefined;
+    const deep = try std.fmt.bufPrint(&probe, "{s}/sub/deep", .{tmp_path});
+    @memcpy(probe[deep.len .. deep.len + 0], "");
+
+    const got = main_mod.findGitRootFrom(io, &probe, deep.len);
+    try testing.expect(got != null);
+    try testing.expectEqualStrings(tmp_path, got.?);
+}
+
+test "issue-502: findGitRootFrom returns null when no .git is found upward" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "lonely");
+
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp.dir.realPathFile(io, ".", &tmp_buf);
+    const tmp_path = tmp_buf[0..tmp_path_len];
+
+    var probe: [std.fs.max_path_bytes]u8 = undefined;
+    const lonely = try std.fmt.bufPrint(&probe, "{s}/lonely", .{tmp_path});
+
+    // tempdir is under /var/folders (mac) or /tmp (linux); neither has a
+    // .git above it on a sane CI runner. If your environment has, this
+    // test's expectation still holds: the found path must not include our
+    // tempdir's leaf.
+    const got = main_mod.findGitRootFrom(io, &probe, lonely.len);
+    if (got) |g| {
+        try testing.expect(std.mem.indexOf(u8, g, "lonely") == null);
+    }
+}
+
+test "issue-506: negotiateProtocolVersion echoes a recognized client version" {
+    // Before fix, server always replied "2025-06-18", which older Zed and
+    // some opencode builds reject with a timeout because they don't know
+    // that version. Now we echo the client's version when we recognize it.
+    try testing.expectEqualStrings("2024-11-05", mcp_mod.negotiateProtocolVersion("2024-11-05").?);
+    try testing.expectEqualStrings("2025-03-26", mcp_mod.negotiateProtocolVersion("2025-03-26").?);
+    try testing.expectEqualStrings("2025-06-18", mcp_mod.negotiateProtocolVersion("2025-06-18").?);
+}
+
+test "issue-506: negotiateProtocolVersion returns latest for newer-than-known clients" {
+    try testing.expectEqualStrings("2025-06-18", mcp_mod.negotiateProtocolVersion("2099-01-01").?);
+}
+
+test "issue-506: negotiateProtocolVersion returns oldest for ancient/unknown clients" {
+    // A pre-2024-11-05 string lex-orders below SUPPORTED[0], so we serve
+    // the oldest version we know; client decides whether to proceed.
+    try testing.expectEqualStrings("2024-11-05", mcp_mod.negotiateProtocolVersion("2024-01-01").?);
+}
+
+test "issue-506: negotiateProtocolVersion returns null on empty input" {
+    try testing.expect(mcp_mod.negotiateProtocolVersion("") == null);
+}
+
+test "issue-508: appendRemoteErrorHint differentiates Cloudflare 530 from 404/429" {
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        mcp_mod.appendRemoteErrorHint(testing.allocator, &out, 530, "error code: 1033");
+        try testing.expect(std.mem.indexOf(u8, out.items, "origin is unreachable") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "codedb_index") != null);
+    }
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        mcp_mod.appendRemoteErrorHint(testing.allocator, &out, 530, "");
+        try testing.expect(std.mem.indexOf(u8, out.items, "Retry") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "origin is unreachable") == null);
+    }
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        mcp_mod.appendRemoteErrorHint(testing.allocator, &out, 404, "");
+        try testing.expect(std.mem.indexOf(u8, out.items, "not indexed") != null);
+    }
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        mcp_mod.appendRemoteErrorHint(testing.allocator, &out, 429, "");
+        try testing.expect(std.mem.indexOf(u8, out.items, "rate limited") != null);
+    }
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        mcp_mod.appendRemoteErrorHint(testing.allocator, &out, 200, "");
+        try testing.expectEqual(@as(usize, 0), out.items.len);
+    }
+}
+
+test "issue-507: indexFileOutlineOnly files remain searchable via tier 3" {
+    // Repro for #507: after a snapshot rebuild, certain files showed up in
+    // `tree` and `read` but searchContent returned 0 hits for substrings
+    // demonstrably present in the file. Snapshot.zig and watcher.zig both
+    // route through Explorer.indexFileOutlineOnly for files that aren't in
+    // the trigram-restore set; before the fix that path populated outlines
+    // and contents but not trigram_index nor skip_trigram_files, so the file
+    // fell off every search tier (trigram missed; tier 3 keyed on
+    // skip_trigram_files missed; tier 5 short-circuited by trigram_ruled_out).
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    const path = "bin/orchestrator";
+    const content =
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\
+        \\policy_context="$(cat <<'POLICY'
+        \\Doran Orchestrator operating contract:
+        \\- AIHero / Matt Pocock skills from AGENTS.md
+        \\POLICY
+        \\)"
+        \\echo "$policy_context"
+    ;
+    try explorer.indexFileOutlineOnly(path, content);
+
+    const hits = try explorer.searchContent("Doran Orchestrator operating contract", testing.allocator, 10);
+    defer {
+        for (hits) |h| {
+            testing.allocator.free(h.path);
+            testing.allocator.free(h.line_text);
+        }
+        testing.allocator.free(hits);
+    }
+
+    try testing.expect(hits.len > 0);
+    try testing.expectEqualStrings(path, hits[0].path);
+}
