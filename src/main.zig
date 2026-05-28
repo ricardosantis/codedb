@@ -66,9 +66,50 @@ const Out = struct {
 /// avoids triggering Rosetta 2's 64 MB stack allocation bug on x86_64-macos.
 pub fn main(init: std.process.Init.Minimal) !void {
     cio.setProcessArgs(init.args.vector);
+
+    // #504: zero-arg and --help/-h/--version/-v invocations are the most
+    // common ways to hit a startup-path bug (an Intel x64 user reported a
+    // segfault on bare `codedb`). Short-circuit them here, on the main
+    // thread, before the worker-thread trampoline runs any of the heavier
+    // init (io-threaded, telemetry, c_allocator + Threaded.init). Worst
+    // case for these flows we'd lose styled output; we keep that risk
+    // contained to one tiny path.
+    if (handleFastPath(init.args.vector)) return;
+
     const stack_size: usize = if (builtin.mode == .Debug) 64 * 1024 * 1024 else 8 * 1024 * 1024;
     const thread = try std.Thread.spawn(.{ .stack_size = stack_size }, mainInner, .{});
     thread.join();
+}
+
+/// Returns true if the invocation was handled and `main` should exit.
+/// Designed to be the cheapest possible path — uses raw stdout writes
+/// instead of any of the heavier init machinery in mainImpl, so a bug
+/// further down the stack can't take out plain `codedb` / `--help` /
+/// `--version` invocations.
+fn handleFastPath(argv: []const [*:0]const u8) bool {
+    const stdout_fd: c_int = 1;
+    const stderr_fd: c_int = 2;
+
+    if (argv.len < 2) {
+        const msg =
+            "codedb  code intelligence server\n\n" ++
+            "  usage: codedb [root] <command> [args...]\n\n" ++
+            "  run `codedb --help` for the full command list.\n";
+        _ = std.c.write(stderr_fd, msg.ptr, msg.len);
+        std.process.exit(1);
+    }
+
+    const a1 = std.mem.span(argv[1]);
+    if (std.mem.eql(u8, a1, "--version") or std.mem.eql(u8, a1, "-v") or std.mem.eql(u8, a1, "version")) {
+        var buf: [128]u8 = undefined;
+        const out = std.fmt.bufPrint(&buf, "codedb {s}\n", .{release_info.semver}) catch {
+            std.process.exit(0);
+        };
+        _ = std.c.write(stdout_fd, out.ptr, out.len);
+        std.process.exit(0);
+    }
+
+    return false;
 }
 
 fn mainInner() void {
