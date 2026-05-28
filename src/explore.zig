@@ -515,7 +515,6 @@ pub const Explorer = struct {
     symbol_index: std.StringHashMap(std.ArrayList(SymbolLocation)),
     word_index: WordIndex,
     trigram_index: AnyTrigramIndex,
-    sparse_ngram_index: SparseNgramIndex,
     /// Paths indexed with skip_trigram=true (past 15k cap or excluded).
     /// Used to restrict the searchContent fallback to only these files.
     skip_trigram_files: std.StringHashMap(void),
@@ -559,7 +558,6 @@ pub const Explorer = struct {
             .symbol_index = std.StringHashMap(std.ArrayList(SymbolLocation)).init(allocator),
             .word_index = WordIndex.init(allocator),
             .trigram_index = .{ .heap = TrigramIndex.init(allocator) },
-            .sparse_ngram_index = SparseNgramIndex.init(allocator),
             .skip_trigram_files = std.StringHashMap(void).init(allocator),
             .allocator = allocator,
         };
@@ -585,7 +583,6 @@ pub const Explorer = struct {
 
         self.word_index.deinit();
         self.trigram_index.deinit();
-        self.sparse_ngram_index.deinit();
         self.skip_trigram_files.deinit();
         if (self.root_dir) |d| {
             if (self.io) |io| d.close(io);
@@ -616,8 +613,6 @@ pub const Explorer = struct {
     pub fn releaseSecondaryIndexes(self: *Explorer) void {
         self.mu.lock();
         defer self.mu.unlock();
-        self.sparse_ngram_index.deinit();
-        self.sparse_ngram_index = SparseNgramIndex.init(self.allocator);
     }
 
     pub fn indexFile(self: *Explorer, path: []const u8, content: []const u8) !void {
@@ -1132,12 +1127,6 @@ pub const Explorer = struct {
                     return;
                 },
             };
-            self.sparse_ngram_index.indexFile(entry.key_ptr.*, entry.value_ptr.*) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    std.log.warn("sparse ngram OOM, skipping remaining files", .{});
-                    return;
-                },
-            };
         }
     }
 
@@ -1284,7 +1273,6 @@ pub const Explorer = struct {
         self.contents.remove(path);
         self.word_index.removeFile(path);
         self.trigram_index.removeFile(path);
-        self.sparse_ngram_index.removeFile(path);
 
         if (self.outlines.fetchRemove(path)) |kv| {
             var outline = kv.value;
@@ -1738,20 +1726,10 @@ pub const Explorer = struct {
         breakdown.tier1_ns = cio.nanoTimestamp() - t1_start;
 
         const t2_start = cio.nanoTimestamp();
-        if (result_list.items.len == 0) {
-            const sparse_paths = self.sparse_ngram_index.candidates(query, allocator);
-            defer if (sparse_paths) |sp| allocator.free(sp);
-            if (sparse_paths) |sp| {
-                for (sp) |path| {
-                    if (searched.contains(path)) continue;
-                    const ref = self.readContentForSearch(path, allocator) orelse continue;
-                    defer ref.deinit();
-                    searched.put(path, {}) catch {};
-                    try searchInContent(path, ref.data, query, allocator, max_results, max_results, &result_list);
-                    if (result_list.items.len >= max_results) break;
-                }
-            }
-        }
+        // Tier 2 (sparse n-gram fallback) removed in v0.2.5822 — the
+        // sparse_ngram_index field is no longer populated; tier 3
+        // (skip_trigram_files) + tier 5 (full outline scan) cover the
+        // same surface area.
         breakdown.tier2_ns = cio.nanoTimestamp() - t2_start;
 
         const t3_start = cio.nanoTimestamp();

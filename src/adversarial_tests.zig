@@ -427,30 +427,6 @@ test "adversarial: regexMatch with 50 alternation branches does not crash" {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// ADVERSARIAL: rebuildTrigrams must also populate sparse_ngram_index (#27)
-// ════════════════════════════════════════════════════════════════════════════
-
-test "adversarial: rebuildTrigrams populates sparse_ngram_index" {
-    var exp = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
-    defer exp.deinit();
-
-    // Index files with skip_trigram=true (simulates cache-hit startup)
-    try exp.indexFileSkipTrigram("a.zig", "pub fn handleRequest(ctx: *Context) !void {}");
-    try exp.indexFileSkipTrigram("b.zig", "pub fn processData(buf: []u8) !void {}");
-
-    // At this point, trigram and sparse indexes should be empty
-    try testing.expectEqual(@as(u32, 0), exp.trigram_index.fileCount());
-    try testing.expectEqual(@as(u32, 0), exp.sparse_ngram_index.fileCount());
-
-    // Rebuild — should populate BOTH indexes
-    try exp.rebuildTrigrams();
-
-    try testing.expectEqual(@as(u32, 2), exp.trigram_index.fileCount());
-    // THIS is the bug: sparse_ngram_index is NOT rebuilt
-    try testing.expectEqual(@as(u32, 2), exp.sparse_ngram_index.fileCount());
-}
-
-// ════════════════════════════════════════════════════════════════════════════
 // ADVERSARIAL: Explorer end-to-end substring search correctness
 // The ultimate test: does the full pipeline find real substrings?
 // ════════════════════════════════════════════════════════════════════════════

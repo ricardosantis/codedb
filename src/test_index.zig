@@ -2696,33 +2696,6 @@ test "issue-250: searchContent finds content in files skipped by trigram index" 
 }
 
 
-test "issue-262: sparse+trigram intersection drops files only in trigram index" {
-    // When both sparse and trigram indices return candidates, searchContent
-    // intersects them.  A file present in trigram candidates but absent from
-    // sparse candidates is silently dropped — a recall loss.
-    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
-    defer explorer.deinit();
-
-    // Index two files — both contain the query.
-    try explorer.indexFile("a.zig", "fn recall_target_alpha() void {}");
-    try explorer.indexFile("b.zig", "fn recall_target_alpha() void {} // more text here for variety");
-
-    // Simulate sparse index missing file "b.zig" (e.g. boundary misalignment).
-    // File b.zig remains in the trigram index but not in sparse.
-    explorer.sparse_ngram_index.removeFile("b.zig");
-
-    const results = try explorer.searchContent("recall_target_alpha", testing.allocator, 50);
-    defer {
-        for (results) |r| {
-            testing.allocator.free(r.path);
-            testing.allocator.free(r.line_text);
-        }
-        testing.allocator.free(results);
-    }
-    // Both files contain the query — both must appear.
-    try testing.expectEqual(@as(usize, 2), results.len);
-}
-
 
 test "issue-263: skip_trigram_files searched before max_results exhausted" {
     // Files indexed with skip_trigram=true are only searched after all

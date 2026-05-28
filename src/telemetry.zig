@@ -438,16 +438,6 @@ pub fn approxIndexSizeBytes(explorer: *const explore.Explorer) u64 {
         .mmap, .mmap_overlay => {},
     }
 
-    var sparse_iter = explorer.sparse_ngram_index.index.iterator();
-    while (sparse_iter.next()) |entry| {
-        total +|= @sizeOf(@TypeOf(entry.key_ptr.*));
-        total +|= entry.value_ptr.count() * @sizeOf(usize);
-    }
-
-    var file_sparse_iter = explorer.sparse_ngram_index.file_ngrams.iterator();
-    while (file_sparse_iter.next()) |entry| {
-        total +|= entry.value_ptr.items.len * @sizeOf(@TypeOf(entry.value_ptr.items[0]));
-    }
 
     size_cache_value.store(total, .monotonic);
     size_cache_at_ms.store(now, .monotonic);
