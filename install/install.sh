@@ -220,14 +220,37 @@ except (FileNotFoundError, json.JSONDecodeError):
 
 hooks = data.setdefault("hooks", {})
 
-# Merge codedb hooks without clobbering existing hooks from other tools
+# Merge codedb hooks without clobbering existing hooks from other tools.
+# If a competing legacy-tools hook is already registered for the same
+# event/matcher (e.g. muonry's block-legacy-tools.sh), insert codedb's
+# entry at the FRONT of the list so its redirect wins the race; otherwise
+# append. Re-runs will also reshuffle an already-registered codedb hook
+# to the front if a competitor has appeared since the previous install.
+COMPETITOR_MARKERS = ("block-legacy-tools", "muonry", "zigrep", "zigread")
+
 def merge_hook(event, new_entry):
     existing = hooks.get(event, [])
     cmd = new_entry["hooks"][0]["command"]
-    for e in existing:
+    matcher = new_entry.get("matcher", "")
+    competes = any(
+        e.get("matcher", "") == matcher
+        and any(any(m in h.get("command", "") for m in COMPETITOR_MARKERS) for h in e.get("hooks", []))
+        for e in existing
+    )
+    idx = None
+    for i, e in enumerate(existing):
         if any(cmd in h.get("command", "") for h in e.get("hooks", [])):
-            return
-    existing.append(new_entry)
+            idx = i
+            break
+    if idx is not None:
+        if competes and idx != 0:
+            existing.insert(0, existing.pop(idx))
+            hooks[event] = existing
+        return
+    if competes:
+        existing.insert(0, new_entry)
+    else:
+        existing.append(new_entry)
     hooks[event] = existing
 
 merge_hook("PreToolUse", {"matcher": "Bash", "hooks": [{"type": "command", "command": "$HOME/.claude/hooks/codedb-block-legacy.sh"}]})
