@@ -1566,3 +1566,135 @@ test "issue-437: codedb_bundle ops items schema has discriminated oneOf per sub-
     }
 }
 
+
+test "issue-503: parsePositional treats `codedb mcp <path>` as path-as-root" {
+    // Before fix: parser took the isCommand("mcp") branch, set root=".",
+    // root_is_explicit=false, and silently dropped /tmp/proj. That tripped
+    // the deferred-scan branch in mainImpl() which waited forever for an
+    // MCP `roots/list` message that a user invoking from a shell will never
+    // send.
+    const argv = [_][]const u8{ "codedb", "mcp", "/tmp/proj" };
+    const p = main_mod.parsePositional(&argv);
+    try testing.expect(!p.usage_exit);
+    try testing.expectEqualStrings("/tmp/proj", p.root);
+    try testing.expectEqualStrings("mcp", p.cmd);
+    try testing.expect(p.root_is_explicit);
+}
+
+test "issue-503: `codedb <path> mcp` still works (original order)" {
+    const argv = [_][]const u8{ "codedb", "/tmp/proj", "mcp" };
+    const p = main_mod.parsePositional(&argv);
+    try testing.expect(!p.usage_exit);
+    try testing.expectEqualStrings("/tmp/proj", p.root);
+    try testing.expectEqualStrings("mcp", p.cmd);
+    try testing.expect(p.root_is_explicit);
+}
+
+test "issue-503: `codedb mcp` alone keeps cwd-as-root deferred behavior" {
+    // The deferred-mode behavior is intentional when no path is given —
+    // an MCP client may still send roots/list. Don't break that path.
+    const argv = [_][]const u8{ "codedb", "mcp" };
+    const p = main_mod.parsePositional(&argv);
+    try testing.expect(!p.usage_exit);
+    try testing.expectEqualStrings(".", p.root);
+    try testing.expectEqualStrings("mcp", p.cmd);
+    try testing.expect(!p.root_is_explicit);
+}
+
+test "issue-502: `codedb mcp --help` rewrites to --help, does not start server" {
+    const argv = [_][]const u8{ "codedb", "mcp", "--help" };
+    const p = main_mod.parsePositional(&argv);
+    try testing.expect(!p.usage_exit);
+    try testing.expectEqualStrings("--help", p.cmd);
+}
+
+test "issue-502: `codedb mcp -h` rewrites to --help" {
+    const argv = [_][]const u8{ "codedb", "mcp", "-h" };
+    const p = main_mod.parsePositional(&argv);
+    try testing.expect(!p.usage_exit);
+    try testing.expectEqualStrings("--help", p.cmd);
+}
+
+test "parsePositional: existing commands still parse correctly (regression)" {
+    // `codedb tree` → cwd-as-root tree
+    {
+        const argv = [_][]const u8{ "codedb", "tree" };
+        const p = main_mod.parsePositional(&argv);
+        try testing.expectEqualStrings(".", p.root);
+        try testing.expectEqualStrings("tree", p.cmd);
+        try testing.expect(!p.root_is_explicit);
+    }
+    // `codedb /path/to/root tree` → explicit-root tree
+    {
+        const argv = [_][]const u8{ "codedb", "/path/to/root", "tree" };
+        const p = main_mod.parsePositional(&argv);
+        try testing.expectEqualStrings("/path/to/root", p.root);
+        try testing.expectEqualStrings("tree", p.cmd);
+        try testing.expect(p.root_is_explicit);
+    }
+    // `codedb --version` → version
+    {
+        const argv = [_][]const u8{ "codedb", "--version" };
+        const p = main_mod.parsePositional(&argv);
+        try testing.expectEqualStrings("--version", p.cmd);
+    }
+    // `codedb --help` → help
+    {
+        const argv = [_][]const u8{ "codedb", "--help" };
+        const p = main_mod.parsePositional(&argv);
+        try testing.expectEqualStrings("--help", p.cmd);
+    }
+    // no args → usage exit
+    {
+        const argv = [_][]const u8{"codedb"};
+        const p = main_mod.parsePositional(&argv);
+        try testing.expect(p.usage_exit);
+    }
+    // `codedb --mcp` → mcp command (legacy alias)
+    {
+        const argv = [_][]const u8{ "codedb", "--mcp" };
+        const p = main_mod.parsePositional(&argv);
+        try testing.expectEqualStrings("mcp", p.cmd);
+    }
+}
+
+test "issue-507: indexFileOutlineOnly files remain searchable via tier 3" {
+    // Repro for #507: after a snapshot rebuild, certain files showed up in
+    // `tree` and `read` but searchContent returned 0 hits for substrings
+    // demonstrably present in the file. Snapshot.zig and watcher.zig both
+    // route through Explorer.indexFileOutlineOnly for files that aren't in
+    // the trigram-restore set; before the fix that path populated outlines
+    // and contents but not trigram_index nor skip_trigram_files, so the file
+    // fell off every search tier (trigram missed; tier 3 keyed on
+    // skip_trigram_files missed; tier 5 short-circuited by trigram_ruled_out).
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    // A representative file from the upstream report — extension-less shell
+    // script that ends up with language=unknown but still has searchable text.
+    const path = "bin/orchestrator";
+    const content =
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\
+        \\policy_context="$(cat <<'POLICY'
+        \\Doran Orchestrator operating contract:
+        \\- AIHero / Matt Pocock skills from AGENTS.md
+        \\POLICY
+        \\)"
+        \\echo "$policy_context"
+    ;
+    try explorer.indexFileOutlineOnly(path, content);
+
+    const hits = try explorer.searchContent("Doran Orchestrator operating contract", testing.allocator, 10);
+    defer {
+        for (hits) |h| {
+            testing.allocator.free(h.path);
+            testing.allocator.free(h.line_text);
+        }
+        testing.allocator.free(hits);
+    }
+
+    try testing.expect(hits.len > 0);
+    try testing.expectEqualStrings(path, hits[0].path);
+}

@@ -128,38 +128,15 @@ fn mainImpl() !void {
     var cmd_args_start: usize = undefined;
     var root_is_explicit: bool = false;
 
-    if (args.len >= 2 and std.mem.eql(u8, args[1], "--mcp")) {
-        root = ".";
-        cmd = "mcp";
-        cmd_args_start = 2;
-    } else if (args.len >= 2 and (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "-v"))) {
-        root = ".";
-        cmd = "--version";
-        cmd_args_start = 2;
-    } else if (args.len >= 2 and
-        (std.mem.eql(u8, args[1], "--help") or
-            std.mem.eql(u8, args[1], "-h") or
-            std.mem.eql(u8, args[1], "help")))
-    {
-        root = ".";
-        cmd = args[1];
-        cmd_args_start = 2;
-    } else if (args.len < 2) {
-        printUsage(&out, s);
-        std.process.exit(1);
-    } else if (isCommand(args[1])) {
-        root = ".";
-        cmd = args[1];
-        cmd_args_start = 2;
-    } else if (args.len >= 3) {
-        root = args[1];
-        cmd = args[2];
-        cmd_args_start = 3;
-        root_is_explicit = true;
-    } else {
+    const parsed = parsePositional(args);
+    if (parsed.usage_exit) {
         printUsage(&out, s);
         std.process.exit(1);
     }
+    root = parsed.root;
+    cmd = parsed.cmd;
+    cmd_args_start = parsed.cmd_args_start;
+    root_is_explicit = parsed.root_is_explicit;
 
     // CODEDB_ROOT env var lets clients (Claude Code MCP, shell scripts) pin
     // the root without needing to pass a positional arg. Treated as explicit
@@ -1067,6 +1044,60 @@ fn mainImpl() !void {
         });
         std.process.exit(1);
     }
+}
+
+pub const ParsedPositional = struct {
+    root: []const u8,
+    cmd: []const u8,
+    cmd_args_start: usize,
+    root_is_explicit: bool,
+    usage_exit: bool = false,
+};
+
+/// Parse positional args into root/cmd. Pure, side-effect-free — caller is
+/// responsible for printUsage()/exit when `usage_exit` is set.
+///
+/// Special cases:
+///   - `codedb mcp <path>` is honored as `codedb <path> mcp` (issue #503).
+///     The wrong arg order is a frequent typo from users who think `mcp` is
+///     a normal subcommand. Treating the path as root prevents the deferred
+///     scan from hanging forever waiting for a `roots/list` that never comes.
+///   - `codedb mcp --help` (or `-h`/`help`) prints usage instead of starting
+///     the MCP server (issue #502).
+pub fn parsePositional(args: []const []const u8) ParsedPositional {
+    if (args.len < 2) {
+        return .{ .root = "", .cmd = "", .cmd_args_start = 0, .root_is_explicit = false, .usage_exit = true };
+    }
+    const a1 = args[1];
+    if (std.mem.eql(u8, a1, "--mcp")) {
+        return .{ .root = ".", .cmd = "mcp", .cmd_args_start = 2, .root_is_explicit = false };
+    }
+    if (std.mem.eql(u8, a1, "--version") or std.mem.eql(u8, a1, "-v")) {
+        return .{ .root = ".", .cmd = "--version", .cmd_args_start = 2, .root_is_explicit = false };
+    }
+    if (std.mem.eql(u8, a1, "--help") or std.mem.eql(u8, a1, "-h") or std.mem.eql(u8, a1, "help")) {
+        return .{ .root = ".", .cmd = a1, .cmd_args_start = 2, .root_is_explicit = false };
+    }
+    if (isCommand(a1)) {
+        // `codedb mcp --help` → print help, do not start server. #502.
+        if (std.mem.eql(u8, a1, "mcp") and args.len >= 3) {
+            const a2 = args[2];
+            if (std.mem.eql(u8, a2, "--help") or std.mem.eql(u8, a2, "-h") or std.mem.eql(u8, a2, "help")) {
+                return .{ .root = ".", .cmd = "--help", .cmd_args_start = 3, .root_is_explicit = false };
+            }
+            // `codedb mcp <path>` → honor path as root. #503.
+            // Only when args[2] doesn't look like a flag; otherwise it's a
+            // legitimate command-arg that the mcp subcommand may consume.
+            if (a2.len > 0 and a2[0] != '-') {
+                return .{ .root = a2, .cmd = "mcp", .cmd_args_start = 3, .root_is_explicit = true };
+            }
+        }
+        return .{ .root = ".", .cmd = a1, .cmd_args_start = 2, .root_is_explicit = false };
+    }
+    if (args.len >= 3) {
+        return .{ .root = a1, .cmd = args[2], .cmd_args_start = 3, .root_is_explicit = true };
+    }
+    return .{ .root = "", .cmd = "", .cmd_args_start = 0, .root_is_explicit = false, .usage_exit = true };
 }
 fn isCommand(arg: []const u8) bool {
     const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "snapshot", "serve", "mcp", "update", "nuke" };

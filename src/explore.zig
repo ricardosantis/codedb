@@ -688,6 +688,18 @@ pub const Explorer = struct {
                 self.sparse_ngram_index.removeFile(stable_path);
                 try self.skip_trigram_files.put(stable_path, {});
             }
+        } else {
+            // Outline-only path (snapshot load fallback, file-watcher incremental
+            // updates, WASM fast-path). The file is in `outlines` + `contents` but
+            // not in word_index or trigram_index — without this entry it would
+            // also be absent from `skip_trigram_files`, dropping it out of every
+            // search tier:
+            //   • tier 1 (trigram candidates) — file not in trigram_index
+            //   • tier 3 (skip_trigram_files scan) — file not in this set
+            //   • tier 5 (full outline scan) — short-circuited by trigram_ruled_out
+            // Registering here means tier 3 picks the file up via searchInContent.
+            // See #507.
+            try self.skip_trigram_files.put(stable_path, {});
         }
 
         try self.rebuildDepsFor(stable_path, &persistent_outline);
