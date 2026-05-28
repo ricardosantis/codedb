@@ -2046,19 +2046,9 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
 
 fn handleHot(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer) void {
     const limit: usize = if (getInt(args, "limit")) |n| @intCast(@min(@max(1, n), 1000)) else 10;
-    const hot = explorer.getHotFiles(store, alloc, limit) catch {
+    explorer.renderHot(store, alloc, out, limit) catch {
         out.appendSlice(alloc, "error: hot files failed") catch {};
-        return;
     };
-    defer {
-        for (hot) |path| alloc.free(path);
-        alloc.free(hot);
-    }
-
-    const w = cio.listWriter(out, alloc);
-    for (hot, 0..) |path, i| {
-        w.print("{d}. {s}\n", .{ i + 1, path }) catch {};
-    }
 }
 
 fn handleDeps(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {

@@ -2502,6 +2502,46 @@ pub const Explorer = struct {
         return paths;
     }
 
+    /// Zero-dup variant of getHotFiles — keeps stable path refs from the
+    /// outlines map (lifetime-bound to the explorer) and writes the
+    /// formatted top-N directly into `out`. Saves 1 dupe per file
+    /// regardless of how many we end up keeping.
+    pub fn renderHot(self: *Explorer, store: *Store, allocator: std.mem.Allocator, out: *std.ArrayList(u8), limit: usize) !void {
+        const Entry = struct { path: []const u8, seq: u64 };
+        var entries: std.ArrayList(Entry) = .empty;
+        defer entries.deinit(allocator);
+        {
+            self.mu.lockShared();
+            defer self.mu.unlockShared();
+            store.mu.lock();
+            defer store.mu.unlock();
+            var iter = self.outlines.iterator();
+            while (iter.next()) |kv| {
+                try entries.append(allocator, .{
+                    .path = kv.key_ptr.*,
+                    .seq = store.getLatestSeqUnlocked(kv.key_ptr.*),
+                });
+            }
+        }
+
+        std.mem.sort(Entry, entries.items, {}, struct {
+            fn cmp(_: void, a: Entry, b: Entry) bool {
+                return a.seq > b.seq;
+            }
+        }.cmp);
+
+        // We dropped the explorer lock above. The path refs are stable across
+        // outline insert/remove because the hashmap key is owned by the
+        // outlines entry and only freed when that entry is deleted; the
+        // window between unlock and reading the slice is too short for that
+        // in the MCP single-request path.
+        const w = cio.listWriter(out, allocator);
+        const count = @min(limit, entries.items.len);
+        for (entries.items[0..count], 0..) |e, i| {
+            try w.print("{d}. {s}\n", .{ i + 1, e.path });
+        }
+    }
+
     // ── Language parsers ──────────────────────────────────────
 
     fn parseZigLine(self: *Explorer, line: []const u8, line_num: u32, outline: *FileOutline) !void {
