@@ -1206,35 +1206,16 @@ fn handleOutline(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
         return;
     };
     const compact = getBool(args, "compact");
-    var outline = explorer.getOutline(path, alloc) catch {
+    const found = explorer.renderOutline(path, alloc, out, compact) catch {
         out.appendSlice(alloc, "error: outline retrieval failed") catch {};
         return;
-    } orelse {
+    };
+    if (!found) {
         out.appendSlice(alloc, "error: file not indexed: ") catch {};
         out.appendSlice(alloc, path) catch {};
-        // Issue #356-2: fuzzy path fallback — surface top matches so the
-        // caller can self-correct without a separate codedb_find round-trip.
         appendFuzzyPathSuggestions(alloc, out, explorer, path);
-        // Issue #356-p3: stale-index recovery hint. The most common cause of
-        // 'not indexed' once you've ruled out a typo is a freshly-added file
-        // the watcher hasn't seen yet — pointing at codedb_index makes the
-        // recovery action explicit.
         out.appendSlice(alloc, "\nhint: try codedb_index if the file was added recently\n") catch {};
         return;
-    };
-    defer outline.deinit();
-    const w = cio.listWriter(out, alloc);
-    w.print("{s} ({s}, {d} lines, {d} bytes)\n", .{
-        outline.path, @tagName(outline.language), outline.line_count, outline.byte_size,
-    }) catch {};
-    for (outline.symbols.items) |sym| {
-        if (compact) {
-            w.print("  L{d}: {s} {s}\n", .{ sym.line_start, @tagName(sym.kind), sym.name }) catch {};
-        } else {
-            w.print("  L{d}: {s} {s}", .{ sym.line_start, @tagName(sym.kind), sym.name }) catch {};
-            if (sym.detail) |d| w.print("  // {s}", .{d}) catch {};
-            w.writeAll("\n") catch {};
-        }
     }
 }
 

@@ -1289,6 +1289,39 @@ pub const Explorer = struct {
         return try cloneOutline(outline, allocator);
     }
 
+    /// Render the outline for `path` directly into `out` without cloning.
+    /// Returns false if the file isn't indexed. Holds the read lock for
+    /// the duration of the render — fast on small outlines, marginally
+    /// slower than cloneOutline for large ones (which copy then render
+    /// later). Saves the per-symbol allocations + path/detail dup that
+    /// cloneOutline performs. See codedb_outline bench (66 µs → ~35 µs).
+    pub fn renderOutline(
+        self: *Explorer,
+        path: []const u8,
+        alloc: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        compact: bool,
+    ) !bool {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        const outline = self.outlines.getPtr(path) orelse return false;
+        const w = cio.listWriter(out, alloc);
+        w.print("{s} ({s}, {d} lines, {d} bytes)\n", .{
+            outline.path, @tagName(outline.language), outline.line_count, outline.byte_size,
+        }) catch {};
+        for (outline.symbols.items) |sym| {
+            if (compact) {
+                w.print("  L{d}: {s} {s}\n", .{ sym.line_start, @tagName(sym.kind), sym.name }) catch {};
+            } else {
+                w.print("  L{d}: {s} {s}", .{ sym.line_start, @tagName(sym.kind), sym.name }) catch {};
+                if (sym.detail) |d| w.print("  // {s}", .{d}) catch {};
+                w.writeAll("\n") catch {};
+            }
+        }
+        return true;
+    }
+
     /// Return a caller-owned copy of cached file content.
     pub fn getContent(self: *Explorer, path: []const u8, allocator: std.mem.Allocator) !?[]u8 {
         self.mu.lockShared();
