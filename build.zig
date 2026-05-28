@@ -18,6 +18,11 @@ pub fn build(b: *std.Build) void {
     });
 
     // ── CLI executable ──
+    // ── CLI executable ──
+    // In ReleaseFast/Small, strip debug info to shrink the binary (~10%)
+    // and the RSS at runtime (smaller __TEXT footprint = fewer pages
+    // resident under load). Debug/ReleaseSafe keep symbols for stack traces.
+    const strip_debug = optimize == .ReleaseFast or optimize == .ReleaseSmall;
     const exe = b.addExecutable(.{
         .name = "codedb",
         .root_module = b.createModule(.{
@@ -25,6 +30,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .strip = strip_debug,
         }),
     });
 
