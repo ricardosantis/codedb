@@ -1191,12 +1191,9 @@ fn toolDependsOnScannedIndex(tool: Tool) bool {
 // ── Tool handlers ───────────────────────────────────────────────────────────
 
 fn handleTree(alloc: std.mem.Allocator, out: *std.ArrayList(u8), explorer: *Explorer) void {
-    const tree = explorer.getTree(alloc, false) catch {
+    explorer.renderTree(alloc, out, false) catch {
         out.appendSlice(alloc, "error: failed to get tree") catch {};
-        return;
     };
-    defer alloc.free(tree);
-    out.appendSlice(alloc, tree) catch {};
 }
 
 fn handleOutline(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {

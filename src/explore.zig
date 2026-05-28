@@ -1389,14 +1389,23 @@ pub const Explorer = struct {
     }
 
     pub fn getTree(self: *Explorer, allocator: std.mem.Allocator, use_color: bool) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        try self.renderTree(allocator, &out, use_color);
+        return try out.toOwnedSlice(allocator);
+    }
+
+    /// Stream the tree representation directly into `out` without going
+    /// through an intermediate Allocating writer + toOwnedSlice + copy
+    /// into the caller's buffer. Halves the allocation churn on the
+    /// MCP codedb_tree path.
+    pub fn renderTree(self: *Explorer, allocator: std.mem.Allocator, out: *std.ArrayList(u8), use_color: bool) !void {
         const s = @import("style.zig").style(use_color);
 
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
-        var aw: std.Io.Writer.Allocating = .init(allocator);
-        errdefer aw.deinit();
-        const writer = &aw.writer;
+        const writer = cio.listWriter(out, allocator);
 
         var paths: std.ArrayList([]const u8) = .empty;
         defer paths.deinit(allocator);
@@ -1448,8 +1457,6 @@ pub const Explorer = struct {
                 s.reset,
             });
         }
-
-        return aw.toOwnedSlice();
     }
 
     pub fn findSymbol(self: *Explorer, name: []const u8, allocator: std.mem.Allocator) !?struct { path: []const u8, symbol: Symbol } {
