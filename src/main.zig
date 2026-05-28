@@ -74,18 +74,32 @@ const Out = struct {
 /// so we trampoline through a thread with an explicit 64 MB stack.
 /// In optimised builds the merged frame is ~190 KB, so 8 MB is ample and
 /// avoids triggering Rosetta 2's 64 MB stack allocation bug on x86_64-macos.
-pub fn main(init: std.process.Init.Minimal) !void {
+///
+/// #504: must have a non-error-union return type. A Zig binary with
+/// `pub fn main(...) !void` ad-hoc-signed and run via Rosetta (or, in the
+/// user-reported case, on a native macOS Intel build that ends up with a
+/// similar startup-path tripwire) segfaults BEFORE main runs — the runtime's
+/// error-handling wrapper is what crashes. Verified with a minimal repro:
+/// `pub fn main(init) void { ... }` works; `!void` does not. Same crash
+/// happens if the entry point spawns a thread before writing to stderr.
+/// So we keep the entry point synchronous + infallible, and push any
+/// fallible work into mainImpl which runs after we've already had a chance
+/// to surface usage / --version output via the fast path.
+pub fn main(init: std.process.Init.Minimal) void {
     cio.setProcessArgs(init.args.vector);
-
-    // #504: zero-arg and --help/-h/--version/-v invocations are the most
-    // common ways to hit a startup-path bug (an Intel x64 user reported a
-    // segfault on bare `codedb`). Short-circuit them here, on the main
-    // thread, before the worker-thread trampoline runs any of the heavier
-    // init (io-threaded, telemetry, c_allocator + Threaded.init). Worst
-    // case for these flows we'd lose styled output; we keep that risk
-    // contained to one tiny path.
     if (handleFastPath(init.args.vector)) return;
+    mainTrampoline() catch |err| {
+        // Surface the failure on stderr so users see something even if the
+        // worker thread crashes during startup.
+        var buf: [256]u8 = undefined;
+        if (std.fmt.bufPrint(&buf, "codedb: fatal startup error: {s}\n", .{@errorName(err)})) |msg| {
+            _ = std.c.write(2, msg.ptr, msg.len);
+        } else |_| {}
+        std.process.exit(1);
+    };
+}
 
+fn mainTrampoline() !void {
     const stack_size: usize = if (builtin.mode == .Debug) 64 * 1024 * 1024 else 8 * 1024 * 1024;
     const thread = try std.Thread.spawn(.{ .stack_size = stack_size }, mainInner, .{});
     thread.join();
