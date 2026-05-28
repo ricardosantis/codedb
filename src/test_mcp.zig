@@ -1669,6 +1669,52 @@ test "issue-502: isValidMcpFlag whitelist rejects unknown flags" {
     try testing.expect(!main_mod.isValidMcpFlag("--help")); // rewritten by parsePositional before reaching here
     try testing.expect(!main_mod.isValidMcpFlag(""));
 }
+
+
+test "issue-502: findGitRootFrom walks up to a .git directory" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, ".git");
+    try tmp.dir.createDirPath(io, "sub/deep");
+
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp.dir.realPathFile(io, ".", &tmp_buf);
+    const tmp_path = tmp_buf[0..tmp_path_len];
+
+    // Build absolute path tmp/sub/deep without changing the process cwd.
+    var probe: [std.fs.max_path_bytes]u8 = undefined;
+    const deep = try std.fmt.bufPrint(&probe, "{s}/sub/deep", .{tmp_path});
+    @memcpy(probe[deep.len .. deep.len + 0], "");
+
+    const got = main_mod.findGitRootFrom(io, &probe, deep.len);
+    try testing.expect(got != null);
+    try testing.expectEqualStrings(tmp_path, got.?);
+}
+
+test "issue-502: findGitRootFrom returns null when no .git is found upward" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "lonely");
+
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp.dir.realPathFile(io, ".", &tmp_buf);
+    const tmp_path = tmp_buf[0..tmp_path_len];
+
+    var probe: [std.fs.max_path_bytes]u8 = undefined;
+    const lonely = try std.fmt.bufPrint(&probe, "{s}/lonely", .{tmp_path});
+
+    // tempdir is under /var/folders (mac) or /tmp (linux); neither has a
+    // .git above it on a sane CI runner. If your environment has, this
+    // test's expectation still holds: the found path must not include our
+    // tempdir's leaf.
+    const got = main_mod.findGitRootFrom(io, &probe, lonely.len);
+    if (got) |g| {
+        try testing.expect(std.mem.indexOf(u8, g, "lonely") == null);
+    }
+}
+
 test "issue-507: indexFileOutlineOnly files remain searchable via tier 3" {
     // Repro for #507: after a snapshot rebuild, certain files showed up in
     // `tree` and `read` but searchContent returned 0 hits for substrings

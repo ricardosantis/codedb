@@ -152,6 +152,19 @@ fn mainImpl() !void {
         }
     }
 
+    // #502: when `codedb mcp` is launched from a subdirectory of a git
+    // repo (e.g. opencode/Zed spawning from the buffer's directory), walk
+    // up to the repo root so the user gets the whole project indexed
+    // rather than the subdir they happen to be in. Skipped if the env var
+    // or a positional arg already pinned the root, or if no .git is found.
+    var git_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (std.mem.eql(u8, cmd, "mcp") and std.mem.eql(u8, root, ".") and !root_is_explicit) {
+        if (findGitRoot(io, &git_root_buf)) |git_root| {
+            root = git_root;
+            root_is_explicit = true;
+        }
+    }
+
     // MCP stdio reserves stdout for JSON-RPC — route status/error output to
     // stderr so startup/failure paths don't corrupt the protocol stream.
     // See #304.
@@ -1125,6 +1138,40 @@ pub fn parsePositional(args: []const []const u8) ParsedPositional {
     return .{ .root = "", .cmd = "", .cmd_args_start = 0, .root_is_explicit = false, .usage_exit = true };
 }
 
+/// Walk up from cwd looking for a `.git` directory or file (git worktree).
+/// Returns a slice into `buf` containing the absolute path, or null if no
+/// repo root is found before reaching the filesystem root. Used to make
+/// `codedb mcp` from inside a subdir of a git repo Just Work (#502).
+pub fn findGitRoot(io: std.Io, buf: *[std.fs.max_path_bytes]u8) ?[]const u8 {
+    const cwd_len = std.Io.Dir.cwd().realPathFile(io, ".", buf) catch return null;
+    return findGitRootFrom(io, buf, cwd_len);
+}
+
+/// Test-friendly variant: walk up from `buf[0..start_len]` (must already be
+/// an absolute path) looking for `.git`. Mutates buf in place. Returns slice
+/// or null. Kept separate so tests can hand in synthetic absolute paths
+/// without chdir'ing the process.
+pub fn findGitRootFrom(io: std.Io, buf: *[std.fs.max_path_bytes]u8, start_len: usize) ?[]const u8 {
+    var len = start_len;
+    var probe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    while (len > 0) {
+        const here = buf[0..len];
+        const probe = std.fmt.bufPrint(&probe_buf, "{s}/.git", .{here}) catch return null;
+        if (std.Io.Dir.cwd().statFile(io, probe, .{})) |_| {
+            return here;
+        } else |_| {}
+        if (std.mem.lastIndexOfScalar(u8, here, '/')) |slash| {
+            if (slash == 0) {
+                // Reached "/<dir>"; one more step to filesystem root, no match.
+                return null;
+            }
+            len = slash;
+        } else {
+            return null;
+        }
+    }
+    return null;
+}
 /// Whitelist of post-command flags accepted by `codedb mcp`. Anything else
 /// starting with `-` is rejected at startup (#502). `--config-file=<path>`
 /// is stripped before positional parsing and never reaches this whitelist;
@@ -1133,6 +1180,7 @@ pub fn parsePositional(args: []const []const u8) ParsedPositional {
 pub fn isValidMcpFlag(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--no-telemetry");
 }
+
 fn isCommand(arg: []const u8) bool {
     const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "snapshot", "serve", "mcp", "update", "nuke" };
     for (commands) |c| {
