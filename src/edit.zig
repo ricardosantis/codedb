@@ -20,6 +20,7 @@ pub const EditResult = struct {
     seq: u64,
     new_hash: u64,
     new_size: u64,
+    changed: bool = true,
     /// Unified-diff-style preview of the change. Only populated when
     /// `dry_run = true`. Caller owns the slice and must free it.
     preview: ?[]u8 = null,
@@ -44,8 +45,9 @@ pub fn applyEdit(
         .insert => if (req.after == null) return error.InvalidRange,
         else => {},
     }
+    const edit_dir = if (explorer) |exp| exp.root_dir orelse std.Io.Dir.cwd() else std.Io.Dir.cwd();
 
-    const source = try std.Io.Dir.cwd().readFileAlloc(io, req.path, allocator, .limited(10 * 1024 * 1024));
+    const source = try edit_dir.readFileAlloc(io, req.path, allocator, .limited(10 * 1024 * 1024));
     defer allocator.free(source);
 
     if (req.if_hash) |expected_hex| {
@@ -53,6 +55,69 @@ pub fn applyEdit(
         var hash_buf: [16]u8 = undefined;
         const actual_hex = std.fmt.bufPrint(&hash_buf, "{x}", .{actual}) catch return error.HashMismatch;
         if (!std.mem.eql(u8, expected_hex, actual_hex)) return error.HashMismatch;
+    }
+
+    if (!req.dry_run and req.op == .replace) {
+        const range = req.range.?;
+        const new_content = req.content orelse return error.MissingContent;
+        if (range[0] == 1 and std.mem.eql(u8, source, new_content) and fileLineCount(source) <= range[1]) {
+            const hash = std.hash.Wyhash.hash(0, source);
+            const seq = store.currentSeq();
+            agents.releaseLock(req.agent_id, req.path);
+            return .{
+                .seq = seq,
+                .new_hash = hash,
+                .new_size = source.len,
+                .changed = false,
+            };
+        }
+    }
+
+    if (!req.dry_run and req.op == .replace) {
+        const range = req.range.?;
+        const new_content = req.content orelse return error.MissingContent;
+        if (new_content.len > 0) {
+            const fast_result = try buildReplaceResultFast(allocator, source, range, new_content);
+            defer allocator.free(fast_result);
+            const hash = std.hash.Wyhash.hash(0, fast_result);
+
+            if (std.mem.eql(u8, source, fast_result)) {
+                const seq = store.currentSeq();
+                agents.releaseLock(req.agent_id, req.path);
+                return .{
+                    .seq = seq,
+                    .new_hash = hash,
+                    .new_size = fast_result.len,
+                    .changed = false,
+                };
+            }
+
+            const tmp_path = try std.fmt.allocPrint(allocator, "{s}.codedb_tmp", .{req.path});
+            defer allocator.free(tmp_path);
+
+            {
+                const tmp_file = try edit_dir.createFile(io, tmp_path, .{});
+                defer tmp_file.close(io);
+                try tmp_file.writeStreamingAll(io, fast_result);
+            }
+
+            std.Io.Dir.rename(edit_dir, tmp_path, edit_dir, req.path, io) catch |err| {
+                edit_dir.deleteFile(io, tmp_path) catch {};
+                return err;
+            };
+
+            const seq = try store.recordEdit(req.path, req.agent_id, req.op, hash, fast_result.len, req.content);
+            if (explorer) |exp| {
+                try exp.indexFile(req.path, fast_result);
+            }
+
+            agents.releaseLock(req.agent_id, req.path);
+            return .{
+                .seq = seq,
+                .new_hash = hash,
+                .new_size = fast_result.len,
+            };
+        }
     }
 
     // Detect line-ending style: if the file has any "\r\n", treat it as
@@ -123,6 +188,17 @@ pub fn applyEdit(
 
     const hash: u64 = std.hash.Wyhash.hash(0, result);
 
+    if (!req.dry_run and std.mem.eql(u8, source, result)) {
+        const seq = store.currentSeq();
+        agents.releaseLock(req.agent_id, req.path);
+        return .{
+            .seq = seq,
+            .new_hash = hash,
+            .new_size = result.len,
+            .changed = false,
+        };
+    }
+
     if (req.dry_run) {
         // Preview-only: build a compact diff and skip disk write, store record,
         // and explorer indexing. Caller releases the lock via errdefer/return.
@@ -137,19 +213,18 @@ pub fn applyEdit(
     }
 
     // Atomic write: write to temp file then rename to prevent corruption on crash
-    const dir = std.Io.Dir.cwd();
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.codedb_tmp", .{req.path});
     defer allocator.free(tmp_path);
 
     {
-        const tmp_file = try dir.createFile(io, tmp_path, .{});
+        const tmp_file = try edit_dir.createFile(io, tmp_path, .{});
         defer tmp_file.close(io);
         try tmp_file.writeStreamingAll(io, result);
     }
 
-    std.Io.Dir.rename(dir, tmp_path, dir, req.path, io) catch |err| {
+    std.Io.Dir.rename(edit_dir, tmp_path, edit_dir, req.path, io) catch |err| {
         // Clean up temp file on rename failure
-        dir.deleteFile(io, tmp_path) catch {};
+        edit_dir.deleteFile(io, tmp_path) catch {};
         return err;
     };
 
@@ -169,6 +244,83 @@ pub fn applyEdit(
         .new_size = result.len,
     };
 }
+
+fn fileLineCount(source: []const u8) usize {
+    if (source.len == 0) return 0;
+    var count = std.mem.count(u8, source, "\n");
+    if (source[source.len - 1] != '\n') count += 1;
+    return count;
+}
+
+fn buildReplaceResultFast(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    range: [2]usize,
+    new_content: []const u8,
+) ![]u8 {
+    if (range[0] == 0 or range[1] < range[0]) return error.InvalidRange;
+
+    const is_crlf = std.mem.indexOf(u8, source, "\r\n") != null;
+    const sep: []const u8 = if (is_crlf) "\r\n" else "\n";
+
+    var line_count: usize = 0;
+    if (source.len > 0) {
+        line_count = std.mem.count(u8, source, "\n");
+        if (source[source.len - 1] != '\n') line_count += 1;
+    }
+    if (range[0] > line_count) return error.InvalidRange;
+
+    var start_off: ?usize = if (range[0] == 1) 0 else null;
+    var end_off: ?usize = null;
+    var cur_line: usize = 1;
+    for (source, 0..) |c, i| {
+        if (c != '\n') continue;
+        if (cur_line == range[1]) {
+            end_off = i + 1;
+            break;
+        }
+        cur_line += 1;
+        if (cur_line == range[0] and start_off == null) {
+            start_off = i + 1;
+        }
+    }
+
+    const start = start_off orelse return error.InvalidRange;
+    const end = end_off orelse source.len;
+    const suffix = source[end..];
+    const content_ends_line = new_content.len > 0 and new_content[new_content.len - 1] == '\n';
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, source.len + new_content.len + sep.len);
+    try out.appendSlice(allocator, source[0..start]);
+    try appendNormalizedReplacement(allocator, &out, new_content, sep);
+    if (suffix.len > 0 and !content_ends_line) {
+        try out.appendSlice(allocator, sep);
+    }
+    try out.appendSlice(allocator, suffix);
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendNormalizedReplacement(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    content: []const u8,
+    sep: []const u8,
+) !void {
+    var first = true;
+    var iter = std.mem.splitScalar(u8, content, '\n');
+    while (iter.next()) |raw_line| {
+        if (!first) try out.appendSlice(allocator, sep);
+        first = false;
+        const line = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r')
+            raw_line[0 .. raw_line.len - 1]
+        else
+            raw_line;
+        try out.appendSlice(allocator, line);
+    }
+}
+
 /// Build a compact unified-diff-style preview showing the affected range with up
 /// to 3 lines of context on each side, removed lines prefixed with `-`, added
 /// lines prefixed with `+`. Caller owns the returned slice.

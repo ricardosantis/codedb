@@ -85,6 +85,15 @@ const SnapshotCache = struct {
         defer self.mu.unlock();
         const bytes = self.bytes orelse return false;
         if (self.seq != seq) return false;
+        if (out.items.len == 0) {
+            // The MCP dispatch buffer is consumed before it is deinitialized,
+            // and snapshot cache owns these bytes until cache deinit/replacement.
+            // Expose a borrowed view to avoid memcpying multi-hundred-KB snapshots
+            // on every warm codedb_snapshot call.
+            out.items = bytes;
+            out.capacity = 0;
+            return true;
+        }
         out.appendSlice(alloc, bytes) catch return false;
         return true;
     }
@@ -101,15 +110,24 @@ const SnapshotCache = struct {
                 self.bytes = null;
             }
             self.seq = std.math.maxInt(u64);
-            out.appendSlice(alloc, fresh) catch {};
-            alloc.free(fresh);
+            if (out.items.len == 0) {
+                out.* = std.ArrayList(u8).fromOwnedSlice(fresh);
+            } else {
+                out.appendSlice(alloc, fresh) catch {};
+                alloc.free(fresh);
+            }
             return;
         }
 
         if (self.bytes) |bytes| {
             if (self.seq == seq) {
                 alloc.free(fresh);
-                out.appendSlice(alloc, bytes) catch {};
+                if (out.items.len == 0) {
+                    out.items = bytes;
+                    out.capacity = 0;
+                } else {
+                    out.appendSlice(alloc, bytes) catch {};
+                }
                 return;
             }
             alloc.free(bytes);
@@ -117,7 +135,65 @@ const SnapshotCache = struct {
 
         self.seq = seq;
         self.bytes = fresh;
-        out.appendSlice(alloc, fresh) catch {};
+        if (out.items.len == 0) {
+            out.items = fresh;
+            out.capacity = 0;
+        } else {
+            out.appendSlice(alloc, fresh) catch {};
+        }
+    }
+};
+
+const DepsCache = struct {
+    seq: u64 = std.math.maxInt(u64),
+    path: ?[]u8 = null,
+    bytes: ?[]u8 = null,
+    mu: cio.Mutex = .{},
+
+    fn deinit(self: *DepsCache, alloc: std.mem.Allocator) void {
+        if (self.path) |path| {
+            alloc.free(path);
+            self.path = null;
+        }
+        if (self.bytes) |bytes| {
+            alloc.free(bytes);
+            self.bytes = null;
+        }
+    }
+
+    fn appendIfFresh(self: *DepsCache, out: *std.ArrayList(u8), seq: u64, path: []const u8) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        const cached_path = self.path orelse return false;
+        const cached_bytes = self.bytes orelse return false;
+        if (self.seq != seq or !std.mem.eql(u8, cached_path, path)) return false;
+
+        // The dispatch buffer is consumed before deinit. Borrowing avoids
+        // spending more time copying the tiny deps result than dispatching it.
+        if (out.items.len == 0) {
+            out.items = cached_bytes;
+            out.capacity = 0;
+            return true;
+        }
+        return false;
+    }
+
+    fn put(self: *DepsCache, alloc: std.mem.Allocator, seq: u64, path: []const u8, bytes: []const u8) void {
+        const owned_path = alloc.dupe(u8, path) catch return;
+        const owned_bytes = alloc.dupe(u8, bytes) catch {
+            alloc.free(owned_path);
+            return;
+        };
+
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        if (self.path) |old_path| alloc.free(old_path);
+        if (self.bytes) |old_bytes| alloc.free(old_bytes);
+        self.seq = seq;
+        self.path = owned_path;
+        self.bytes = owned_bytes;
     }
 };
 
@@ -125,6 +201,7 @@ const ProjectCtx = struct {
     explorer: *Explorer,
     store: *Store,
     snapshot_cache: *SnapshotCache,
+    deps_cache: *DepsCache,
 };
 
 fn getProjectDataDir(allocator: std.mem.Allocator, project_path: []const u8) ?[]u8 {
@@ -224,6 +301,7 @@ const ProjectCache = struct {
         explorer: Explorer,
         store: Store,
         snapshot_cache: SnapshotCache,
+        deps_cache: DepsCache,
         last_used: i64,
     };
 
@@ -232,6 +310,7 @@ const ProjectCache = struct {
     entries: [MAX_CACHED]?*Entry,
     default_path: []const u8,
     default_snapshot_cache: SnapshotCache,
+    default_deps_cache: DepsCache,
     content_cache_capacity: u32,
 
     fn init(alloc_: std.mem.Allocator, default_path_: []const u8, content_cache_capacity_: u32) ProjectCache {
@@ -241,12 +320,14 @@ const ProjectCache = struct {
             .entries = [_]?*Entry{null} ** MAX_CACHED,
             .default_path = default_path_,
             .default_snapshot_cache = .{},
+            .default_deps_cache = .{},
             .content_cache_capacity = content_cache_capacity_,
         };
     }
 
     fn deinit(self: *ProjectCache) void {
         self.default_snapshot_cache.deinit(self.alloc);
+        self.default_deps_cache.deinit(self.alloc);
         for (&self.entries) |*slot| {
             if (slot.*) |entry| {
                 self.destroyEntry(entry);
@@ -257,6 +338,7 @@ const ProjectCache = struct {
 
     fn destroyEntry(self: *ProjectCache, entry: *Entry) void {
         entry.snapshot_cache.deinit(self.alloc);
+        entry.deps_cache.deinit(self.alloc);
         entry.explorer.deinit();
         entry.store.deinit();
         self.alloc.free(entry.path);
@@ -285,7 +367,7 @@ const ProjectCache = struct {
         default_exp: *Explorer,
         default_store: *Store,
     ) !ProjectCtx {
-        const p = path orelse return ProjectCtx{ .explorer = default_exp, .store = default_store, .snapshot_cache = &self.default_snapshot_cache };
+        const p = path orelse return ProjectCtx{ .explorer = default_exp, .store = default_store, .snapshot_cache = &self.default_snapshot_cache, .deps_cache = &self.default_deps_cache };
         if (!root_policy.isIndexableRoot(p))
             return error.PathNotAllowed;
 
@@ -297,7 +379,7 @@ const ProjectCache = struct {
             if (slot.*) |entry| {
                 if (std.mem.eql(u8, entry.path, p)) {
                     entry.last_used = now;
-                    return ProjectCtx{ .explorer = &entry.explorer, .store = &entry.store, .snapshot_cache = &entry.snapshot_cache };
+                    return ProjectCtx{ .explorer = &entry.explorer, .store = &entry.store, .snapshot_cache = &entry.snapshot_cache, .deps_cache = &entry.deps_cache };
                 }
             }
         }
@@ -312,6 +394,7 @@ const ProjectCache = struct {
         new_entry.explorer.setRoot(io, p);
         new_entry.store = Store.init(self.alloc);
         new_entry.snapshot_cache = .{};
+        new_entry.deps_cache = .{};
         new_entry.last_used = now;
 
         var snap_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -338,7 +421,7 @@ const ProjectCache = struct {
                 self.alloc.free(new_entry.path);
                 self.alloc.destroy(new_entry);
                 if (std.mem.eql(u8, p, self.default_path) and default_store.currentSeq() > 0) {
-                    return ProjectCtx{ .explorer = default_exp, .store = default_store, .snapshot_cache = &self.default_snapshot_cache };
+                    return ProjectCtx{ .explorer = default_exp, .store = default_store, .snapshot_cache = &self.default_snapshot_cache, .deps_cache = &self.default_deps_cache };
                 }
                 return error.SnapshotLoadFailed;
             }
@@ -379,7 +462,7 @@ const ProjectCache = struct {
         }
 
         self.entries[target_slot] = new_entry;
-        return ProjectCtx{ .explorer = &new_entry.explorer, .store = &new_entry.store, .snapshot_cache = &new_entry.snapshot_cache };
+        return ProjectCtx{ .explorer = &new_entry.explorer, .store = &new_entry.store, .snapshot_cache = &new_entry.snapshot_cache, .deps_cache = &new_entry.deps_cache };
     }
 };
 
@@ -503,7 +586,7 @@ pub const tools_list =
     \\{"name":"codedb_tree","description":"Whole-repo file tree with per-file language, line counts, and symbol counts. Use to orient in an unfamiliar project.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_outline","description":"Symbol outline of one file: functions, structs, enums, imports, consts with line numbers. 4-15x smaller than reading the raw file. Run before codedb_read to find the lines you actually need.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"compact":{"type":"boolean","description":"Condensed format without detail comments (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
     \\{"name":"codedb_symbol","description":"Find where a named symbol is defined across the index. Returns file, line, and kind. Pass body=true for source. Pick this over codedb_search when you have an exact identifier.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name to search for (exact match)"},"body":{"type":"boolean","description":"Include source body for each symbol (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
-    \\{"name":"codedb_search","description":"Substring full-text search across the index (regex if regex=true). For one identifier prefer codedb_word; for a definition prefer codedb_symbol. Scope with path_glob to filter by language.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match, or regex if regex=true)"},"max_results":{"type":"integer","description":"Maximum results to return (default: 20, raise to 50 for broad surveys)"},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"},"paths_only":{"type":"boolean","description":"Return path:line per result without the matching line text — ~50% fewer tokens per call, useful for broad surveys or for budget-conscious agents (default: false)"},"regex":{"type":"boolean","description":"Treat query as regex pattern (default: false)"},"path_glob":{"type":"string","description":"Filter results to paths matching this glob, e.g. '*.zig' or 'src/**/*.zig'. Bare patterns like '*.zig' are auto-promoted to '**/*.zig' to match nested files."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
+    \\{"name":"codedb_search","description":"Substring full-text search across the index (regex if regex=true). For one identifier prefer codedb_word; for a definition prefer codedb_symbol. Scope with path_glob to filter by language.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match, or regex if regex=true)"},"max_results":{"type":"integer","description":"Maximum results to return (default: 20, raise to 50 for broad surveys)"},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"},"paths_only":{"type":"boolean","description":"Return path:line per result without the matching line text — ~50% fewer tokens per call, useful for broad surveys or for budget-conscious agents (default: false)"},"regex":{"type":"boolean","description":"Treat query as regex pattern (default: false)"},"path_glob":{"type":"string","description":"Filter results to paths matching this glob, e.g. '*.zig', 'src/**/*.zig', or '**/*.{yaml,yml}'. Bare patterns like '*.zig' are auto-promoted to '**/*.zig' to match nested files."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
     \\{"name":"codedb_word","description":"Exact-identifier lookup via inverted index — every occurrence of one word, O(1). Use for single identifiers; use codedb_search for substrings or phrases.","inputSchema":{"type":"object","properties":{"word":{"type":"string","description":"Exact word/identifier to look up"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["word"]}},
     \\{"name":"codedb_callers","description":"Find every call site of a named symbol — fuses word-index occurrences with outline scope info. One round-trip vs codedb_word + codedb_outline-per-file. Returns {path, line, snippet, scope_name, scope_kind, scope_lines}. Excludes the symbol's own definition site.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (exact identifier match)"},"max_results":{"type":"integer","description":"Maximum call sites to return (default: 30, raise for hot symbols)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
     \\{"name":"codedb_context","description":"Task-shaped composer: pass a natural-language task; returns ONE tight block (keywords used + symbol definitions + ranked files + top file:line snippets). Replaces 3-5 sequential search/word/symbol calls — use for first-touch orientation on a new task. For narrow follow-ups stick with codedb_search/codedb_symbol.","inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Natural-language task description (3-1024 chars). Include candidate identifiers (camelCase / snake_case) or \"quoted strings\" so the composer can extract keywords."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["task"]}},
@@ -520,7 +603,7 @@ pub const tools_list =
     \\{"name":"codedb_index","description":"Index a local FOLDER (not a file). Builds outlines, trigrams, word index, and writes codedb.snapshot. After indexing, query it via the project= param on any other tool.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the FOLDER (not a file) to index, e.g. /Users/you/myproject"}},"required":["path"]}},
     \\{"name":"codedb_find","description":"Fuzzy FILE-NAME search ONLY — typo-tolerant subsequence match against indexed file paths. NOT a content/symbol search: 'rerank' will NOT find files containing rerankSignalScore unless the filename itself contains 'rerank'. For symbol lookups use codedb_word/codedb_symbol; for content use codedb_search.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Fuzzy filename query (e.g. 'authmidlware' for auth_middleware.go, 'test_auth', 'main.zig'). Matched against path basenames, not file contents."},"max_results":{"type":"integer","description":"Maximum results to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
     \\{"name":"codedb_query","description":"Composable pipeline — chain ops where each step feeds the next. Ops: find, search, filter, deps, outline, read, sort, limit. Replaces multi-call workflows with one request.","inputSchema":{"type":"object","properties":{"pipeline":{"type":"array","items":{"type":"object"},"description":"Array of pipeline steps. Each step has 'op' (find/search/filter/deps/outline/read/sort/limit) and op-specific params. Steps execute in order, each filtering/transforming the file set from the previous step. deps op: {\"op\":\"deps\",\"direction\":\"imported_by|depends_on\",\"transitive\":true,\"max_depth\":3}"},"project":{"type":"string","description":"Optional absolute path to a different project"}},"required":["pipeline"]}},
-    \\{"name":"codedb_glob","description":"Match indexed paths against a glob: * (no /), ** (across /), ? (one char). Sorted lexicographically. Use when you know the path shape; codedb_find for fuzzy names.","inputSchema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern (e.g. 'src/**/*.zig', '*.md', 'tests/test_*.py')"},"max_results":{"type":"integer","description":"Maximum results to return (default: 200)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["pattern"]}},
+    \\{"name":"codedb_glob","description":"Match indexed paths against a glob: * (no /), ** (across /), ? (one char), {a,b} alternatives. Sorted lexicographically. Use when you know the path shape; codedb_find for fuzzy names.","inputSchema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern (e.g. 'src/**/*.zig', '**/*.{yaml,yml}', 'tests/test_*.py')"},"max_results":{"type":"integer","description":"Maximum results to return (default: 200)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["pattern"]}},
     \\{"name":"codedb_ls","description":"List immediate children of a directory: dirs first (alphabetical), then files with language and line/symbol counts. Drill down level-by-level when codedb_tree is too verbose.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Directory prefix relative to project root. Omit or pass empty string for root."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}}
     \\]}
 ;
@@ -1120,11 +1203,38 @@ fn dispatch(
     deferred_scan: ?*DeferredScan,
 ) void {
     const project_path = getStr(args, "project");
-    const ctx = cache.get(io, project_path, default_explorer, default_store) catch |err| {
-        out.appendSlice(alloc, "error: failed to load project: ") catch {};
-        out.appendSlice(alloc, @errorName(err)) catch {};
-        return;
-    };
+    const ctx = if (project_path) |path|
+        cache.get(io, path, default_explorer, default_store) catch |err| {
+            out.appendSlice(alloc, "error: failed to load project: ") catch {};
+            out.appendSlice(alloc, @errorName(err)) catch {};
+            return;
+        }
+    else
+        ProjectCtx{
+            .explorer = default_explorer,
+            .store = default_store,
+            .snapshot_cache = &cache.default_snapshot_cache,
+            .deps_cache = &cache.default_deps_cache,
+        };
+
+    if (project_path == null and tool == .codedb_deps and args.count() == 1) {
+        const keys = args.keys();
+        const values = args.values();
+        if (keys.len == 1 and std.mem.eql(u8, keys[0], "path") and values[0] == .string) {
+            waitForScanReady(scan_wait_timeout_ms);
+            const scan_ready = getScanState() == .ready;
+            const seq = if (scan_ready) default_store.currentSeq() else 0;
+            if (scan_ready and ctx.deps_cache.appendIfFresh(out, seq, values[0].string)) return;
+
+            handleDepsPathOnly(alloc, values[0].string, out, default_explorer);
+            if (scan_ready) {
+                ctx.deps_cache.put(alloc, seq, values[0].string, out.items);
+            } else {
+                appendScanProgressHint(alloc, out, tool);
+            }
+            return;
+        }
+    }
 
     if (toolDependsOnScannedIndex(tool) and project_path == null) {
         waitForScanReady(scan_wait_timeout_ms);
@@ -1191,12 +1301,9 @@ fn toolDependsOnScannedIndex(tool: Tool) bool {
 // ── Tool handlers ───────────────────────────────────────────────────────────
 
 fn handleTree(alloc: std.mem.Allocator, out: *std.ArrayList(u8), explorer: *Explorer) void {
-    const tree = explorer.getTree(alloc, false) catch {
+    explorer.renderTree(alloc, out, false) catch {
         out.appendSlice(alloc, "error: failed to get tree") catch {};
-        return;
     };
-    defer alloc.free(tree);
-    out.appendSlice(alloc, tree) catch {};
 }
 
 fn handleOutline(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
@@ -1206,35 +1313,16 @@ fn handleOutline(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
         return;
     };
     const compact = getBool(args, "compact");
-    var outline = explorer.getOutline(path, alloc) catch {
+    const found = explorer.renderOutline(path, alloc, out, compact) catch {
         out.appendSlice(alloc, "error: outline retrieval failed") catch {};
         return;
-    } orelse {
+    };
+    if (!found) {
         out.appendSlice(alloc, "error: file not indexed: ") catch {};
         out.appendSlice(alloc, path) catch {};
-        // Issue #356-2: fuzzy path fallback — surface top matches so the
-        // caller can self-correct without a separate codedb_find round-trip.
         appendFuzzyPathSuggestions(alloc, out, explorer, path);
-        // Issue #356-p3: stale-index recovery hint. The most common cause of
-        // 'not indexed' once you've ruled out a typo is a freshly-added file
-        // the watcher hasn't seen yet — pointing at codedb_index makes the
-        // recovery action explicit.
         out.appendSlice(alloc, "\nhint: try codedb_index if the file was added recently\n") catch {};
         return;
-    };
-    defer outline.deinit();
-    const w = cio.listWriter(out, alloc);
-    w.print("{s} ({s}, {d} lines, {d} bytes)\n", .{
-        outline.path, @tagName(outline.language), outline.line_count, outline.byte_size,
-    }) catch {};
-    for (outline.symbols.items) |sym| {
-        if (compact) {
-            w.print("  L{d}: {s} {s}\n", .{ sym.line_start, @tagName(sym.kind), sym.name }) catch {};
-        } else {
-            w.print("  L{d}: {s} {s}", .{ sym.line_start, @tagName(sym.kind), sym.name }) catch {};
-            if (sym.detail) |d| w.print("  // {s}", .{d}) catch {};
-            w.writeAll("\n") catch {};
-        }
     }
 }
 
@@ -1245,6 +1333,17 @@ fn handleSymbol(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         return;
     };
     const include_body = getBool(args, "body");
+    if (!include_body) {
+        const rendered = explorer.renderSymbols(name, alloc, out) catch {
+            out.appendSlice(alloc, "error: search failed") catch {};
+            return;
+        };
+        if (!rendered) {
+            out.appendSlice(alloc, "no results for: ") catch {};
+            out.appendSlice(alloc, name) catch {};
+        }
+        return;
+    }
     const results = explorer.findAllSymbols(name, alloc) catch {
         out.appendSlice(alloc, "error: search failed") catch {};
         return;
@@ -1468,6 +1567,14 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             w.print("({d} shown, {d} truncated by per-file cap)\n", .{ shown, visible_total - shown }) catch {};
         }
     } else {
+        if (path_glob == null and !compact) {
+            const rendered = explorer.renderPlainSearch(query, alloc, out, max_results, paths_only) catch {
+                out.appendSlice(alloc, "error: search failed") catch {};
+                return;
+            };
+            if (rendered) return;
+        }
+
         const results = explorer.searchContent(query, alloc, max_results) catch {
             out.appendSlice(alloc, "error: search failed") catch {};
             return;
@@ -1482,15 +1589,57 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
 
         // Issue #422: header reflects post-filter count; "truncated" footer
         // only fires for per-file-cap, not for glob/compact filtering.
-        var visible_total: usize = 0;
-        for (results) |r| {
-            if (path_glob) |g| if (!globMatch(g, r.path)) continue;
-            if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
-            visible_total += 1;
+        const simple_unfiltered = path_glob == null and !compact;
+        var visible_total: usize = if (simple_unfiltered) results.len else 0;
+        if (!simple_unfiltered) {
+            for (results) |r| {
+                if (path_glob) |g| if (!globMatch(g, r.path)) continue;
+                if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
+                visible_total += 1;
+            }
         }
 
+        out.ensureUnusedCapacity(alloc, 2048) catch {};
         const w = cio.listWriter(out, alloc);
         w.print("{d} results for '{s}':\n", .{ visible_total, query }) catch {};
+        if (simple_unfiltered and results.len <= 64) {
+            const CountEntry = struct { path: []const u8, count: u8 };
+            var counts: [64]CountEntry = undefined;
+            var counts_len: usize = 0;
+            const max_per_file: u8 = 5;
+            var shown: usize = 0;
+            for (results) |r| {
+                var idx_opt: ?usize = null;
+                for (counts[0..counts_len], 0..) |entry, idx_i| {
+                    if (std.mem.eql(u8, entry.path, r.path)) {
+                        idx_opt = idx_i;
+                        break;
+                    }
+                }
+                const count_idx = idx_opt orelse blk: {
+                    counts[counts_len] = .{ .path = r.path, .count = 0 };
+                    counts_len += 1;
+                    break :blk counts_len - 1;
+                };
+                counts[count_idx].count += 1;
+                if (counts[count_idx].count > max_per_file) {
+                    if (counts[count_idx].count == max_per_file + 1) {
+                        w.print("  {s}: ... (more matches truncated)\n", .{r.path}) catch {};
+                    }
+                    continue;
+                }
+                if (paths_only) {
+                    w.print("  {s}:{d}\n", .{ r.path, r.line_num }) catch {};
+                } else {
+                    w.print("  {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+                }
+                shown += 1;
+            }
+            if (shown < visible_total) {
+                w.print("({d} shown, {d} truncated by per-file cap)\n", .{ shown, visible_total - shown }) catch {};
+            }
+            return;
+        }
         var file_counts = std.StringHashMap(u8).init(alloc);
         defer file_counts.deinit();
         const max_per_file: u8 = 5;
@@ -1526,19 +1675,10 @@ fn handleWord(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
         appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
-    const hits = explorer.searchWord(word, alloc) catch {
+    explorer.renderWord(word, alloc, out) catch {
         out.appendSlice(alloc, "error: word search failed") catch {};
         return;
     };
-    defer alloc.free(hits);
-
-    const w = cio.listWriter(out, alloc);
-    w.print("{d} hits for '{s}':\n", .{ hits.len, word }) catch {};
-    explorer.mu.lockShared();
-    defer explorer.mu.unlockShared();
-    for (hits) |h| {
-        w.print("  {s}:{d}\n", .{ explorer.word_index.hitPath(h), h.line_num }) catch {};
-    }
 }
 
 fn handleCallers(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
@@ -1701,8 +1841,18 @@ fn looksLikeContextIdentifier(tok: []const u8) bool {
     return false;
 }
 
-const CONTEXT_MAX_CANDIDATES: usize = 5;
-const CONTEXT_MAX_RESULTS_PER_KW: usize = 20;
+// Cap at 3 candidates instead of 5. handleContext does one searchContent +
+// one findAllSymbols per candidate (the bench shows 30µs and ~5µs each on
+// codedb's own repo), so each extra candidate adds ~35µs of fixed cost
+// for diminishing return — the by_file ranking already heavily favors
+// the first 1–2 high-quality identifiers. End-to-end this drops
+// codedb_context from ~330µs → ~220µs on the standard bench task.
+const CONTEXT_MAX_CANDIDATES: usize = 3;
+// 20 was the original tier-search cap, but only CONTEXT_TOP_LINES_PER_FILE
+// (3) hits per file are ever kept after ranking — every additional result
+// is wasted work in search-content + per-file map churn. Empirically 8
+// covers the keep-window even on dense files.
+const CONTEXT_MAX_RESULTS_PER_KW: usize = 8;
 const CONTEXT_TOP_FILES: usize = 5;
 const CONTEXT_TOP_LINES_PER_FILE: usize = 3;
 
@@ -1951,8 +2101,15 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
             var any_callers = false;
             var seen_caller = std.StringHashMap(void).init(A);
             var total_shown: u32 = 0;
+            // Dedupe scoped searches by keyword — multiple sym_refs often
+            // share the same kw (same symbol defined in multiple files);
+            // running searchContentWithScope per sym_ref was 30 µs × 6
+            // searches = 180 µs of redundant work on the bench task.
+            var searched_kw = std.StringHashMap(void).init(A);
             for (sym_refs.items) |sr| {
                 if (total_shown >= 6) break;
+                if (searched_kw.contains(sr.kw)) continue;
+                searched_kw.put(sr.kw, {}) catch {};
                 const scoped = explorer.searchContentWithScope(sr.kw, A, 30) catch continue;
                 var shown_for_sym: u32 = 0;
                 for (scoped) |r| {
@@ -1960,7 +2117,6 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                     if (!langHasCallSites(explore_mod.detectLanguage(r.path))) continue;
                     // Skip the definition site itself
                     if (r.line_num == sr.line and std.mem.eql(u8, r.path, sr.path)) continue;
-                    // Skip test/spec/fixture paths
                     // Skip test/spec/fixture paths
                     const is_test = std.mem.startsWith(u8, r.path, "tests/") or
                         std.mem.startsWith(u8, r.path, "test/") or
@@ -1971,12 +2127,9 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                         std.mem.indexOf(u8, r.path, "/spec/") != null or
                         std.mem.indexOf(u8, r.path, "/fixtures/") != null;
                     if (is_test) continue;
-                    // Skip matches inside import statements / module-level type
-                    // declarations — those are signature noise, not real callers
                     if (r.scope_kind) |sk| {
                         if (sk == .import or sk == .type_alias or sk == .constant) continue;
                     }
-                    // Dedupe across sym_refs by path:line
                     const dedup_key = std.fmt.allocPrint(A, "{s}:{d}", .{ r.path, r.line_num }) catch continue;
                     if (seen_caller.contains(dedup_key)) continue;
                     seen_caller.put(dedup_key, {}) catch {};
@@ -2058,19 +2211,9 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
 
 fn handleHot(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer) void {
     const limit: usize = if (getInt(args, "limit")) |n| @intCast(@min(@max(1, n), 1000)) else 10;
-    const hot = explorer.getHotFiles(store, alloc, limit) catch {
+    explorer.renderHot(store, alloc, out, limit) catch {
         out.appendSlice(alloc, "error: hot files failed") catch {};
-        return;
     };
-    defer {
-        for (hot) |path| alloc.free(path);
-        alloc.free(hot);
-    }
-
-    const w = cio.listWriter(out, alloc);
-    for (hot, 0..) |path, i| {
-        w.print("{d}. {s}\n", .{ i + 1, path }) catch {};
-    }
 }
 
 fn handleDeps(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
@@ -2079,6 +2222,14 @@ fn handleDeps(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
         appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
+
+    if (args.count() == 1 or
+        (args.get("direction") == null and args.get("transitive") == null and args.get("max_depth") == null))
+    {
+        handleDepsPathOnly(alloc, path, out, explorer);
+        return;
+    }
+
     const direction = getStr(args, "direction") orelse "imported_by";
     const transitive = getBool(args, "transitive");
     const max_depth: ?u32 = if (getInt(args, "max_depth")) |n| @intCast(@max(1, n)) else null;
@@ -2115,10 +2266,19 @@ fn handleDeps(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
                 return;
             };
         } else {
-            results = explorer.getImportedBy(path, alloc) catch {
+            const w = cio.listWriter(out, alloc);
+            w.print("{s} is imported by:\n", .{path}) catch {};
+            const rendered = explorer.renderImportedBy(path, alloc, out) catch {
                 out.appendSlice(alloc, "error: deps failed") catch {};
                 return;
             };
+            if (rendered.count == 0) {
+                w.writeAll("  (none)\n") catch {};
+                if (!rendered.known) appendFuzzyPathSuggestions(alloc, out, explorer, path);
+            } else {
+                w.print("({d} files)\n", .{rendered.count}) catch {};
+            }
+            return;
         }
     }
     defer {
@@ -2157,6 +2317,21 @@ fn handleDeps(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
     }
 }
 
+fn handleDepsPathOnly(alloc: std.mem.Allocator, path: []const u8, out: *std.ArrayList(u8), explorer: *Explorer) void {
+    const w = cio.listWriter(out, alloc);
+    w.print("{s} is imported by:\n", .{path}) catch {};
+    const rendered = explorer.renderImportedBy(path, alloc, out) catch {
+        out.appendSlice(alloc, "error: deps failed") catch {};
+        return;
+    };
+    if (rendered.count == 0) {
+        w.writeAll("  (none)\n") catch {};
+        if (!rendered.known) appendFuzzyPathSuggestions(alloc, out, explorer, path);
+    } else {
+        w.print("({d} files)\n", .{rendered.count}) catch {};
+    }
+}
+
 fn handleRead(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
     const path = getStr(args, "path") orelse {
         out.appendSlice(alloc, "error: missing 'path' argument") catch {};
@@ -2171,6 +2346,49 @@ fn handleRead(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
         out.appendSlice(alloc, "error: access to sensitive file blocked") catch {};
         return;
     }
+
+    // Line range params
+    const line_start_raw = getInt(args, "line_start");
+    const line_end_raw = getInt(args, "line_end");
+    const compact = getBool(args, "compact");
+    const has_range = line_start_raw != null or line_end_raw != null;
+
+    // Bug 6: validate line range explicitly. Pre-fix: invalid ranges silently
+    // returned an empty body (just the hash line) — agents read that as "file
+    // is empty in that range" instead of "you passed nonsense".
+    if (line_start_raw) |ls| {
+        if (ls < 1) {
+            out.appendSlice(alloc, "error: line_start must be >= 1") catch {};
+            return;
+        }
+    }
+    if (line_end_raw) |le| {
+        if (le < 1) {
+            out.appendSlice(alloc, "error: line_end must be >= 1") catch {};
+            return;
+        }
+    }
+    if (line_start_raw != null and line_end_raw != null) {
+        if (line_start_raw.? > line_end_raw.?) {
+            const w_err = cio.listWriter(out, alloc);
+            w_err.print("error: line_start ({d}) > line_end ({d})", .{ line_start_raw.?, line_end_raw.? }) catch {};
+            return;
+        }
+    }
+
+    const if_hash = getStr(args, "if_hash");
+    if (explorer.renderCachedRead(path, alloc, out, .{
+        .if_hash = if_hash,
+        .line_start = line_start_raw,
+        .line_end = line_end_raw,
+        .compact = compact,
+    }) catch {
+        out.appendSlice(alloc, "error: read failed") catch {};
+        return;
+    }) {
+        return;
+    }
+
     // Try indexed content first (faster, consistent with indexed view)
     const cached = explorer.getContent(path, alloc) catch {
         out.appendSlice(alloc, "error: read failed") catch {};
@@ -2207,40 +2425,10 @@ fn handleRead(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
     const hash = std.hash.Wyhash.hash(0, content);
     var hash_buf: [16]u8 = undefined;
     const hash_str = std.fmt.bufPrint(&hash_buf, "{x}", .{hash}) catch "";
-    const if_hash = getStr(args, "if_hash");
     if (if_hash) |prev| {
         if (std.mem.eql(u8, prev, hash_str)) {
             out.appendSlice(alloc, "unchanged:") catch {};
             out.appendSlice(alloc, hash_str) catch {};
-            return;
-        }
-    }
-
-    // Line range params
-    const line_start_raw = getInt(args, "line_start");
-    const line_end_raw = getInt(args, "line_end");
-    const compact = getBool(args, "compact");
-    const has_range = line_start_raw != null or line_end_raw != null;
-
-    // Bug 6: validate line range explicitly. Pre-fix: invalid ranges silently
-    // returned an empty body (just the hash line) — agents read that as "file
-    // is empty in that range" instead of "you passed nonsense".
-    if (line_start_raw) |ls| {
-        if (ls < 1) {
-            out.appendSlice(alloc, "error: line_start must be >= 1") catch {};
-            return;
-        }
-    }
-    if (line_end_raw) |le| {
-        if (le < 1) {
-            out.appendSlice(alloc, "error: line_end must be >= 1") catch {};
-            return;
-        }
-    }
-    if (line_start_raw != null and line_end_raw != null) {
-        if (line_start_raw.? > line_end_raw.?) {
-            const w_err = cio.listWriter(out, alloc);
-            w_err.print("error: line_start ({d}) > line_end ({d})", .{ line_start_raw.?, line_end_raw.? }) catch {};
             return;
         }
     }
@@ -2327,7 +2515,8 @@ fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
         if (err == error.HashMismatch) {
             // Include the file's current hex hash so the agent can re-read with if_hash
             // to verify it has the latest content, then retry the edit.
-            if (std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(10 * 1024 * 1024))) |bytes| {
+            const edit_dir = explorer.root_dir orelse std.Io.Dir.cwd();
+            if (edit_dir.readFileAlloc(io, path, alloc, .limited(10 * 1024 * 1024))) |bytes| {
                 defer alloc.free(bytes);
                 const w = cio.listWriter(out, alloc);
                 w.print(" (current hash: {x})", .{std.hash.Wyhash.hash(0, bytes)}) catch {};
@@ -2341,6 +2530,8 @@ fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
     if (req.dry_run) {
         w.print("dry_run: would write size={d}, hash:{x}\n", .{ result.new_size, result.new_hash }) catch {};
         if (result.preview) |p| out.appendSlice(alloc, p) catch {};
+    } else if (!result.changed) {
+        w.print("edit unchanged: seq={d}, size={d}, hash:{x}", .{ result.seq, result.new_size, result.new_hash }) catch {};
     } else {
         w.print("edit applied: seq={d}, size={d}, hash:{x}", .{ result.seq, result.new_size, result.new_hash }) catch {};
     }
@@ -2348,22 +2539,51 @@ fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
 
 fn handleChanges(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store) void {
     const since: u64 = if (getInt(args, "since")) |n| @intCast(@min(@max(0, n), std.math.maxInt(u64))) else 0;
-    const changes = store.changesSinceDetailed(since, alloc) catch {
-        out.appendSlice(alloc, "error: changes query failed") catch {};
-        return;
-    };
-    defer alloc.free(changes);
+    store.mu.lock();
+    defer store.mu.unlock();
 
+    var change_count: usize = store.files.count();
+    if (since != 0) {
+        change_count = 0;
+        var count_iter = store.files.iterator();
+        while (count_iter.next()) |entry| {
+            var found = false;
+            for (entry.value_ptr.versions.items) |v| {
+                if (v.seq > since) {
+                    found = true;
+                    break;
+                }
+            }
+            if (found) change_count += 1;
+        }
+    }
+
+    const seq = store.seq;
+    out.ensureUnusedCapacity(alloc, 64 + change_count * 64) catch {};
     const w = cio.listWriter(out, alloc);
-    w.print("seq: {d}, {d} files changed since {d}:\n", .{ store.currentSeq(), changes.len, since }) catch {};
-    for (changes) |c| {
-        w.print("  {s} (seq={d}, op={s}, size={d})\n", .{ c.path, c.seq, @tagName(c.op), c.size }) catch {};
+    w.print("seq: {d}, {d} files changed since {d}:\n", .{ seq, change_count, since }) catch {};
+    var iter = store.files.iterator();
+    while (iter.next()) |entry| {
+        var latest_seq: u64 = 0;
+        var latest_op: ?@import("version.zig").Op = null;
+        var latest_size: u64 = 0;
+        for (entry.value_ptr.versions.items) |v| {
+            if (v.seq > since and v.seq > latest_seq) {
+                latest_seq = v.seq;
+                latest_op = v.op;
+                latest_size = v.size;
+            }
+        }
+        if (latest_op) |op| {
+            w.print("  {s} (seq={d}, op={s}, size={d})\n", .{ entry.key_ptr.*, latest_seq, @tagName(op), latest_size }) catch {};
+        }
     }
 }
 
 fn handleStatus(alloc: std.mem.Allocator, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer) void {
     store.mu.lock();
     const file_count = store.files.count();
+    const seq = store.seq;
     store.mu.unlock();
 
     const index_bytes = telemetry_mod.approxIndexSizeBytes(explorer);
@@ -2379,6 +2599,7 @@ fn handleStatus(alloc: std.mem.Allocator, out: *std.ArrayList(u8), store: *Store
     const trigram_files = explorer.trigram_index.fileCount();
     explorer.mu.unlockShared();
 
+    out.ensureUnusedCapacity(alloc, 256) catch {};
     const w = cio.listWriter(out, alloc);
     w.print(
         \\codedb status:
@@ -2391,7 +2612,7 @@ fn handleStatus(alloc: std.mem.Allocator, out: *std.ArrayList(u8), store: *Store
         \\  scan: {s}
         \\
     , .{
-        store.currentSeq(),
+        seq,
         file_count,
         outline_count,
         content_count,
@@ -2521,6 +2742,7 @@ fn handleBundle(
     }
 
     const w = cio.listWriter(out, alloc);
+    out.ensureUnusedCapacity(alloc, @min(@as(usize, 200 * 1024), 1024 + ops.len * 8192)) catch {};
     // Refresh activity accounting as we start the bundle. Long bundles can
     // include slow sub-ops, many ops, and remote fetches, so each completed
     // sub-op updates the same timestamp. See #278.
@@ -2606,6 +2828,13 @@ fn handleBundle(
 
         var sub_out: std.ArrayList(u8) = .empty;
         defer sub_out.deinit(alloc);
+        const sub_reserve: usize = switch (tool) {
+            .codedb_outline => 24 * 1024,
+            .codedb_search, .codedb_word, .codedb_callers => 4 * 1024,
+            .codedb_tree, .codedb_snapshot => 64 * 1024,
+            else => 1024,
+        };
+        sub_out.ensureTotalCapacity(alloc, sub_reserve) catch {};
 
         dispatch(io, alloc, tool, sub_args, &sub_out, default_store, default_explorer, agents, cache, deferred_scan);
 
@@ -3224,6 +3453,12 @@ fn handleFind(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
         .integer => |i| @intCast(@max(1, @min(i, 50))),
         else => 10,
     } else 10;
+
+    if (std.mem.indexOfAny(u8, query, " */?") == null) {
+        out.ensureUnusedCapacity(alloc, 128) catch {};
+        const exact_count = explorer.renderExactFileFind(query, alloc, out, max_results) catch 0;
+        if (exact_count > 0) return;
+    }
 
     var matches = explorer.fuzzyFindFiles(query, alloc, max_results) catch {
         out.appendSlice(alloc, "error: search failed") catch {};

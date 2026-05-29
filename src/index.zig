@@ -805,7 +805,7 @@ pub const TrigramIndex = struct {
 
     /// Maximum entries per posting list — caps memory for common trigrams.
     /// Trigrams appearing in more files than this are poor discriminators anyway.
-    const MAX_POSTINGS: usize = 512;
+    const MAX_POSTINGS: usize = 256;
 
     pub fn init(allocator: std.mem.Allocator) TrigramIndex {
         return .{
