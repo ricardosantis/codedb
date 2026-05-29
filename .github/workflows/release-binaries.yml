@@ -39,6 +39,11 @@ jobs:
             asset_name: codedb-linux-x86_64
             zig_archive: zig-x86_64-linux-0.16.0.tar.xz
             zig_dir: zig-x86_64-linux-0.16.0
+          - runner: ubuntu-24.04
+            zig_target: aarch64-linux
+            asset_name: codedb-linux-arm64
+            zig_archive: zig-x86_64-linux-0.16.0.tar.xz
+            zig_dir: zig-x86_64-linux-0.16.0
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
       APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
@@ -86,14 +91,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          codesign_arg=()
           if [[ "${{ runner.os }}" == "macOS" ]] &&
              [[ "${{ matrix.zig_target }}" != "x86_64-macos" ]] &&
              [[ -n "${CODEDB_CODESIGN_IDENTITY:-}" ]] &&
              grep -q 'codesign-identity' build.zig; then
-            codesign_arg=(-Dcodesign-identity="$CODEDB_CODESIGN_IDENTITY")
+            zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.zig_target }} -Dcodesign-identity="$CODEDB_CODESIGN_IDENTITY"
+          else
+            zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.zig_target }}
           fi
-          zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.zig_target }} "${codesign_arg[@]}"
           cp zig-out/bin/codedb "${{ matrix.asset_name }}"
 
       - name: Upload build artifact
