@@ -52,6 +52,8 @@ releases catch this exact client-wrapper failure mode.
 - `python3 scripts/e2e_mcp_test.py --binary zig-out/bin/codedb --project /Users/blackfloofie/codedb-release-0.2.5823`
   — **20/20 passed**
 - GitHub PR bench-regression for #513: **success**
+- Release asset workflow now builds the expected Linux ARM64 asset in addition
+  to macOS ARM64, macOS x86_64, and Linux x86_64.
 
 See [`benchmarks/v0.2.5823-validation.md`](benchmarks/v0.2.5823-validation.md)
 for the release validation notes.

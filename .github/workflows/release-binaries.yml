@@ -39,6 +39,11 @@ jobs:
             asset_name: codedb-linux-x86_64
             zig_archive: zig-x86_64-linux-0.16.0.tar.xz
             zig_dir: zig-x86_64-linux-0.16.0
+          - runner: ubuntu-24.04
+            zig_target: aarch64-linux
+            asset_name: codedb-linux-arm64
+            zig_archive: zig-x86_64-linux-0.16.0.tar.xz
+            zig_dir: zig-x86_64-linux-0.16.0
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
       APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
