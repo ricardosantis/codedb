@@ -493,6 +493,21 @@ pub const BenchContext = struct {
         dispatch(io, alloc, tool, args, out, store, explorer, agents, &self.cache, null);
     }
 
+    pub fn runHandleCall(
+        self: *BenchContext,
+        io: std.Io,
+        alloc: std.mem.Allocator,
+        root: *const std.json.ObjectMap,
+        stdout: cio.File,
+        id: ?std.json.Value,
+        store: *Store,
+        explorer: *Explorer,
+        agents: *AgentRegistry,
+        telem: *telemetry_mod.Telemetry,
+    ) void {
+        handleCall(io, alloc, root, stdout, id, store, explorer, agents, &self.cache, telem, null);
+    }
+
     pub fn runToolCall(
         self: *BenchContext,
         io: std.Io,
@@ -4569,6 +4584,7 @@ pub fn mcpGenerateGuidance(
         buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_outline on a hot file to see recent changes" ++ MCP_RESET) catch {};
     }
 }
+
 test "issue-258: cached project reads use the project root after contents are released" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
