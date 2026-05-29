@@ -1,6 +1,62 @@
 # Changelog
 
 
+## 0.2.5823 - 2026-05-29
+
+`0.2.5823` is an MCP compatibility hotfix for direct `tools/call` requests.
+It ships the issue #512 fix and adds a wire-level stdio backtest so future
+releases catch this exact client-wrapper failure mode.
+
+### MCP direct tool-call compatibility
+
+- **#512 — direct calls no longer drop inline args when `arguments` is empty.**
+  Some clients send canonical MCP `params.name` and `params.arguments`, but a
+  wrapper layer may also emit `arguments: {}` while placing the real fields
+  inline on `params`, for example `{"name":"codedb_outline","arguments":{},
+  "path":"src/mcp.zig"}`. Direct `tools/call` previously treated the empty
+  `arguments` object as authoritative, dispatched `codedb_outline` with no
+  `path`, and returned `missing 'path'` / `received keys: []` even though the
+  request contained a path.
+- **Canonical MCP behavior is preserved.** Non-empty `params.arguments` remains
+  authoritative. When `arguments` is empty or absent, direct calls now copy
+  non-administrative inline fields into a clean argument map before dispatch.
+  A legacy `params.args` object is accepted only as a compatibility fallback
+  when canonical args are absent or empty. Malformed non-object `arguments`
+  still returns the protocol error `arguments must be object`.
+- **Diagnostics now match direct calls.** Missing-arg guidance no longer says
+  "sub-op" for direct `tools/call`; it explains the canonical direct shape and
+  separately mentions the bundled inline fallback.
+
+### Backtesting
+
+- Added `test "issue-512: direct tools call accepts inline args when arguments
+  is empty"` to exercise the direct call handler.
+- Extended `scripts/e2e_mcp_test.py` with Scenario 4, which sends the malformed
+  direct stdio MCP request through the real server process. The fixed binary
+  passes **20/20** E2E checks; the pre-fix binary fails Scenario 4 with the old
+  `missing 'path'` / `received keys: []` response.
+- A subagent also validated the change with codedb MCP available. Its MCP
+  snapshot was stale, so it used codedb MCP to inspect what was available and
+  then confirmed the current disk state plus the focused and stdio E2E tests.
+
+### Release metadata
+
+- `src/release_info.zig`, `build.zig.zon`, and `npm/package.json` are aligned
+  on `0.2.5823`.
+
+### Validation
+
+- `zig build test -Dtest-filter=issue-512`
+- `zig build test`
+- `zig build`
+- `python3 scripts/e2e_mcp_test.py --binary zig-out/bin/codedb --project /Users/blackfloofie/codedb-release-0.2.5823`
+  — **20/20 passed**
+- GitHub PR bench-regression for #513: **success**
+
+See [`benchmarks/v0.2.5823-validation.md`](benchmarks/v0.2.5823-validation.md)
+for the release validation notes.
+
+
 ## 0.2.5822 - 2026-05-29
 
 `0.2.5822` is a hot-path performance and release-reliability follow-up to
