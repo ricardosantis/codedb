@@ -23,3 +23,6 @@ codedb.snapshot
 release/
 release/
 socials/
+
+# Benchmark / dev output dirs
+logs/

