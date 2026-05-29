@@ -220,24 +220,32 @@ back-to-back saves can extend the scan phase. Check `codedb status` —
 ### Permission errors on macOS
 
 The first time you run a fresh codedb binary on macOS, Gatekeeper may
-quarantine it. All release binaries from v0.2.5811+ are signed with a
-Developer ID and notarized via Apple — verify with:
+quarantine it. Apple Silicon release binaries from v0.2.5811+ are signed
+with a Developer ID and notarized via Apple — verify with:
 
 ```bash
 spctl -a -vv -t install /usr/local/bin/codedb
 # expected: accepted, source=Notarized Developer ID
 ```
 
-If you built from source, codesign the binary locally:
+The Intel `codedb-darwin-x86_64` release slice is temporarily unsigned.
+Signed Zig 0.16 x86_64-macos binaries can segfault on macOS 26 and under
+Rosetta after codesign, so the release workflow leaves that artifact
+unsigned and relies on the published SHA256 checksum instead.
+
+If you built from source on Apple Silicon, codesign the binary locally:
 
 ```bash
 codesign --force --sign - /usr/local/bin/codedb
 ```
 
+Avoid codesigning locally built x86_64-macos binaries on macOS 26 until
+the upstream Zig/Mach-O issue is resolved.
+
 ### Stale signatures after `cp` over an existing binary
 
 macOS caches codesignatures by path. After replacing the binary,
-re-codesign or the MCP server may fail to launch:
+re-codesign Apple Silicon builds or the MCP server may fail to launch:
 
 ```bash
 codesign --force --sign - /usr/local/bin/codedb

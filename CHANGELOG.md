@@ -1,6 +1,92 @@
 # Changelog
 
 
+## 0.2.5822 - 2026-05-29
+
+`0.2.5822` is a hot-path performance and release-reliability follow-up to
+`0.2.5821`. It keeps the protocol fixes from `0.2.5821`, cuts the cost of
+the common MCP tools, removes parser boilerplate, and fixes the remaining
+Intel macOS/Rosetta release crash by leaving the x86_64 macOS artifact
+unsigned until the Zig/Mach-O signing issue is resolved.
+
+### MCP hot-path performance
+
+- **Pre-rendered responses for hot tools.** `codedb_tree`, `codedb_outline`,
+  `codedb_hot`, `codedb_deps`, `codedb_status`, and related MCP response paths
+  now avoid unnecessary deep clones and intermediate buffers. The corrected
+  benchmark harness now runs cases from the temp corpus root, so edit/read
+  timings measure the intended project instead of the caller's checkout.
+- **Lower edit latency.** `codedb_edit` avoids extra project-root work in the
+  hot path and dropped from `236300 ns` to `44700 ns` p50 in the corrected
+  microbench, an **81.08%** reduction.
+- **No benchmark-critical regressions.** Comparing the corrected baseline to
+  this release, every comparable MCP benchmark improved by more than 50%:
+  `codedb_tree` `14530 -> 6270 ns`, `codedb_outline` `62930 -> 12820 ns`,
+  `codedb_search` `33700 -> 8450 ns`, `codedb_deps` `1620 -> 70 ns`,
+  `codedb_bundle` `93040 -> 28380 ns`, and `codedb_snapshot`
+  `60100 -> 27750 ns`.
+
+### Parser maintenance
+
+- **`src/explore.zig` parser append cleanup.** Older language parsers had many
+  repeated "dupe name/detail/import then append" blocks. These now route
+  through shared helpers that preserve the prior symbol/detail behavior while
+  cutting **393 net lines** from `src/explore.zig` (`83 insertions`,
+  `476 deletions`). This is intentionally behavior-preserving cleanup after
+  the parser expansion in earlier releases.
+
+### macOS Intel / Rosetta
+
+- **#504 — signed x86_64 macOS binaries still crashed.** Local Rosetta testing
+  reproduced the published `v0.2.5821` `codedb-darwin-x86_64` crash:
+  `--help` exited `139` with no output. A fresh `0.2.5822` x86_64 build works
+  when unsigned, but manually applying an ad-hoc signature to that exact binary
+  brings back exit `139`. This matches the issue thread's native-Intel finding:
+  the crash is triggered by codesigning Zig 0.16 x86_64-macos binaries on
+  macOS 26, not by codedb startup logic.
+- **Release workaround.** `build.zig` now makes `-Dcodesign-identity` opt-in and
+  skips codesign for `x86_64-macos` even if the option is provided. The release
+  workflow no longer passes `-Dcodesign-identity` for the Intel macOS matrix
+  entry. Apple Silicon macOS artifacts still sign when the signing identity is
+  configured.
+- **Docs updated to match distribution reality.** README and MCP docs now state
+  that `codedb-darwin-x86_64` is temporarily unsigned and should be verified
+  by SHA256 checksum. Zig version badges / requirements now say Zig 0.16.
+
+### Release metadata
+
+- `src/release_info.zig`, `build.zig.zon`, and `npm/package.json` are aligned
+  on `0.2.5822`, so the native binary and `codedeebee` package metadata agree.
+
+### Validation
+
+- `zig build test`
+- `zig build test-mcp -Doptimize=ReleaseFast`
+- `zig build`
+- `python3 scripts/e2e_mcp_test.py --binary zig-out/bin/codedb --project /Users/blackfloofie/codedb`
+  — **17/17 passed**
+- Rosetta x86_64 release test:
+  - published signed `v0.2.5821` asset: `--help` exit `139`
+  - patched unsigned `0.2.5822` x86_64 build: `--help` exit `0`,
+    `--version` exit `0`, MCP e2e **17/17 passed**
+  - manually re-signed patched x86_64 build: `--help` exit `139`
+  - patched arm64 macOS build: signed and `--help` exit `0`
+- Four-subagent SWE-bench Lite smoke using `codedb 0.2.5822` on non-temp
+  workspaces:
+  - `pallets__flask-4992`: target TOML config test passed.
+  - `pytest-dev__pytest-5221`: two target fixture-listing tests passed with
+    plugin autoload disabled for the old pytest checkout.
+  - `sympy__sympy-12454`: rectangular matrix upper-triangular and Hessenberg
+    target tests passed.
+  - `psf__requests-2317`: codedb navigation succeeded, but the old checkout's
+    target pytest collection is blocked on Python 3.14 because stdlib `cgi` was
+    removed; a direct smoke confirmed byte and string methods normalize to
+    `GET`.
+
+See [`benchmarks/v0.2.5822-validation.md`](benchmarks/v0.2.5822-validation.md)
+for the benchmark table and SWE-bench Lite smoke details.
+
+
 ## 0.2.5821 - 2026-05-28
 
 Bundle of seven fixes from the open-issue triage on 2026-05-28.
