@@ -493,6 +493,21 @@ pub const BenchContext = struct {
         dispatch(io, alloc, tool, args, out, store, explorer, agents, &self.cache, null);
     }
 
+    pub fn runHandleCall(
+        self: *BenchContext,
+        io: std.Io,
+        alloc: std.mem.Allocator,
+        root: *const std.json.ObjectMap,
+        stdout: cio.File,
+        id: ?std.json.Value,
+        store: *Store,
+        explorer: *Explorer,
+        agents: *AgentRegistry,
+        telem: *telemetry_mod.Telemetry,
+    ) void {
+        handleCall(io, alloc, root, stdout, id, store, explorer, agents, &self.cache, telem, null);
+    }
+
     pub fn runToolCall(
         self: *BenchContext,
         io: std.Io,
@@ -1096,12 +1111,17 @@ fn handleCall(
         if (!is_notification) writeError(alloc, stdout, id, -32602, "Missing tool name");
         return;
     };
-    var args_value = params.get("arguments") orelse std.json.Value{ .object = .empty };
-    if (args_value != .object) {
-        if (!is_notification) writeError(alloc, stdout, id, -32602, "arguments must be object");
+    var args_value: std.json.Value = .{ .object = .empty };
+    var inline_args: std.json.ObjectMap = .empty;
+    defer inline_args.deinit(alloc);
+    const args = selectDirectCallArgs(alloc, params, &args_value, &inline_args) catch |err| {
+        if (!is_notification) writeError(alloc, stdout, id, -32602, switch (err) {
+            error.ArgumentsMustBeObject => "arguments must be object",
+            error.ArgsMustBeObject => "args must be object",
+            error.OutOfMemory => "out of memory",
+        });
         return;
-    }
-    const args = &args_value.object;
+    };
 
     const tool = std.meta.stringToEnum(Tool, name) orelse {
         if (!is_notification) writeError(alloc, stdout, id, -32602, "Unknown tool");
@@ -1188,6 +1208,57 @@ fn handleCall(
 
     result.appendSlice(alloc, if (is_error) "],\"isError\":true}" else "],\"isError\":false}") catch return;
     writeResult(alloc, stdout, id, result.items);
+}
+
+fn isDirectCallAdminKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "name") or
+        std.mem.eql(u8, key, "arguments") or
+        std.mem.eql(u8, key, "args") or
+        std.mem.eql(u8, key, "_meta") or
+        std.mem.eql(u8, key, "task");
+}
+
+fn copyDirectInlineArgs(
+    alloc: std.mem.Allocator,
+    params: *const std.json.ObjectMap,
+    inline_args: *std.json.ObjectMap,
+) !bool {
+    var copied = false;
+    var it = params.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (isDirectCallAdminKey(key)) continue;
+        try inline_args.put(alloc, key, entry.value_ptr.*);
+        copied = true;
+    }
+    return copied;
+}
+
+fn selectDirectCallArgs(
+    alloc: std.mem.Allocator,
+    params: *const std.json.ObjectMap,
+    args_value: *std.json.Value,
+    inline_args: *std.json.ObjectMap,
+) (error{ ArgumentsMustBeObject, ArgsMustBeObject } || std.mem.Allocator.Error)!*const std.json.ObjectMap {
+    if (params.get("arguments")) |arguments_val| {
+        if (arguments_val != .object) return error.ArgumentsMustBeObject;
+        if (arguments_val.object.count() > 0) {
+            args_value.* = arguments_val;
+            return &args_value.object;
+        }
+        if (try copyDirectInlineArgs(alloc, params, inline_args)) return inline_args;
+    } else {
+        if (try copyDirectInlineArgs(alloc, params, inline_args)) return inline_args;
+    }
+
+    if (params.get("args")) |args_val| {
+        if (args_val != .object) return error.ArgsMustBeObject;
+        args_value.* = args_val;
+        return &args_value.object;
+    }
+
+    args_value.* = .{ .object = .empty };
+    return &args_value.object;
 }
 
 fn dispatch(
@@ -2653,21 +2724,20 @@ fn appendBundleArgKeysDiagnostic(
         out.appendSlice(alloc, entry.key_ptr.*) catch return;
     }
     out.appendSlice(alloc, "]") catch return;
-    // Issue #424: if the args we saw contain ONLY administrative keys
-    // (`tool`, `arguments`) — or are empty entirely — there were no real
-    // sub-op fields at all. That's almost always a client wrapper bug.
-    // Suggest the inline shape so the caller can route around it.
+    // Issue #424/#512: if the args we saw contain only administrative keys
+    // or are empty entirely, there were no real tool fields at all. That's
+    // almost always a client wrapper bug.
     var has_real_arg = false;
     var it2 = args.iterator();
     while (it2.next()) |entry| {
         const k = entry.key_ptr.*;
-        if (!std.mem.eql(u8, k, "tool") and !std.mem.eql(u8, k, "arguments")) {
+        if (!std.mem.eql(u8, k, "tool") and !isDirectCallAdminKey(k)) {
             has_real_arg = true;
             break;
         }
     }
     if (!has_real_arg) {
-        out.appendSlice(alloc, "\nhint: no sub-op args reached the handler — your client may be stripping fields. Try inline shape: {\"tool\":\"...\",\"path\":\"...\"} (no `arguments` wrapper)") catch return;
+        out.appendSlice(alloc, "\nhint: no tool args reached the handler — your client may be stripping fields. Direct tools/call expects {\"name\":\"...\",\"arguments\":{\"path\":\"...\"}}; bundled ops may use inline shape: {\"tool\":\"...\",\"path\":\"...\"}.") catch return;
     }
 }
 
@@ -4569,6 +4639,7 @@ pub fn mcpGenerateGuidance(
         buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_outline on a hot file to see recent changes" ++ MCP_RESET) catch {};
     }
 }
+
 test "issue-258: cached project reads use the project root after contents are released" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
