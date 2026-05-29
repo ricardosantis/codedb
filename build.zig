@@ -53,6 +53,9 @@ pub fn build(b: *std.Build) void {
             const codesign = b.addSystemCommand(&.{
                 "codesign",
                 "-f",
+                "--options",
+                "runtime",
+                "--timestamp",
                 "-s",
                 identity,
                 b.getInstallPath(.bin, "codedb"),

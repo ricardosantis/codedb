@@ -35,6 +35,15 @@ unsigned until the Zig/Mach-O signing issue is resolved.
   `476 deletions`). This is intentionally behavior-preserving cleanup after
   the parser expansion in earlier releases.
 
+### Glob matching
+
+- **#511 — brace alternatives in glob patterns.** `codedb_glob` and all MCP
+  `path_glob` filters now support simple shell-style alternatives such as
+  `**/*.{yaml,yml}` and `src/{mcp,explore}.zig`. Malformed braces without a
+  comma continue to match literally, so existing literal-brace paths keep
+  working. This fixes the confusing zero-result behavior agents hit when
+  surveying YAML files with one glob.
+
 ### macOS Intel / Rosetta
 
 - **#504 — signed x86_64 macOS binaries still crashed.** Local Rosetta testing
@@ -47,8 +56,8 @@ unsigned until the Zig/Mach-O signing issue is resolved.
 - **Release workaround.** `build.zig` now makes `-Dcodesign-identity` opt-in and
   skips codesign for `x86_64-macos` even if the option is provided. The release
   workflow no longer passes `-Dcodesign-identity` for the Intel macOS matrix
-  entry. Apple Silicon macOS artifacts still sign when the signing identity is
-  configured.
+  entry. Apple Silicon macOS artifacts still sign with hardened runtime when
+  the signing identity is configured.
 - **Docs updated to match distribution reality.** README and MCP docs now state
   that `codedb-darwin-x86_64` is temporarily unsigned and should be verified
   by SHA256 checksum. Zig version badges / requirements now say Zig 0.16.
@@ -61,6 +70,7 @@ unsigned until the Zig/Mach-O signing issue is resolved.
 ### Validation
 
 - `zig build test`
+- `zig build test-query -Dtest-filter="issue-511"`
 - `zig build test-mcp -Doptimize=ReleaseFast`
 - `zig build`
 - `python3 scripts/e2e_mcp_test.py --binary zig-out/bin/codedb --project /Users/blackfloofie/codedb`
