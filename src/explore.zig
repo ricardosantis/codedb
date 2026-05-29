@@ -447,7 +447,7 @@ pub fn matchGlob(pattern: []const u8, path: []const u8) bool {
     var lit_end: usize = 0;
     while (lit_end < pattern.len) : (lit_end += 1) {
         const c = pattern[lit_end];
-        if (c == '*' or c == '?') break;
+        if (c == '*' or c == '?' or c == '{') break;
     }
     if (lit_end > 0) {
         if (path.len < lit_end) return false;
@@ -466,8 +466,58 @@ fn globIsPureSuffix(pattern: []const u8) ?[]const u8 {
     if (pattern.len < 4) return null;
     if (pattern[0] != '*' or pattern[1] != '*' or pattern[2] != '/' or pattern[3] != '*') return null;
     const tail = pattern[4..];
-    for (tail) |c| if (c == '*' or c == '?') return null;
+    for (tail) |c| if (c == '*' or c == '?' or c == '{' or c == '}') return null;
     return tail;
+}
+
+fn findBraceAlternatives(pattern: []const u8, open: usize) ?usize {
+    var i = open + 1;
+    var has_comma = false;
+    while (i < pattern.len) : (i += 1) {
+        switch (pattern[i]) {
+            '{' => return null,
+            ',' => has_comma = true,
+            '}' => return if (has_comma) i else null,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn matchGlobFragmentThen(fragment: []const u8, gi_start: usize, path: []const u8, ti_start: usize, rest: []const u8) bool {
+    var gi = gi_start;
+    var ti = ti_start;
+    while (gi < fragment.len) {
+        const c = fragment[gi];
+        if (c == '*') {
+            if (gi + 1 < fragment.len and fragment[gi + 1] == '*') {
+                var next = gi + 2;
+                if (next < fragment.len and fragment[next] == '/') next += 1;
+                if (matchGlobFragmentThen(fragment, next, path, ti, rest)) return true;
+                var k: usize = ti;
+                while (k < path.len) : (k += 1) {
+                    if (matchGlobFragmentThen(fragment, next, path, k + 1, rest)) return true;
+                }
+                return false;
+            } else {
+                if (matchGlobFragmentThen(fragment, gi + 1, path, ti, rest)) return true;
+                var k: usize = ti;
+                while (k < path.len and path[k] != '/') : (k += 1) {
+                    if (matchGlobFragmentThen(fragment, gi + 1, path, k + 1, rest)) return true;
+                }
+                return false;
+            }
+        } else if (c == '?') {
+            if (ti >= path.len or path[ti] == '/') return false;
+            gi += 1;
+            ti += 1;
+        } else {
+            if (ti >= path.len or path[ti] != c) return false;
+            gi += 1;
+            ti += 1;
+        }
+    }
+    return matchGlobRec(rest, 0, path, ti);
 }
 
 fn matchGlobRec(pattern: []const u8, gi_start: usize, path: []const u8, ti_start: usize) bool {
@@ -497,6 +547,21 @@ fn matchGlobRec(pattern: []const u8, gi_start: usize, path: []const u8, ti_start
             }
         } else if (c == '?') {
             if (ti >= path.len or path[ti] == '/') return false;
+            gi += 1;
+            ti += 1;
+        } else if (c == '{') {
+            if (findBraceAlternatives(pattern, gi)) |close| {
+                var alt_start = gi + 1;
+                var i = alt_start;
+                while (i <= close) : (i += 1) {
+                    if (i == close or pattern[i] == ',') {
+                        if (matchGlobFragmentThen(pattern[alt_start..i], 0, path, ti, pattern[close + 1 ..])) return true;
+                        alt_start = i + 1;
+                    }
+                }
+                return false;
+            }
+            if (ti >= path.len or path[ti] != c) return false;
             gi += 1;
             ti += 1;
         } else {
