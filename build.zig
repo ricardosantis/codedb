@@ -7,8 +7,8 @@ pub fn build(b: *std.Build) void {
     const codesign_identity = b.option(
         []const u8,
         "codesign-identity",
-        "macOS codesign identity. Defaults to ad-hoc signing ('-').",
-    ) orelse "-";
+        "macOS codesign identity. Disabled by default and skipped for x86_64-macos.",
+    );
 
     // ── Exposed module: importable as @import("codedb") ──
     const codedb_mod = b.addModule("codedb", .{
@@ -17,7 +17,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // ── CLI executable ──
     // ── CLI executable ──
     // In ReleaseFast/Small, strip debug info to shrink the binary (~10%)
     // and the RSS at runtime (smaller __TEXT footprint = fewer pages
@@ -42,14 +41,25 @@ pub fn build(b: *std.Build) void {
     const nanoregex_dep = b.dependency("nanoregex", .{});
     exe.root_module.addImport("nanoregex", nanoregex_dep.module("nanoregex"));
 
-    b.installArtifact(exe);
+    const install_exe = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&install_exe.step);
 
-
-    // ── macOS codesign (ad-hoc by default; configurable for release builds) ──
-    if (target.result.os.tag == .macos and builtin.os.tag == .macos) {
-        const codesign = b.addSystemCommand(&.{ "codesign", "-f", "-s", codesign_identity });
-        codesign.addArtifactArg(exe);
-        b.getInstallStep().dependOn(&codesign.step);
+    // Zig 0.16 x86_64-macos binaries can segfault on macOS 26 after codesign
+    // (issue #504), including under Rosetta. Keep that release slice unsigned.
+    if (codesign_identity) |identity| {
+        const target_os = target.query.os_tag orelse target.result.os.tag;
+        const target_arch = target.query.cpu_arch orelse target.result.cpu.arch;
+        if (target_os == .macos and target_arch != .x86_64 and builtin.os.tag == .macos) {
+            const codesign = b.addSystemCommand(&.{
+                "codesign",
+                "-f",
+                "-s",
+                identity,
+                b.getInstallPath(.bin, "codedb"),
+            });
+            codesign.step.dependOn(&install_exe.step);
+            b.getInstallStep().dependOn(&codesign.step);
+        }
     }
 
     const run_cmd = b.addRunArtifact(exe);
