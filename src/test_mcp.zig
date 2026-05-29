@@ -272,6 +272,15 @@ test "update: compareVersions orders semantic versions" {
     try testing.expect(try update_mod.compareVersions("0.2.56", "0.2.56.0") == .eq);
 }
 
+test "update: compareVersionsForUpdate allows superseded release train typo" {
+    try testing.expect(try update_mod.compareVersions("0.2.58181", "0.2.5823") == .gt);
+    try testing.expect(try update_mod.compareVersionsForUpdate("0.2.58181", "0.2.5823") == .lt);
+    try testing.expect(try update_mod.compareVersionsForUpdate("v0.2.58181", "v0.2.5823") == .lt);
+    try testing.expect(try update_mod.compareVersionsForUpdate("0.2.58181", "0.2.5824") == .lt);
+    try testing.expect(try update_mod.compareVersionsForUpdate("0.2.58181", "0.2.5822") == .gt);
+    try testing.expect(!try update_mod.targetSupersedesCurrent("0.2.5823", "0.2.5824"));
+}
+
 
 test "update: checksumForBinary parses release manifest" {
     const manifest =
