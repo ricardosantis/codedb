@@ -813,6 +813,67 @@ test "linter: the interactive prompt entrypoint compiles (analysis guard)" {
 }
 
 
+// ── Diagnostics cache (trial/graph-based-codedb) ──────────────────────────
+
+test "diag-cache: store + appendIfFresh matches on (path,hash), misses otherwise" {
+    var c = linter.DiagnosticsCache.init(testing.allocator);
+    defer c.deinit();
+    c.store("a.py", 111, "ruff 1 issue - F821 at L9");
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expect(c.appendIfFresh(testing.allocator, &out, "a.py", 111));
+    try testing.expect(std.mem.indexOf(u8, out.items, "F821") != null);
+    out.clearRetainingCapacity();
+    try testing.expect(!c.appendIfFresh(testing.allocator, &out, "a.py", 999)); // wrong hash
+    try testing.expect(!c.appendIfFresh(testing.allocator, &out, "b.py", 111)); // wrong path
+}
+
+test "diag-cache: appendLatest returns the newest summary for a path" {
+    var c = linter.DiagnosticsCache.init(testing.allocator);
+    defer c.deinit();
+    c.store("a.py", 1, "first");
+    c.store("a.py", 2, "second");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expect(c.appendLatest(testing.allocator, &out, "a.py"));
+    try testing.expectEqualStrings("second", out.items);
+}
+
+test "diag-cache: tryBeginWork coalesces per path and skips fresh content" {
+    var c = linter.DiagnosticsCache.init(testing.allocator);
+    defer c.deinit();
+    try testing.expect(c.tryBeginWork("a.py", 1)); // first -> spawn
+    try testing.expect(!c.tryBeginWork("a.py", 1)); // already pending -> skip
+    try testing.expect(!c.tryBeginWork("a.py", 2)); // same path pending -> skip
+    try testing.expect(c.tryBeginWork("b.py", 1)); // different path -> spawn
+    c.endWork("a.py"); // a.py worker failed
+    try testing.expect(c.tryBeginWork("a.py", 1)); // can spawn again
+    c.store("a.py", 1, "done"); // result for (a.py,1); clears pending
+    try testing.expect(!c.tryBeginWork("a.py", 1)); // fresh same-content -> skip
+    try testing.expect(c.tryBeginWork("a.py", 2)); // different content -> spawn
+    // zero out in-flight so deinit's drain returns immediately.
+    c.endWork("a.py");
+    c.endWork("b.py");
+}
+
+test "diag-cache: eviction stays bounded and leak-free past MAX entries" {
+    var c = linter.DiagnosticsCache.init(testing.allocator);
+    defer c.deinit();
+    var i: usize = 0;
+    while (i < linter.DiagnosticsCache.MAX + 5) : (i += 1) {
+        var pbuf: [32]u8 = undefined;
+        const p = std.fmt.bufPrint(&pbuf, "f{d}.py", .{i}) catch unreachable;
+        c.store(p, i, "x"); // testing.allocator fails the test on any leak
+    }
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    var pbuf: [32]u8 = undefined;
+    const last = std.fmt.bufPrint(&pbuf, "f{d}.py", .{linter.DiagnosticsCache.MAX + 4}) catch unreachable;
+    try testing.expect(c.appendLatest(testing.allocator, &out, last)); // newest retained
+}
+
+
 test "issue-101: Store.max_versions is configurable (caps per-file history)" {
     // Default cap is 100. After setting max_versions = 3, writing 5 versions
     // of the same file must leave exactly 3 in-memory.

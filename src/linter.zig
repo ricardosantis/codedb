@@ -26,6 +26,7 @@ const linter_pref = @import("linter_pref.zig");
 // std.fs / std.posix are not available in this Io-based build, so use libc
 // access(2) directly for the PATH probe (libc is already linked; see cio.zig).
 extern "c" fn access(path: [*:0]const u8, mode: c_int) c_int;
+extern "c" fn usleep(usec: c_uint) c_int;
 const X_OK: c_int = 1;
 
 /// The "{file}" token in check_args is replaced with the target path at run time.
@@ -342,3 +343,182 @@ pub fn maybePromptAndInstall(io: std.Io, allocator: std.mem.Allocator) void {
     linter_pref.write(io, allocator, .on);
     out.print("Enabled. codedb will run available linters after edits (built-in checks always run).\n", .{}) catch {};
 }
+
+// ── Diagnostics cache (off-hot-path results, delivered out of band) ───────
+//
+// Holds the latest linter summary per file so the edit/read handlers can
+// piggyback it and the codedb_diagnostics tool can pull it. Mutex-guarded
+// because the producer is a detached worker thread and the consumers are the
+// request handlers. Bounded (LRU by timestamp) so it can't grow without limit.
+// `inflight` lets the owner drain in-flight workers before freeing the cache.
+
+pub const DiagnosticsCache = struct {
+    pub const MAX = 16;
+    pub const FRESH_MS: i64 = 60_000;
+
+    const Entry = struct { path: []u8, hash: u64, summary: []u8, stamp_ms: i64 };
+
+    mu: cio.Mutex = .{},
+    alloc: std.mem.Allocator,
+    entries: [MAX]?Entry = .{null} ** MAX,
+    pending: [MAX]?[]u8 = .{null} ** MAX,
+    inflight: usize = 0,
+
+    pub fn init(alloc: std.mem.Allocator) DiagnosticsCache {
+        return .{ .alloc = alloc };
+    }
+
+    /// Drain in-flight workers, then free every owned slice. Call once at
+    /// connection teardown — after this the cache must not be used again.
+    pub fn deinit(self: *DiagnosticsCache) void {
+        self.drain();
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (&self.entries) |*e| if (e.*) |entry| {
+            self.alloc.free(entry.path);
+            self.alloc.free(entry.summary);
+            e.* = null;
+        };
+        for (&self.pending) |*p| if (p.*) |path| {
+            self.alloc.free(path);
+            p.* = null;
+        };
+    }
+
+    fn isFresh(stamp_ms: i64) bool {
+        return cio.milliTimestamp() - stamp_ms < FRESH_MS;
+    }
+
+    fn pendingRemoveLocked(self: *DiagnosticsCache, path: []const u8) void {
+        for (&self.pending) |*p| {
+            if (p.*) |pp| if (std.mem.eql(u8, pp, path)) {
+                self.alloc.free(pp);
+                p.* = null;
+                if (self.inflight > 0) self.inflight -= 1;
+                return;
+            };
+        }
+    }
+
+    /// Decide whether to spawn a worker for (path, content_hash). Returns false
+    /// (do NOT spawn) when a fresh result for that exact content already exists
+    /// or a worker for the path is already in flight; otherwise records the path
+    /// as pending and returns true. Caller must later call store() or endWork().
+    pub fn tryBeginWork(self: *DiagnosticsCache, path: []const u8, content_hash: u64) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.entries) |e| if (e) |entry| {
+            if (entry.hash == content_hash and std.mem.eql(u8, entry.path, path) and isFresh(entry.stamp_ms)) return false;
+        };
+        for (self.pending) |p| if (p) |pp| {
+            if (std.mem.eql(u8, pp, path)) return false;
+        };
+        for (&self.pending) |*slot| {
+            if (slot.* == null) {
+                slot.* = self.alloc.dupe(u8, path) catch return false;
+                self.inflight += 1;
+                return true;
+            }
+        }
+        return false; // pending table full — skip, stay bounded
+    }
+
+    /// Clear the pending mark for a path whose worker finished without a result.
+    pub fn endWork(self: *DiagnosticsCache, path: []const u8) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.pendingRemoveLocked(path);
+    }
+
+    /// Store a worker's result (clears pending, dups path+summary, evicts LRU
+    /// when full). Replaces any existing entry for the same path.
+    pub fn store(self: *DiagnosticsCache, path: []const u8, content_hash: u64, summary: []const u8) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.pendingRemoveLocked(path);
+
+        const pdup = self.alloc.dupe(u8, path) catch return;
+        const sdup = self.alloc.dupe(u8, summary) catch {
+            self.alloc.free(pdup);
+            return;
+        };
+
+        var slot: ?usize = null;
+        for (self.entries, 0..) |e, i| {
+            if (e) |entry| if (std.mem.eql(u8, entry.path, path)) {
+                slot = i;
+                break;
+            };
+        }
+        if (slot == null) for (self.entries, 0..) |e, i| {
+            if (e == null) {
+                slot = i;
+                break;
+            }
+        };
+        if (slot == null) {
+            var oldest: usize = 0;
+            var oldest_ms: i64 = std.math.maxInt(i64);
+            for (self.entries, 0..) |e, i| if (e) |entry| {
+                if (entry.stamp_ms < oldest_ms) {
+                    oldest_ms = entry.stamp_ms;
+                    oldest = i;
+                }
+            };
+            slot = oldest;
+        }
+        const si = slot.?;
+        if (self.entries[si]) |old| {
+            self.alloc.free(old.path);
+            self.alloc.free(old.summary);
+        }
+        self.entries[si] = .{ .path = pdup, .hash = content_hash, .summary = sdup, .stamp_ms = cio.milliTimestamp() };
+    }
+
+    /// Append the summary for (path, content_hash) to `out` iff a fresh entry
+    /// for that exact content exists. Used to piggyback on edit/read of the
+    /// same bytes. Returns whether anything was appended.
+    pub fn appendIfFresh(self: *DiagnosticsCache, out_alloc: std.mem.Allocator, out: *std.ArrayList(u8), path: []const u8, content_hash: u64) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.entries) |e| if (e) |entry| {
+            if (entry.hash == content_hash and std.mem.eql(u8, entry.path, path) and isFresh(entry.stamp_ms)) {
+                out.appendSlice(out_alloc, entry.summary) catch return false;
+                return true;
+            }
+        };
+        return false;
+    }
+
+    /// Append the latest summary for `path` regardless of hash (for the
+    /// codedb_diagnostics pull tool). Returns whether anything was appended.
+    pub fn appendLatest(self: *DiagnosticsCache, out_alloc: std.mem.Allocator, out: *std.ArrayList(u8), path: []const u8) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        var best: ?Entry = null;
+        for (self.entries) |e| if (e) |entry| {
+            if (std.mem.eql(u8, entry.path, path)) {
+                if (best == null or entry.stamp_ms > best.?.stamp_ms) best = entry;
+            }
+        };
+        if (best) |entry| {
+            out.appendSlice(out_alloc, entry.summary) catch return false;
+            return true;
+        }
+        return false;
+    }
+
+    /// Block (bounded ~2s) until no workers are in flight. Called by deinit so a
+    /// detached worker can never touch the cache after it is freed.
+    pub fn drain(self: *DiagnosticsCache) void {
+        var spins: usize = 0;
+        while (spins < 2000) : (spins += 1) {
+            self.mu.lock();
+            const n = self.inflight;
+            self.mu.unlock();
+            if (n == 0) return;
+            _ = usleep(1000); // 1ms; only reached at shutdown while workers finish
+
+        }
+    }
+};
