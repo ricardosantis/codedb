@@ -10,6 +10,7 @@ const edit_mod = @import("edit.zig");
 const explore = @import("explore.zig");
 const Explorer = explore.Explorer;
 const linter = @import("linter.zig");
+const linter_pref = @import("linter_pref.zig");
 
 
 test "store: record and retrieve snapshots" {
@@ -726,6 +727,40 @@ test "linter: a disabled session never tries the external linter (preference off
 
 test "linter: toolOnPath returns false for a non-existent executable" {
     try testing.expect(!linter.toolOnPath(testing.allocator, "codedb_definitely_not_a_real_tool_zzz"));
+}
+
+
+// ── Linter opt-in preference persistence (trial/graph-based-codedb) ───────
+
+test "linter-pref: parseBody maps tokens to the three states" {
+    try testing.expectEqual(linter_pref.Pref.on, linter_pref.parseBody("on\n"));
+    try testing.expectEqual(linter_pref.Pref.on, linter_pref.parseBody("  on  "));
+    try testing.expectEqual(linter_pref.Pref.off, linter_pref.parseBody("off\n"));
+    try testing.expectEqual(linter_pref.Pref.unset, linter_pref.parseBody(""));
+    try testing.expectEqual(linter_pref.Pref.unset, linter_pref.parseBody("garbage"));
+    try testing.expect(linter_pref.enabledFromPref(.on));
+    try testing.expect(!linter_pref.enabledFromPref(.off));
+    try testing.expect(!linter_pref.enabledFromPref(.unset));
+}
+
+test "linter-pref: write then read round-trips on/off; missing file is unset" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/linter_optin", .{tmp.sub_path});
+    defer testing.allocator.free(path);
+
+    // Missing file -> unset (heuristics-only default).
+    try testing.expectEqual(linter_pref.Pref.unset, linter_pref.readAt(io, path));
+
+    linter_pref.writeAt(io, path, .on);
+    try testing.expectEqual(linter_pref.Pref.on, linter_pref.readAt(io, path));
+
+    linter_pref.writeAt(io, path, .off);
+    try testing.expectEqual(linter_pref.Pref.off, linter_pref.readAt(io, path));
+
+    // Writing unset is a no-op — the prior value remains.
+    linter_pref.writeAt(io, path, .unset);
+    try testing.expectEqual(linter_pref.Pref.off, linter_pref.readAt(io, path));
 }
 
 
