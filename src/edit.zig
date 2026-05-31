@@ -14,6 +14,12 @@ pub const EditRequest = struct {
     range: ?[2]usize = null,
     after: ?usize = null,
     content: ?[]const u8 = null,
+    /// Anchor-based replace (P2, trial/graph-based-codedb): when set, the unique
+    /// occurrence of old_string in the file is replaced with new_string by exact
+    /// byte splice. Takes precedence over the range/after line ops, and cannot
+    /// mis-target surrounding lines the way a whole-block range replace can.
+    old_string: ?[]const u8 = null,
+    new_string: ?[]const u8 = null,
     if_hash: ?[]const u8 = null,
     dry_run: bool = false,
 };
@@ -44,11 +50,16 @@ pub fn applyEdit(
     errdefer agents.releaseLock(req.agent_id, req.path);
 
     // Validate required op-specific args BEFORE doing any work that
-    // mutates Store.seq or rewrites the file (#401).
-    switch (req.op) {
-        .replace, .delete => if (req.range == null) return error.InvalidRange,
-        .insert => if (req.after == null) return error.InvalidRange,
-        else => {},
+    // mutates Store.seq or rewrites the file (#401). Anchor-based str_replace
+    // (old_string set) uses neither range nor after.
+    if (req.old_string == null) {
+        switch (req.op) {
+            .replace, .delete => if (req.range == null) return error.InvalidRange,
+            .insert => if (req.after == null) return error.InvalidRange,
+            else => {},
+        }
+    } else if (req.old_string.?.len == 0) {
+        return error.MissingContent;
     }
 
     const source = try std.Io.Dir.cwd().readFileAlloc(io, req.path, allocator, .limited(10 * 1024 * 1024));
@@ -59,6 +70,23 @@ pub fn applyEdit(
         var hash_buf: [16]u8 = undefined;
         const actual_hex = std.fmt.bufPrint(&hash_buf, "{x}", .{actual}) catch return error.HashMismatch;
         if (!std.mem.eql(u8, expected_hex, actual_hex)) return error.HashMismatch;
+    }
+
+    // Anchor-based replace (P2): splice the unique occurrence of old_string.
+    // Byte-exact, so it cannot mis-target surrounding lines the way a range
+    // replace can. old_string must occur exactly once.
+    if (req.old_string) |old| {
+        const new = req.new_string orelse "";
+        const first = std.mem.indexOf(u8, source, old) orelse return error.PatternNotFound;
+        if (std.mem.indexOfPos(u8, source, first + old.len, old) != null) return error.PatternNotUnique;
+        var b: std.ArrayList(u8) = .empty;
+        defer b.deinit(allocator);
+        try b.appendSlice(allocator, source[0..first]);
+        try b.appendSlice(allocator, new);
+        try b.appendSlice(allocator, source[first + old.len ..]);
+        const result = try b.toOwnedSlice(allocator);
+        defer allocator.free(result);
+        return try finalizeEdit(io, allocator, store, agents, explorer, req, source, result);
     }
 
     // Detect line-ending style: if the file has any "\r\n", treat it as
@@ -127,19 +155,33 @@ pub fn applyEdit(
         try std.mem.join(allocator, sep, lines.items);
     defer allocator.free(result);
 
+    return try finalizeEdit(io, allocator, store, agents, explorer, req, source, result);
+}
+
+/// Common tail for applyEdit: hash + post-edit health, then either a dry-run
+/// preview or an atomic write + store record + re-index. Releases the file lock
+/// on its own return paths; on error the caller's errdefer releases it.
+fn finalizeEdit(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    store: *Store,
+    agents: *AgentRegistry,
+    explorer: ?*Explorer,
+    req: EditRequest,
+    source: []const u8,
+    result: []const u8,
+) !EditResult {
     const hash: u64 = std.hash.Wyhash.hash(0, result);
 
-    // Post-edit syntax health (trial/graph-based-codedb): a cheap, advisory
-    // delimiter-balance scan so a mis-spliced multi-line edit (orphaned/
-    // duplicated bracket) surfaces back to the agent instead of shipping a
-    // file that no longer parses.
+    // Post-edit syntax health (trial/graph-based-codedb): advisory delimiter +
+    // dropped-import scan so a mis-spliced edit surfaces to the agent.
     const health_msg = try describeHealth(allocator, source, result, detectLanguage(req.path));
     errdefer if (health_msg) |h| allocator.free(h);
 
     if (req.dry_run) {
-        // Preview-only: build a compact diff and skip disk write, store record,
-        // and explorer indexing. Caller releases the lock via errdefer/return.
-        const preview = try buildPreview(allocator, source, result, req);
+        // Preview-only: skip disk write, store record, and explorer indexing.
+        // Range/insert/delete ops get a unified-diff preview; anchor edits skip it.
+        const preview = if (req.old_string == null) try buildPreview(allocator, source, result, req) else null;
         agents.releaseLock(req.agent_id, req.path);
         return .{
             .seq = 0,

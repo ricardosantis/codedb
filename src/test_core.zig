@@ -555,6 +555,123 @@ test "edit-health: a name re-imported from another module is not flagged" {
 }
 
 
+// ── Anchor-based str_replace (P2, trial/graph-based-codedb) ───────────────
+
+test "edit-str_replace: anchored replace updates the unique occurrence exactly" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/sr.py", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    const original = "def f(x):\n    return x + 1\n";
+    var file = try tmp.dir.createFile(io, "sr.py", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, original);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const agent_id = try agents.register("sr-1");
+
+    const result = try edit_mod.applyEdit(io, testing.allocator, &store, &agents, null, .{
+        .path = rel_path,
+        .agent_id = agent_id,
+        .op = .replace,
+        .old_string = "return x + 1",
+        .new_string = "return x + 2",
+    });
+    defer if (result.health) |h| testing.allocator.free(h);
+
+    const after = try std.Io.Dir.cwd().readFileAlloc(io, rel_path, testing.allocator, .limited(10 * 1024));
+    defer testing.allocator.free(after);
+    try testing.expect(std.mem.indexOf(u8, after, "return x + 2") != null);
+    try testing.expect(std.mem.indexOf(u8, after, "return x + 1") == null);
+    try testing.expect(result.health == null);
+}
+
+test "edit-str_replace: missing old_string errors and writes nothing" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/sr2.py", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    var file = try tmp.dir.createFile(io, "sr2.py", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "a = 1\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const agent_id = try agents.register("sr-2");
+
+    try testing.expectError(error.PatternNotFound, edit_mod.applyEdit(io, testing.allocator, &store, &agents, null, .{
+        .path = rel_path,
+        .agent_id = agent_id,
+        .op = .replace,
+        .old_string = "does not exist",
+        .new_string = "x",
+    }));
+    try testing.expectEqual(@as(u64, 0), store.currentSeq());
+}
+
+test "edit-str_replace: non-unique old_string errors (refuses ambiguous target)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/sr3.py", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    var file = try tmp.dir.createFile(io, "sr3.py", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "x = 1\nx = 1\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const agent_id = try agents.register("sr-3");
+
+    try testing.expectError(error.PatternNotUnique, edit_mod.applyEdit(io, testing.allocator, &store, &agents, null, .{
+        .path = rel_path,
+        .agent_id = agent_id,
+        .op = .replace,
+        .old_string = "x = 1",
+        .new_string = "x = 2",
+    }));
+    try testing.expectEqual(@as(u64, 0), store.currentSeq());
+}
+
+test "edit-str_replace: health check still runs on an anchored edit that breaks syntax" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/sr4.py", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    var file = try tmp.dir.createFile(io, "sr4.py", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "y = (1 + 2)\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const agent_id = try agents.register("sr-4");
+
+    // Drop the closing paren via the anchored replace — health must catch it.
+    const result = try edit_mod.applyEdit(io, testing.allocator, &store, &agents, null, .{
+        .path = rel_path,
+        .agent_id = agent_id,
+        .op = .replace,
+        .old_string = "(1 + 2)",
+        .new_string = "(1 + 2",
+    });
+    defer if (result.health) |h| testing.allocator.free(h);
+    try testing.expect(result.health != null);
+    try testing.expect(std.mem.indexOf(u8, result.health.?, "never closed") != null);
+}
+
+
 test "issue-101: Store.max_versions is configurable (caps per-file history)" {
     // Default cap is 100. After setting max_versions = 3, writing 5 versions
     // of the same file must leave exactly 3 in-memory.
