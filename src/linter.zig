@@ -83,8 +83,32 @@ pub fn linterFor(language: Language) ?LinterSpec {
             .check_args = &.{ "-l", FILE_TOKEN },
             .install_hint = "ships with PHP",
         },
-        // c/cpp/rust/java/kotlin/swift/dart: no reliable single-file linter
-        // without project context — fall back to Tier-0 heuristics for now.
+        .c, .cpp => .{
+            .tool = "cppcheck",
+            // --error-exitcode=1 so a finding is a non-zero exit (cppcheck
+            // otherwise exits 0); --quiet drops progress noise.
+            .check_args = &.{ "--enable=warning", "--error-exitcode=1", "--quiet", FILE_TOKEN },
+            .install_hint = "nb install cppcheck  (or: brew install cppcheck)",
+        },
+        .shell => .{
+            .tool = "shellcheck",
+            .check_args = &.{ "--format=json", FILE_TOKEN },
+            .install_hint = "nb install shellcheck  (or: brew install shellcheck)",
+            .json = true,
+        },
+        .kotlin => .{
+            .tool = "ktlint",
+            .check_args = &.{FILE_TOKEN},
+            .install_hint = "nb install ktlint  (or: brew install ktlint)",
+        },
+        .swift => .{
+            .tool = "swiftlint",
+            .check_args = &.{ "lint", "--quiet", FILE_TOKEN },
+            .install_hint = "nb install swiftlint  (or: brew install swiftlint)",
+        },
+        // rust (clippy needs a Cargo project), java (JVM + ruleset), hcl
+        // (directory-based), r/sql/dart-without-sdk: no clean zero-config
+        // single-file linter — fall back to the Tier-0 heuristics.
         else => null,
     };
 }
@@ -177,6 +201,10 @@ pub fn installFor(language: Language) ?[]const []const u8 {
     return switch (language) {
         .python => &.{ "uv", "tool", "install", "ruff" },
         .javascript, .typescript => &.{ "npm", "i", "-g", "@biomejs/biome" },
+        .c, .cpp => &.{ "brew", "install", "cppcheck" },
+        .shell => &.{ "brew", "install", "shellcheck" },
+        .kotlin => &.{ "brew", "install", "ktlint" },
+        .swift => &.{ "brew", "install", "swiftlint" },
         else => null,
     };
 }
@@ -207,10 +235,35 @@ fn rowField(o: std.json.ObjectMap) i64 {
     return if (r == .integer) r.integer else 0;
 }
 
-fn firstLine(s: []const u8) []const u8 {
-    const trimmed = std.mem.trim(u8, s, " \t\r\n");
-    const end = std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len;
-    return trimmed[0..end];
+fn intField(o: std.json.ObjectMap, key: []const u8) i64 {
+    const v = o.get(key) orelse return 0;
+    return if (v == .integer) v.integer else 0;
+}
+
+/// Append the first non-empty line of `s` to `buf`, capped at `max` bytes and
+/// with ANSI escape sequences stripped. Some tools (e.g. `zig ast-check`) colour
+/// their output even when writing to a pipe; the raw ESC bytes are both noise
+/// and invalid inside a JSON-RPC string, so drop them here.
+pub fn appendFirstLineStripped(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8, max: usize) !void {
+    const trimmed = std.mem.trimStart(u8, s, " \t\r\n");
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i < trimmed.len and n < max) {
+        const c = trimmed[i];
+        if (c == '\n') break;
+        if (c == 0x1b) { // ESC — skip a CSI sequence: ESC '[' ... <final 0x40..0x7e>
+            i += 1;
+            if (i < trimmed.len and trimmed[i] == '[') {
+                i += 1;
+                while (i < trimmed.len and !(trimmed[i] >= 0x40 and trimmed[i] <= 0x7e)) i += 1;
+                if (i < trimmed.len) i += 1;
+            }
+            continue;
+        }
+        try buf.append(allocator, c);
+        n += 1;
+        i += 1;
+    }
 }
 
 /// Summarize `ruff check --output-format json` output (a JSON array of
@@ -269,6 +322,33 @@ pub fn summarizeBiomeJson(allocator: std.mem.Allocator, stdout: []const u8) RunE
     return buf.toOwnedSlice(allocator) catch error.OutOfMemory;
 }
 
+/// Summarize `shellcheck --format=json` output (a JSON array of
+/// {line, column, level, code:int, message}). Code is rendered as SCxxxx.
+/// null = clean (empty array). Pure — exposed for tests.
+pub fn summarizeShellcheckJson(allocator: std.mem.Allocator, stdout: []const u8) RunError!?[]u8 {
+    const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch return error.LinterCrashed;
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.LinterCrashed;
+    const items = parsed.value.array.items;
+    if (items.len == 0) return null;
+
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try appendFmt(allocator, &buf, "shellcheck {d} issue{s} -", .{ items.len, plural(items.len) });
+    const show = @min(items.len, 3);
+    var i: usize = 0;
+    while (i < show) : (i += 1) {
+        if (items[i] != .object) continue;
+        const o = items[i].object;
+        const msg = strField(o, "message") orelse "";
+        try appendFmt(allocator, &buf, " SC{d} {s} at L{d}{s}", .{ intField(o, "code"), clip(msg, 48), intField(o, "line"), if (i + 1 < show) "," else "" });
+    }
+    if (items.len > show) try appendFmt(allocator, &buf, " (+{d} more)", .{items.len - show});
+    return buf.toOwnedSlice(allocator) catch error.OutOfMemory;
+}
+
 /// Run the registered linter for `language` on `abs_path` and fold the result
 /// into a SHORT owned summary string, or null when the file is clean. Spawns a
 /// subprocess (via cio.runCapture, which itself uses a drain thread) — MUST be
@@ -301,13 +381,19 @@ pub fn runCheck(allocator: std.mem.Allocator, language: Language, abs_path: []co
             if (code >= 2 and std.mem.trim(u8, res.stdout, " \t\r\n").len == 0) return error.LinterCrashed;
             return summarizeRuffJson(allocator, res.stdout);
         }
+        if (std.mem.eql(u8, spec.tool, "shellcheck")) return summarizeShellcheckJson(allocator, res.stdout);
         return summarizeBiomeJson(allocator, res.stdout);
     }
 
-    // Exit-code tools (zig ast-check, gofmt -e, ruby -c, php -l): 0 = clean.
+    // Exit-code tools (zig ast-check, cppcheck, gofmt -e, ruby -c, php -l, ktlint,
+    // swiftlint): 0 = clean; otherwise summarize the first (ANSI-stripped) line.
     if (code == 0) return null;
-    const line = firstLine(if (res.stderr.len > 0) res.stderr else res.stdout);
-    return std.fmt.allocPrint(allocator, "{s} check failed - {s}", .{ spec.tool, clip(line, 120) }) catch error.OutOfMemory;
+    const raw = if (res.stderr.len > 0) res.stderr else res.stdout;
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try appendFmt(allocator, &buf, "{s} check failed - ", .{spec.tool});
+    appendFirstLineStripped(allocator, &buf, raw, 120) catch {};
+    return buf.toOwnedSlice(allocator) catch error.OutOfMemory;
 }
 
 // ── Install / update-time opt-in prompt (interactive CLI only) ────────────
@@ -393,9 +479,12 @@ fn installLinters(allocator: std.mem.Allocator, out: cio.File) void {
         }
     }
 
+    // Install the light, broadly-useful set. ktlint (pulls a JDK) and swiftlint
+    // (niche) stay registry-only — codedb uses them if present, but doesn't drag
+    // them in here. Add them yourself with `nb install ktlint swiftlint`.
     if (nb) |nbpath| {
-        out.print("  installing linters via nanobrew: ruff, biome...\n", .{}) catch {};
-        if (cio.runCapture(.{ .allocator = allocator, .argv = &.{ nbpath, "install", "ruff", "biome" }, .max_output_bytes = 1024 * 1024 })) |res| {
+        out.print("  installing linters via nanobrew: ruff, biome, shellcheck, cppcheck...\n", .{}) catch {};
+        if (cio.runCapture(.{ .allocator = allocator, .argv = &.{ nbpath, "install", "ruff", "biome", "shellcheck", "cppcheck" }, .max_output_bytes = 1024 * 1024 })) |res| {
             defer allocator.free(res.stdout);
             defer allocator.free(res.stderr);
             const ok = switch (res.term) {
@@ -409,13 +498,18 @@ fn installLinters(allocator: std.mem.Allocator, out: cio.File) void {
             }
         } else |_| {
             out.print("  linters: nanobrew run failed — falling back\n", .{}) catch {};
-            installToolIfMissing(allocator, out, "ruff", installFor(.python));
-            installToolIfMissing(allocator, out, "biome", installFor(.javascript));
+            fallbackInstall(allocator, out);
         }
     } else {
-        installToolIfMissing(allocator, out, "ruff", installFor(.python));
-        installToolIfMissing(allocator, out, "biome", installFor(.javascript));
+        fallbackInstall(allocator, out);
     }
+}
+
+fn fallbackInstall(allocator: std.mem.Allocator, out: cio.File) void {
+    installToolIfMissing(allocator, out, "ruff", installFor(.python));
+    installToolIfMissing(allocator, out, "biome", installFor(.javascript));
+    installToolIfMissing(allocator, out, "shellcheck", installFor(.shell));
+    installToolIfMissing(allocator, out, "cppcheck", installFor(.c));
 }
 
 // ── Diagnostics cache (off-hot-path results, delivered out of band) ───────

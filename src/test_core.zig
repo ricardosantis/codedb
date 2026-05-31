@@ -681,7 +681,7 @@ fn argsHaveFileToken(args: []const []const u8) bool {
     return false;
 }
 
-test "linter: registry maps languages to the expected tools (ruff/biome confirmed via deepwiki)" {
+test "linter: registry maps languages to the expected tools" {
     const py = linter.linterFor(.python).?;
     try testing.expectEqualStrings("ruff", py.tool);
     try testing.expect(py.json);
@@ -689,10 +689,19 @@ test "linter: registry maps languages to the expected tools (ruff/biome confirme
 
     try testing.expectEqualStrings("biome", linter.linterFor(.typescript).?.tool);
     try testing.expectEqualStrings("biome", linter.linterFor(.javascript).?.tool);
-    try testing.expectEqualStrings("zig", linter.linterFor(.zig).?.tool);
+    try testing.expectEqualStrings("zig", linter.linterFor(.zig).?.tool); // ast-check, ships with zig
+    try testing.expectEqualStrings("cppcheck", linter.linterFor(.c).?.tool);
+    try testing.expectEqualStrings("cppcheck", linter.linterFor(.cpp).?.tool);
+    try testing.expect(argsHaveFileToken(linter.linterFor(.cpp).?.check_args));
+    const sh = linter.linterFor(.shell).?;
+    try testing.expectEqualStrings("shellcheck", sh.tool);
+    try testing.expect(sh.json);
+    try testing.expectEqualStrings("ktlint", linter.linterFor(.kotlin).?.tool);
+    try testing.expectEqualStrings("swiftlint", linter.linterFor(.swift).?.tool);
 
-    // Languages without a reliable single-file linter fall back to heuristics.
-    try testing.expect(linter.linterFor(.cpp) == null);
+    // Languages without a clean single-file linter fall back to heuristics.
+    try testing.expect(linter.linterFor(.rust) == null);
+    try testing.expect(linter.linterFor(.java) == null);
     try testing.expect(linter.linterFor(.unknown) == null);
 }
 
@@ -702,7 +711,7 @@ test "linter: session fallback is sticky — a failed language is never retried"
     try testing.expectEqual(linter.LinterStatus.unknown, session.status(.python));
     try testing.expect(session.shouldTry(.python));
     try testing.expect(!session.shouldTry(.unknown));
-    try testing.expect(!session.shouldTry(.cpp));
+    try testing.expect(!session.shouldTry(.rust));
 
     // Once a tool is missing / failed / crashed, the language is ruled out for
     // the rest of the session and we silently use the Tier-0 heuristics.
@@ -722,7 +731,7 @@ test "linter: a disabled session never tries the external linter (preference off
     // Enabling flips it on for supported languages only.
     session.enabled = true;
     try testing.expect(session.shouldTry(.python));
-    try testing.expect(!session.shouldTry(.cpp));
+    try testing.expect(!session.shouldTry(.rust));
 }
 
 test "linter: toolOnPath returns false for a non-existent executable" {
@@ -766,12 +775,38 @@ test "linter-pref: write then read round-trips on/off; missing file is unset" {
 
 // ── Linter execution + output parsing (trial/graph-based-codedb) ──────────
 
-test "linter: installFor maps only ruff and biome; toolchain langs are null" {
+test "linter: installFor returns installers for installable tools, null for toolchain langs" {
     try testing.expectEqualStrings("uv", linter.installFor(.python).?[0]);
     try testing.expectEqualStrings("ruff", linter.installFor(.python).?[3]);
     try testing.expectEqualStrings("npm", linter.installFor(.typescript).?[0]);
+    try testing.expectEqualStrings("brew", linter.installFor(.shell).?[0]);
+    try testing.expectEqualStrings("shellcheck", linter.installFor(.shell).?[2]);
+    try testing.expectEqualStrings("cppcheck", linter.installFor(.c).?[2]);
+    // zig/go/ruby/php ship with their toolchains -> nothing to install
     try testing.expect(linter.installFor(.zig) == null);
     try testing.expect(linter.installFor(.go_lang) == null);
+}
+
+test "linter: appendFirstLineStripped drops ANSI codes and stops at first line" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    // Mirrors `zig ast-check` output: bold + colour escapes, multi-line.
+    const s = "\x1b[1mfile.zig:2:16: \x1b[31merror:\x1b[0m expected ';'\x1b[0m\n    const x = 1\n";
+    try linter.appendFirstLineStripped(testing.allocator, &buf, s, 120);
+    try testing.expectEqualStrings("file.zig:2:16: error: expected ';'", buf.items);
+}
+
+test "linter: summarizeShellcheckJson renders SC codes and treats [] as clean" {
+    try testing.expect((try linter.summarizeShellcheckJson(testing.allocator, "[]")) == null);
+
+    const json =
+        \\[{"file":"x.sh","line":3,"column":4,"level":"warning","code":2154,"message":"bar is referenced but not assigned."}]
+    ;
+    const msg = (try linter.summarizeShellcheckJson(testing.allocator, json)).?;
+    defer testing.allocator.free(msg);
+    try testing.expect(std.mem.indexOf(u8, msg, "shellcheck 1 issue") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "SC2154") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "L3") != null);
 }
 
 test "linter: summarizeRuffJson builds a summary and treats [] as clean" {
@@ -801,7 +836,7 @@ test "linter: summarizeBiomeJson uses categories and treats empty diagnostics as
 }
 
 test "linter: runCheck errors NoLinter for a language with no registered tool" {
-    try testing.expectError(error.NoLinter, linter.runCheck(testing.allocator, .cpp, "/tmp/x.cpp"));
+    try testing.expectError(error.NoLinter, linter.runCheck(testing.allocator, .rust, "/tmp/x.rs"));
 }
 
 test "linter: the interactive prompt entrypoint compiles (analysis guard)" {
