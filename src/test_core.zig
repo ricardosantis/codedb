@@ -9,6 +9,7 @@ const Config = @import("config.zig").Config;
 const edit_mod = @import("edit.zig");
 const explore = @import("explore.zig");
 const Explorer = explore.Explorer;
+const linter = @import("linter.zig");
 
 
 test "store: record and retrieve snapshots" {
@@ -669,6 +670,51 @@ test "edit-str_replace: health check still runs on an anchored edit that breaks 
     defer if (result.health) |h| testing.allocator.free(h);
     try testing.expect(result.health != null);
     try testing.expect(std.mem.indexOf(u8, result.health.?, "never closed") != null);
+}
+
+
+// ── Tier-1 linter registry + session policy (trial/graph-based-codedb) ────
+
+fn argsHaveFileToken(args: []const []const u8) bool {
+    for (args) |a| if (std.mem.eql(u8, a, linter.FILE_TOKEN)) return true;
+    return false;
+}
+
+test "linter: registry maps languages to the expected tools (ruff/biome confirmed via deepwiki)" {
+    const py = linter.linterFor(.python).?;
+    try testing.expectEqualStrings("ruff", py.tool);
+    try testing.expect(py.json);
+    try testing.expect(argsHaveFileToken(py.check_args));
+
+    try testing.expectEqualStrings("biome", linter.linterFor(.typescript).?.tool);
+    try testing.expectEqualStrings("biome", linter.linterFor(.javascript).?.tool);
+    try testing.expectEqualStrings("zig", linter.linterFor(.zig).?.tool);
+
+    // Languages without a reliable single-file linter fall back to heuristics.
+    try testing.expect(linter.linterFor(.cpp) == null);
+    try testing.expect(linter.linterFor(.unknown) == null);
+}
+
+test "linter: session fallback is sticky — a failed language is never retried" {
+    var session = linter.LinterSession{};
+    // Fresh session: python is worth trying, unknown is not (no tool).
+    try testing.expectEqual(linter.LinterStatus.unknown, session.status(.python));
+    try testing.expect(session.shouldTry(.python));
+    try testing.expect(!session.shouldTry(.unknown));
+    try testing.expect(!session.shouldTry(.cpp));
+
+    // Once a tool is missing / failed / crashed, the language is ruled out for
+    // the rest of the session and we silently use the Tier-0 heuristics.
+    session.mark(.python, .unavailable);
+    try testing.expectEqual(linter.LinterStatus.unavailable, session.status(.python));
+    try testing.expect(!session.shouldTry(.python));
+
+    // A different language is unaffected.
+    try testing.expect(session.shouldTry(.typescript));
+}
+
+test "linter: toolOnPath returns false for a non-existent executable" {
+    try testing.expect(!linter.toolOnPath(testing.allocator, "codedb_definitely_not_a_real_tool_zzz"));
 }
 
 
