@@ -101,6 +101,12 @@ pub const LinterStatus = enum {
 /// that way, guaranteeing the linter is probed/installed at most once and that
 /// a flaky or absent tool can never repeatedly tax the edit path.
 pub const LinterSession = struct {
+    /// Remembered user preference (persisted in config). External linters are
+    /// installed only at codedb install / `codedb update` time, behind a prompt;
+    /// the MCP server never installs anything and never prompts. When the user
+    /// declined (or hasn't opted in), this stays false and codedb uses only the
+    /// Tier-0 heuristics — the edit path carries zero linter cost.
+    enabled: bool = false,
     statuses: std.EnumArray(Language, LinterStatus) = std.EnumArray(Language, LinterStatus).initFill(.unknown),
 
     pub fn status(self: *const LinterSession, language: Language) LinterStatus {
@@ -111,10 +117,11 @@ pub const LinterSession = struct {
         self.statuses.set(language, s);
     }
 
-    /// True if we should attempt the external linter for `language`: it has a
-    /// registered tool and has not already been ruled out this session.
+    /// True if we should attempt the external linter for `language`: the user
+    /// opted in, the language has a registered tool, and it has not already been
+    /// ruled out this session (missing/failed/crashed -> naive heuristics).
     pub fn shouldTry(self: *const LinterSession, language: Language) bool {
-        return linterFor(language) != null and self.statuses.get(language) != .unavailable;
+        return self.enabled and linterFor(language) != null and self.statuses.get(language) != .unavailable;
     }
 };
 

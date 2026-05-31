@@ -696,8 +696,8 @@ test "linter: registry maps languages to the expected tools (ruff/biome confirme
 }
 
 test "linter: session fallback is sticky — a failed language is never retried" {
-    var session = linter.LinterSession{};
-    // Fresh session: python is worth trying, unknown is not (no tool).
+    var session = linter.LinterSession{ .enabled = true };
+    // Opted-in session: python is worth trying, unknown is not (no tool).
     try testing.expectEqual(linter.LinterStatus.unknown, session.status(.python));
     try testing.expect(session.shouldTry(.python));
     try testing.expect(!session.shouldTry(.unknown));
@@ -711,6 +711,17 @@ test "linter: session fallback is sticky — a failed language is never retried"
 
     // A different language is unaffected.
     try testing.expect(session.shouldTry(.typescript));
+}
+
+test "linter: a disabled session never tries the external linter (preference off)" {
+    // Default: the user has not opted in, so codedb uses only Tier-0 heuristics.
+    var session = linter.LinterSession{};
+    try testing.expect(!session.shouldTry(.python));
+    try testing.expect(!session.shouldTry(.typescript));
+    // Enabling flips it on for supported languages only.
+    session.enabled = true;
+    try testing.expect(session.shouldTry(.python));
+    try testing.expect(!session.shouldTry(.cpp));
 }
 
 test "linter: toolOnPath returns false for a non-existent executable" {
