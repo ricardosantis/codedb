@@ -31,6 +31,18 @@ const ResolvedVersion = struct {
     source: VersionSource,
 };
 
+const SupersededRelease = struct {
+    current: []const u8,
+    minimum_target: []const u8,
+};
+
+const superseded_releases = [_]SupersededRelease{
+    // v0.2.58181 was an accidental release-train typo. Pure SemVer ordering
+    // treats its patch component as newer than v0.2.5823, but operationally it
+    // belongs before v0.2.5823 and should update forward normally.
+    .{ .current = "0.2.58181", .minimum_target = "0.2.5823" },
+};
+
 pub fn run(io: std.Io, stdout: cio.File, s: sty.Style, allocator: std.mem.Allocator) void {
     const out = Out{ .file = stdout, .alloc = allocator };
 
@@ -40,7 +52,7 @@ pub fn run(io: std.Io, stdout: cio.File, s: sty.Style, allocator: std.mem.Alloca
     };
     defer allocator.free(resolved.value);
 
-    const version_order = compareVersions(release_info.semver, resolved.value) catch |err| {
+    const version_order = compareVersionsForUpdate(release_info.semver, resolved.value) catch |err| {
         out.p("{s}✗{s} invalid release version: {s}\n", .{ s.red, s.reset, @errorName(err) });
         std.process.exit(1);
     };
@@ -131,6 +143,21 @@ pub fn compareVersions(current: []const u8, target: []const u8) !std.math.Order 
         if (current_num < target_num) return .lt;
         if (current_num > target_num) return .gt;
     }
+}
+
+pub fn compareVersionsForUpdate(current: []const u8, target: []const u8) !std.math.Order {
+    const order = try compareVersions(current, target);
+    if (order == .gt and try targetSupersedesCurrent(current, target)) return .lt;
+    return order;
+}
+
+pub fn targetSupersedesCurrent(current: []const u8, target: []const u8) !bool {
+    const normalized_current = trimVersionPrefix(current);
+    for (superseded_releases) |release| {
+        if (!std.mem.eql(u8, normalized_current, release.current)) continue;
+        return (try compareVersions(target, release.minimum_target)) != .lt;
+    }
+    return false;
 }
 
 pub fn checksumForBinary(manifest: []const u8, binary_name: []const u8) ?[]const u8 {

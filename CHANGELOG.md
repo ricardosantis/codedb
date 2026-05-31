@@ -1,6 +1,160 @@
 # Changelog
 
 
+## 0.2.5823 - 2026-05-29
+
+`0.2.5823` is an MCP compatibility hotfix for direct `tools/call` requests.
+It ships the issue #512 fix and adds a wire-level stdio backtest so future
+releases catch this exact client-wrapper failure mode.
+
+### MCP direct tool-call compatibility
+
+- **#512 — direct calls no longer drop inline args when `arguments` is empty.**
+  Some clients send canonical MCP `params.name` and `params.arguments`, but a
+  wrapper layer may also emit `arguments: {}` while placing the real fields
+  inline on `params`, for example `{"name":"codedb_outline","arguments":{},
+  "path":"src/mcp.zig"}`. Direct `tools/call` previously treated the empty
+  `arguments` object as authoritative, dispatched `codedb_outline` with no
+  `path`, and returned `missing 'path'` / `received keys: []` even though the
+  request contained a path.
+- **Canonical MCP behavior is preserved.** Non-empty `params.arguments` remains
+  authoritative. When `arguments` is empty or absent, direct calls now copy
+  non-administrative inline fields into a clean argument map before dispatch.
+  A legacy `params.args` object is accepted only as a compatibility fallback
+  when canonical args are absent or empty. Malformed non-object `arguments`
+  still returns the protocol error `arguments must be object`.
+- **Diagnostics now match direct calls.** Missing-arg guidance no longer says
+  "sub-op" for direct `tools/call`; it explains the canonical direct shape and
+  separately mentions the bundled inline fallback.
+
+### Backtesting
+
+- Added `test "issue-512: direct tools call accepts inline args when arguments
+  is empty"` to exercise the direct call handler.
+- Extended `scripts/e2e_mcp_test.py` with Scenario 4, which sends the malformed
+  direct stdio MCP request through the real server process. The fixed binary
+  passes **20/20** E2E checks; the pre-fix binary fails Scenario 4 with the old
+  `missing 'path'` / `received keys: []` response.
+- A subagent also validated the change with codedb MCP available. Its MCP
+  snapshot was stale, so it used codedb MCP to inspect what was available and
+  then confirmed the current disk state plus the focused and stdio E2E tests.
+
+### Release metadata
+
+- `src/release_info.zig`, `build.zig.zon`, and `npm/package.json` are aligned
+  on `0.2.5823`.
+
+### Validation
+
+- `zig build test -Dtest-filter=issue-512`
+- `zig build test`
+- `zig build`
+- `python3 scripts/e2e_mcp_test.py --binary zig-out/bin/codedb --project /Users/blackfloofie/codedb-release-0.2.5823`
+  — **20/20 passed**
+- GitHub PR bench-regression for #513: **success**
+- Release asset workflow now builds the expected Linux ARM64 asset in addition
+  to macOS ARM64, macOS x86_64, and Linux x86_64.
+
+See [`benchmarks/v0.2.5823-validation.md`](benchmarks/v0.2.5823-validation.md)
+for the release validation notes.
+
+
+## 0.2.5822 - 2026-05-29
+
+`0.2.5822` is a hot-path performance and release-reliability follow-up to
+`0.2.5821`. It keeps the protocol fixes from `0.2.5821`, cuts the cost of
+the common MCP tools, removes parser boilerplate, and fixes the remaining
+Intel macOS/Rosetta release crash by leaving the x86_64 macOS artifact
+unsigned until the Zig/Mach-O signing issue is resolved.
+
+### MCP hot-path performance
+
+- **Pre-rendered responses for hot tools.** `codedb_tree`, `codedb_outline`,
+  `codedb_hot`, `codedb_deps`, `codedb_status`, and related MCP response paths
+  now avoid unnecessary deep clones and intermediate buffers. The corrected
+  benchmark harness now runs cases from the temp corpus root, so edit/read
+  timings measure the intended project instead of the caller's checkout.
+- **Lower edit latency.** `codedb_edit` avoids extra project-root work in the
+  hot path and dropped from `236300 ns` to `44700 ns` p50 in the corrected
+  microbench, an **81.08%** reduction.
+- **No benchmark-critical regressions.** Comparing the corrected baseline to
+  this release, every comparable MCP benchmark improved by more than 50%:
+  `codedb_tree` `14530 -> 6270 ns`, `codedb_outline` `62930 -> 12820 ns`,
+  `codedb_search` `33700 -> 8450 ns`, `codedb_deps` `1620 -> 70 ns`,
+  `codedb_bundle` `93040 -> 28380 ns`, and `codedb_snapshot`
+  `60100 -> 27750 ns`.
+
+### Parser maintenance
+
+- **`src/explore.zig` parser append cleanup.** Older language parsers had many
+  repeated "dupe name/detail/import then append" blocks. These now route
+  through shared helpers that preserve the prior symbol/detail behavior while
+  cutting **393 net lines** from `src/explore.zig` (`83 insertions`,
+  `476 deletions`). This is intentionally behavior-preserving cleanup after
+  the parser expansion in earlier releases.
+
+### Glob matching
+
+- **#511 — brace alternatives in glob patterns.** `codedb_glob` and all MCP
+  `path_glob` filters now support simple shell-style alternatives such as
+  `**/*.{yaml,yml}` and `src/{mcp,explore}.zig`. Malformed braces without a
+  comma continue to match literally, so existing literal-brace paths keep
+  working. This fixes the confusing zero-result behavior agents hit when
+  surveying YAML files with one glob.
+
+### macOS Intel / Rosetta
+
+- **#504 — signed x86_64 macOS binaries still crashed.** Local Rosetta testing
+  reproduced the published `v0.2.5821` `codedb-darwin-x86_64` crash:
+  `--help` exited `139` with no output. A fresh `0.2.5822` x86_64 build works
+  when unsigned, but manually applying an ad-hoc signature to that exact binary
+  brings back exit `139`. This matches the issue thread's native-Intel finding:
+  the crash is triggered by codesigning Zig 0.16 x86_64-macos binaries on
+  macOS 26, not by codedb startup logic.
+- **Release workaround.** `build.zig` now makes `-Dcodesign-identity` opt-in and
+  skips codesign for `x86_64-macos` even if the option is provided. The release
+  workflow no longer passes `-Dcodesign-identity` for the Intel macOS matrix
+  entry. Apple Silicon macOS artifacts still sign with hardened runtime when
+  the signing identity is configured.
+- **Docs updated to match distribution reality.** README and MCP docs now state
+  that `codedb-darwin-x86_64` is temporarily unsigned and should be verified
+  by SHA256 checksum. Zig version badges / requirements now say Zig 0.16.
+
+### Release metadata
+
+- `src/release_info.zig`, `build.zig.zon`, and `npm/package.json` are aligned
+  on `0.2.5822`, so the native binary and `codedeebee` package metadata agree.
+
+### Validation
+
+- `zig build test`
+- `zig build test-query -Dtest-filter="issue-511"`
+- `zig build test-mcp -Doptimize=ReleaseFast`
+- `zig build`
+- `python3 scripts/e2e_mcp_test.py --binary zig-out/bin/codedb --project /Users/blackfloofie/codedb`
+  — **17/17 passed**
+- Rosetta x86_64 release test:
+  - published signed `v0.2.5821` asset: `--help` exit `139`
+  - patched unsigned `0.2.5822` x86_64 build: `--help` exit `0`,
+    `--version` exit `0`, MCP e2e **17/17 passed**
+  - manually re-signed patched x86_64 build: `--help` exit `139`
+  - patched arm64 macOS build: signed and `--help` exit `0`
+- Four-subagent SWE-bench Lite smoke using `codedb 0.2.5822` on non-temp
+  workspaces:
+  - `pallets__flask-4992`: target TOML config test passed.
+  - `pytest-dev__pytest-5221`: two target fixture-listing tests passed with
+    plugin autoload disabled for the old pytest checkout.
+  - `sympy__sympy-12454`: rectangular matrix upper-triangular and Hessenberg
+    target tests passed.
+  - `psf__requests-2317`: codedb navigation succeeded, but the old checkout's
+    target pytest collection is blocked on Python 3.14 because stdlib `cgi` was
+    removed; a direct smoke confirmed byte and string methods normalize to
+    `GET`.
+
+See [`benchmarks/v0.2.5822-validation.md`](benchmarks/v0.2.5822-validation.md)
+for the benchmark table and SWE-bench Lite smoke details.
+
+
 ## 0.2.5821 - 2026-05-28
 
 Bundle of seven fixes from the open-issue triage on 2026-05-28.

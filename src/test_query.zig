@@ -629,6 +629,27 @@ test "issue-359: mcp.globMatch backtracks across **/* boundary" {
 }
 
 
+test "issue-511: glob supports brace alternatives" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    try explorer.indexFile(".github/workflows/release.yml", "name: release");
+    try explorer.indexFile("config.yaml", "name: app");
+    try explorer.indexFile("docs/readme.md", "# docs");
+
+    const matches = try explorer.globPaths(testing.allocator, "**/*.{yaml,yml}", 10);
+    defer testing.allocator.free(matches);
+
+    try testing.expectEqual(@as(usize, 2), matches.len);
+    try testing.expectEqualStrings(".github/workflows/release.yml", matches[0]);
+    try testing.expectEqualStrings("config.yaml", matches[1]);
+
+    try testing.expect(mcp_mod.globMatch("src/{mcp,explore}.zig", "src/mcp.zig"));
+    try testing.expect(mcp_mod.globMatch("src/{mcp,explore}.zig", "src/explore.zig"));
+    try testing.expect(!mcp_mod.globMatch("src/{mcp,explore}.zig", "src/main.zig"));
+}
+
+
 test "issue-359: globPaths recall — every matching path survives at every depth" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
@@ -1229,4 +1250,3 @@ test "issue-356-p3: codedb_read appends fuzzy suggestions when path is unreadabl
     try testing.expect(std.mem.indexOf(u8, out.items, "did you mean") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "src/main.zig") != null);
 }
-

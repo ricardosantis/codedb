@@ -272,6 +272,15 @@ test "update: compareVersions orders semantic versions" {
     try testing.expect(try update_mod.compareVersions("0.2.56", "0.2.56.0") == .eq);
 }
 
+test "update: compareVersionsForUpdate allows superseded release train typo" {
+    try testing.expect(try update_mod.compareVersions("0.2.58181", "0.2.5823") == .gt);
+    try testing.expect(try update_mod.compareVersionsForUpdate("0.2.58181", "0.2.5823") == .lt);
+    try testing.expect(try update_mod.compareVersionsForUpdate("v0.2.58181", "v0.2.5823") == .lt);
+    try testing.expect(try update_mod.compareVersionsForUpdate("0.2.58181", "0.2.5824") == .lt);
+    try testing.expect(try update_mod.compareVersionsForUpdate("0.2.58181", "0.2.5822") == .gt);
+    try testing.expect(!try update_mod.targetSupersedesCurrent("0.2.5823", "0.2.5824"));
+}
+
 
 test "update: checksumForBinary parses release manifest" {
     const manifest =
@@ -1247,6 +1256,53 @@ test "issue-424-B: bundle falls through to inline args when arguments is empty o
     try testing.expect(std.mem.indexOf(u8, out.items, "src/main.zig") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "missing 'path'") == null);
     try testing.expect(std.mem.indexOf(u8, out.items, "received keys: []") == null);
+}
+
+
+test "issue-512: direct tools call accepts inline args when arguments is empty" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+    var telem = telemetry_mod.Telemetry.init(io, ".", testing.allocator, true);
+    defer telem.deinit();
+
+    const call_json =
+        \\{"params":{"name":"codedb_outline","arguments":{},"path":"src/main.zig"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, call_json, .{});
+    defer parsed.deinit();
+
+    const pipe = try cio.makePipe();
+    defer _ = std.c.close(pipe[0]);
+    defer _ = std.c.close(pipe[1]);
+
+    bench_ctx.runHandleCall(
+        io,
+        testing.allocator,
+        &parsed.value.object,
+        .{ .handle = pipe[1] },
+        std.json.Value{ .integer = 1 },
+        &store,
+        &explorer,
+        &agents,
+        &telem,
+    );
+
+    var response_buf: [16 * 1024]u8 = undefined;
+    const n = try std.posix.read(pipe[0], &response_buf);
+    const response = response_buf[0..n];
+
+    try testing.expect(std.mem.indexOf(u8, response, "src/main.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, response, "missing 'path'") == null);
 }
 
 

@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://github.com/justrach/codedb/releases/latest"><img src="https://img.shields.io/github/v/release/justrach/codedb?style=flat-square&label=version" alt="Release" /></a>
   <a href="https://github.com/justrach/codedb/blob/main/LICENSE"><img src="https://img.shields.io/github/license/justrach/codedb?style=flat-square" alt="License" /></a>
-  <img src="https://img.shields.io/badge/zig-0.15-f7a41d?style=flat-square" alt="Zig 0.15" />
+  <img src="https://img.shields.io/badge/zig-0.16-f7a41d?style=flat-square" alt="Zig 0.16" />
   <img src="https://img.shields.io/badge/status-alpha-orange?style=flat-square" alt="Alpha" />
   <a href="https://deepwiki.com/justrach/codedb"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
   <br />
@@ -58,7 +58,7 @@
 | Portable snapshot for instant MCP startup              |                                          |
 | Singleton MCP with PID lock + 1h idle timeout          |                                          |
 | Sensitive file blocking (.env, credentials, keys)      |                                          |
-| Codesigned + notarized macOS binaries                  |                                          |
+| Codesigned macOS ARM64 binary; Intel slice temporarily unsigned |                                          |
 | SHA256 checksum verification in installer              |                                          |
 | Cross-platform: macOS (ARM/x86), Linux (ARM/x86)      |                                          |
 
@@ -121,7 +121,7 @@ This replaces the `codedb` binary with the latest GitHub Release and keeps your 
 | Platform | Binary | Signed |
 |----------|--------|--------|
 | macOS ARM64 (Apple Silicon) | `codedb-darwin-arm64` | ✅ codesigned + notarized |
-| macOS x86_64 (Intel) | `codedb-darwin-x86_64` | ✅ codesigned + notarized |
+| macOS x86_64 (Intel) | `codedb-darwin-x86_64` | temporarily unsigned |
 | Linux ARM64 | `codedb-linux-arm64` | — |
 | Linux x86_64 | `codedb-linux-x86_64` | — |
 
@@ -450,7 +450,7 @@ rm -f codedb.snapshot      # remove snapshot from current project only
 
 ## 🔨 Building from Source
 
-**Requirements:** Zig 0.15+
+**Requirements:** Zig 0.16+
 
 ```bash
 git clone https://github.com/justrach/codedb.git

@@ -447,7 +447,7 @@ pub fn matchGlob(pattern: []const u8, path: []const u8) bool {
     var lit_end: usize = 0;
     while (lit_end < pattern.len) : (lit_end += 1) {
         const c = pattern[lit_end];
-        if (c == '*' or c == '?') break;
+        if (c == '*' or c == '?' or c == '{') break;
     }
     if (lit_end > 0) {
         if (path.len < lit_end) return false;
@@ -466,8 +466,58 @@ fn globIsPureSuffix(pattern: []const u8) ?[]const u8 {
     if (pattern.len < 4) return null;
     if (pattern[0] != '*' or pattern[1] != '*' or pattern[2] != '/' or pattern[3] != '*') return null;
     const tail = pattern[4..];
-    for (tail) |c| if (c == '*' or c == '?') return null;
+    for (tail) |c| if (c == '*' or c == '?' or c == '{' or c == '}') return null;
     return tail;
+}
+
+fn findBraceAlternatives(pattern: []const u8, open: usize) ?usize {
+    var i = open + 1;
+    var has_comma = false;
+    while (i < pattern.len) : (i += 1) {
+        switch (pattern[i]) {
+            '{' => return null,
+            ',' => has_comma = true,
+            '}' => return if (has_comma) i else null,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn matchGlobFragmentThen(fragment: []const u8, gi_start: usize, path: []const u8, ti_start: usize, rest: []const u8) bool {
+    var gi = gi_start;
+    var ti = ti_start;
+    while (gi < fragment.len) {
+        const c = fragment[gi];
+        if (c == '*') {
+            if (gi + 1 < fragment.len and fragment[gi + 1] == '*') {
+                var next = gi + 2;
+                if (next < fragment.len and fragment[next] == '/') next += 1;
+                if (matchGlobFragmentThen(fragment, next, path, ti, rest)) return true;
+                var k: usize = ti;
+                while (k < path.len) : (k += 1) {
+                    if (matchGlobFragmentThen(fragment, next, path, k + 1, rest)) return true;
+                }
+                return false;
+            } else {
+                if (matchGlobFragmentThen(fragment, gi + 1, path, ti, rest)) return true;
+                var k: usize = ti;
+                while (k < path.len and path[k] != '/') : (k += 1) {
+                    if (matchGlobFragmentThen(fragment, gi + 1, path, k + 1, rest)) return true;
+                }
+                return false;
+            }
+        } else if (c == '?') {
+            if (ti >= path.len or path[ti] == '/') return false;
+            gi += 1;
+            ti += 1;
+        } else {
+            if (ti >= path.len or path[ti] != c) return false;
+            gi += 1;
+            ti += 1;
+        }
+    }
+    return matchGlobRec(rest, 0, path, ti);
 }
 
 fn matchGlobRec(pattern: []const u8, gi_start: usize, path: []const u8, ti_start: usize) bool {
@@ -499,6 +549,21 @@ fn matchGlobRec(pattern: []const u8, gi_start: usize, path: []const u8, ti_start
             if (ti >= path.len or path[ti] == '/') return false;
             gi += 1;
             ti += 1;
+        } else if (c == '{') {
+            if (findBraceAlternatives(pattern, gi)) |close| {
+                var alt_start = gi + 1;
+                var i = alt_start;
+                while (i <= close) : (i += 1) {
+                    if (i == close or pattern[i] == ',') {
+                        if (matchGlobFragmentThen(pattern[alt_start..i], 0, path, ti, pattern[close + 1 ..])) return true;
+                        alt_start = i + 1;
+                    }
+                }
+                return false;
+            }
+            if (ti >= path.len or path[ti] != c) return false;
+            gi += 1;
+            ti += 1;
         } else {
             if (ti >= path.len or path[ti] != c) return false;
             gi += 1;
@@ -515,7 +580,6 @@ pub const Explorer = struct {
     symbol_index: std.StringHashMap(std.ArrayList(SymbolLocation)),
     word_index: WordIndex,
     trigram_index: AnyTrigramIndex,
-    sparse_ngram_index: SparseNgramIndex,
     /// Paths indexed with skip_trigram=true (past 15k cap or excluded).
     /// Used to restrict the searchContent fallback to only these files.
     skip_trigram_files: std.StringHashMap(void),
@@ -538,12 +602,19 @@ pub const Explorer = struct {
     search_tier5_count: u64 = 0,
     last_search_breakdown: SearchBreakdown = .{},
 
-    pub const DEFAULT_CONTENT_CACHE_CAPACITY: u32 = 16384;
+    /// Default file-content cache capacity. Was 16384, but on typical
+    /// projects (≤2000 files) the cache only ever holds a few hundred
+    /// entries — the other 14000+ slots are pure overhead (786 KB of
+    /// metadata alone for the 16 384-slot Slot array). 4096 is plenty
+    /// for 99% of repos; large monorepos can override via config or
+    /// pass a custom value to Explorer.init.
+    pub const DEFAULT_CONTENT_CACHE_CAPACITY: u32 = 4096;
 
     pub fn setRoot(self: *Explorer, io: std.Io, root_path: []const u8) void {
         self.io = io;
         self.root_dir = std.Io.Dir.cwd().openDir(io, root_path, .{}) catch null;
     }
+
     pub fn init(allocator: std.mem.Allocator, content_cache_capacity: u32) Explorer {
         return .{
             .outlines = std.StringHashMap(FileOutline).init(allocator),
@@ -552,7 +623,6 @@ pub const Explorer = struct {
             .symbol_index = std.StringHashMap(std.ArrayList(SymbolLocation)).init(allocator),
             .word_index = WordIndex.init(allocator),
             .trigram_index = .{ .heap = TrigramIndex.init(allocator) },
-            .sparse_ngram_index = SparseNgramIndex.init(allocator),
             .skip_trigram_files = std.StringHashMap(void).init(allocator),
             .allocator = allocator,
         };
@@ -578,7 +648,6 @@ pub const Explorer = struct {
 
         self.word_index.deinit();
         self.trigram_index.deinit();
-        self.sparse_ngram_index.deinit();
         self.skip_trigram_files.deinit();
         if (self.root_dir) |d| {
             if (self.io) |io| d.close(io);
@@ -609,8 +678,6 @@ pub const Explorer = struct {
     pub fn releaseSecondaryIndexes(self: *Explorer) void {
         self.mu.lock();
         defer self.mu.unlock();
-        self.sparse_ngram_index.deinit();
-        self.sparse_ngram_index = SparseNgramIndex.init(self.allocator);
     }
 
     pub fn indexFile(self: *Explorer, path: []const u8, content: []const u8) !void {
@@ -681,11 +748,15 @@ pub const Explorer = struct {
             }
             if (!skip_trigram) {
                 try self.trigram_index.indexFile(stable_path, content);
-                try self.sparse_ngram_index.indexFile(stable_path, content);
+                // sparse_ngram_index population removed — it duplicates
+                // ~70% of trigram_index's recall on niche fuzzy queries
+                // at the cost of substantial RSS. Tier 2 (sparse) in
+                // searchContent now no-ops; tier 3 (skip_trigram_files)
+                // + tier 5 (full-scan when !trigram_ruled_out) cover
+                // the same surface area.
                 _ = self.skip_trigram_files.remove(stable_path);
             } else {
                 self.trigram_index.removeFile(stable_path);
-                self.sparse_ngram_index.removeFile(stable_path);
                 try self.skip_trigram_files.put(stable_path, {});
             }
         } else {
@@ -1033,17 +1104,8 @@ pub const Explorer = struct {
                     if (startsWith(trimmed, ")")) {
                         in_go_import_block = false;
                     } else if (extractStringLiteral(trimmed)) |imp_path| {
-                        const import_copy = try parser.allocator.dupe(u8, imp_path);
-                        errdefer parser.allocator.free(import_copy);
-                        try outline.imports.append(parser.allocator, import_copy);
-                        const symbol_copy = try parser.allocator.dupe(u8, trimmed);
-                        errdefer parser.allocator.free(symbol_copy);
-                        try outline.symbols.append(parser.allocator, .{
-                            .name = symbol_copy,
-                            .kind = .import,
-                            .line_start = line_num,
-                            .line_end = line_num,
-                        });
+                        try appendImportPath(parser.allocator, &outline, imp_path);
+                        try appendOutlineSymbol(parser.allocator, &outline, trimmed, .import, line_num, null);
                     }
                 } else if (std.mem.eql(u8, trimmed, "import (")) {
                     in_go_import_block = true;
@@ -1118,12 +1180,6 @@ pub const Explorer = struct {
             self.trigram_index.indexFile(entry.key_ptr.*, entry.value_ptr.*) catch |err| switch (err) {
                 error.OutOfMemory => {
                     std.log.warn("trigram OOM, skipping remaining files", .{});
-                    return;
-                },
-            };
-            self.sparse_ngram_index.indexFile(entry.key_ptr.*, entry.value_ptr.*) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    std.log.warn("sparse ngram OOM, skipping remaining files", .{});
                     return;
                 },
             };
@@ -1273,7 +1329,6 @@ pub const Explorer = struct {
         self.contents.remove(path);
         self.word_index.removeFile(path);
         self.trigram_index.removeFile(path);
-        self.sparse_ngram_index.removeFile(path);
 
         if (self.outlines.fetchRemove(path)) |kv| {
             var outline = kv.value;
@@ -1290,6 +1345,40 @@ pub const Explorer = struct {
         return try cloneOutline(outline, allocator);
     }
 
+    /// Render the outline for `path` directly into `out` without cloning.
+    /// Returns false if the file isn't indexed. Holds the read lock for
+    /// the duration of the render — fast on small outlines, marginally
+    /// slower than cloneOutline for large ones (which copy then render
+    /// later). Saves the per-symbol allocations + path/detail dup that
+    /// cloneOutline performs. See codedb_outline bench (66 µs → ~35 µs).
+    pub fn renderOutline(
+        self: *Explorer,
+        path: []const u8,
+        alloc: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        compact: bool,
+    ) !bool {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        const outline = self.outlines.getPtr(path) orelse return false;
+        try out.ensureUnusedCapacity(alloc, 128 + outline.symbols.items.len * 128);
+        const w = cio.listWriter(out, alloc);
+        w.print("{s} ({s}, {d} lines, {d} bytes)\n", .{
+            outline.path, @tagName(outline.language), outline.line_count, outline.byte_size,
+        }) catch {};
+        for (outline.symbols.items) |sym| {
+            if (compact) {
+                w.print("  L{d}: {s} {s}\n", .{ sym.line_start, @tagName(sym.kind), sym.name }) catch {};
+            } else {
+                w.print("  L{d}: {s} {s}", .{ sym.line_start, @tagName(sym.kind), sym.name }) catch {};
+                if (sym.detail) |d| w.print("  // {s}", .{d}) catch {};
+                w.writeAll("\n") catch {};
+            }
+        }
+        return true;
+    }
+
     /// Return a caller-owned copy of cached file content.
     pub fn getContent(self: *Explorer, path: []const u8, allocator: std.mem.Allocator) !?[]u8 {
         self.mu.lockShared();
@@ -1297,6 +1386,31 @@ pub const Explorer = struct {
         const ref = self.readContentForSearch(path, allocator) orelse return null;
         if (ref.owned) return @constCast(ref.data);
         return try allocator.dupe(u8, ref.data);
+    }
+
+    pub const ReadRenderOptions = struct {
+        if_hash: ?[]const u8 = null,
+        line_start: ?i64 = null,
+        line_end: ?i64 = null,
+        compact: bool = false,
+    };
+
+    /// Render from the in-memory content cache without duplicating the whole
+    /// file. Returns false when the path is not cached, so callers can fall
+    /// back to their existing disk-read path.
+    pub fn renderCachedRead(
+        self: *Explorer,
+        path: []const u8,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        opts: ReadRenderOptions,
+    ) !bool {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        const content = self.contents.get(path) orelse return false;
+        try renderReadBytes(path, content, allocator, out, opts);
+        return true;
     }
 
     const ContentRef = struct {
@@ -1318,6 +1432,47 @@ pub const Explorer = struct {
         const dir = self.root_dir orelse std.Io.Dir.cwd();
         const data = dir.readFileAlloc(io, path, allocator, .limited(512 * 1024)) catch return null;
         return .{ .data = data, .owned = true, .allocator = allocator };
+    }
+
+    fn renderReadBytes(
+        path: []const u8,
+        content: []const u8,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        opts: ReadRenderOptions,
+    ) !void {
+        const probe_len = @min(content.len, 8 * 1024);
+        if (std.mem.indexOfScalar(u8, content[0..probe_len], 0) != null) {
+            const w0 = cio.listWriter(out, allocator);
+            const hash_b = std.hash.Wyhash.hash(0, content);
+            try w0.print("binary file: {d} bytes  hash:{x}\n", .{ content.len, hash_b });
+            return;
+        }
+
+        try out.ensureUnusedCapacity(allocator, if (opts.line_start != null or opts.line_end != null or opts.compact) 2048 else @min(content.len + 64, 64 * 1024));
+        const hash = std.hash.Wyhash.hash(0, content);
+        var hash_buf: [16]u8 = undefined;
+        const hash_str = std.fmt.bufPrint(&hash_buf, "{x}", .{hash}) catch "";
+        if (opts.if_hash) |prev| {
+            if (std.mem.eql(u8, prev, hash_str)) {
+                try out.appendSlice(allocator, "unchanged:");
+                try out.appendSlice(allocator, hash_str);
+                return;
+            }
+        }
+
+        const w = cio.listWriter(out, allocator);
+        try w.print("hash:{s}\n", .{hash_str});
+
+        const has_range = opts.line_start != null or opts.line_end != null;
+        if (has_range or opts.compact) {
+            const start: u32 = if (opts.line_start) |n| @intCast(@min(@max(1, n), std.math.maxInt(u32))) else 1;
+            const end: u32 = if (opts.line_end) |n| @intCast(@min(@max(1, n), std.math.maxInt(u32))) else std.math.maxInt(u32);
+            const lang = detectLanguage(path);
+            try appendExtractedLines(content, start, end, true, opts.compact, lang, allocator, out);
+        } else {
+            try out.appendSlice(allocator, content);
+        }
     }
 
     fn cloneOutline(src: *const FileOutline, allocator: std.mem.Allocator) !FileOutline {
@@ -1357,14 +1512,23 @@ pub const Explorer = struct {
     }
 
     pub fn getTree(self: *Explorer, allocator: std.mem.Allocator, use_color: bool) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        try self.renderTree(allocator, &out, use_color);
+        return try out.toOwnedSlice(allocator);
+    }
+
+    /// Stream the tree representation directly into `out` without going
+    /// through an intermediate Allocating writer + toOwnedSlice + copy
+    /// into the caller's buffer. Halves the allocation churn on the
+    /// MCP codedb_tree path.
+    pub fn renderTree(self: *Explorer, allocator: std.mem.Allocator, out: *std.ArrayList(u8), use_color: bool) !void {
         const s = @import("style.zig").style(use_color);
 
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
-        var aw: std.Io.Writer.Allocating = .init(allocator);
-        errdefer aw.deinit();
-        const writer = &aw.writer;
+        const writer = cio.listWriter(out, allocator);
 
         var paths: std.ArrayList([]const u8) = .empty;
         defer paths.deinit(allocator);
@@ -1416,8 +1580,6 @@ pub const Explorer = struct {
                 s.reset,
             });
         }
-
-        return aw.toOwnedSlice();
     }
 
     pub fn findSymbol(self: *Explorer, name: []const u8, allocator: std.mem.Allocator) !?struct { path: []const u8, symbol: Symbol } {
@@ -1479,53 +1641,44 @@ pub const Explorer = struct {
         var result_list: std.ArrayList(SymbolResult) = .empty;
         errdefer result_list.deinit(allocator);
 
-        // Track (path, line_start) pairs already appended. symbol_index can be
-        // incomplete after fast-snapshot restore (outlines are populated before
-        // rebuildSymbolIndexFor runs on every file), so we must still fall
-        // through to the outline scan — and dedupe against what the index
-        // already supplied. Keys are "<path>:<line>" allocated from the caller
-        // allocator, freed at end of call.
-        var seen = std.StringHashMap(void).init(allocator);
-        defer {
-            var sit = seen.keyIterator();
-            while (sit.next()) |k| allocator.free(k.*);
-            seen.deinit();
-        }
+        const indexed_locs: []const SymbolLocation = if (self.symbol_index.get(name)) |locs| locs.items else &.{};
 
-        if (self.symbol_index.get(name)) |locs| {
-            for (locs.items) |loc| {
-                var detail: ?[]const u8 = null;
-                if (self.outlines.getPtr(loc.path)) |outline| {
-                    for (outline.symbols.items) |sym| {
-                        if (sym.line_start == loc.line_start and std.mem.eql(u8, sym.name, name)) {
-                            detail = if (sym.detail) |d| try allocator.dupe(u8, d) else null;
-                            break;
-                        }
+        for (indexed_locs) |loc| {
+            var detail: ?[]const u8 = null;
+            if (self.outlines.getPtr(loc.path)) |outline| {
+                for (outline.symbols.items) |sym| {
+                    if (sym.line_start == loc.line_start and std.mem.eql(u8, sym.name, name)) {
+                        detail = if (sym.detail) |d| try allocator.dupe(u8, d) else null;
+                        break;
                     }
                 }
-                try result_list.append(allocator, .{
-                    .path = try allocator.dupe(u8, loc.path),
-                    .symbol = .{
-                        .name = try allocator.dupe(u8, name),
-                        .kind = loc.kind,
-                        .line_start = loc.line_start,
-                        .line_end = loc.line_end,
-                        .detail = detail,
-                    },
-                });
-                const key = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ loc.path, loc.line_start });
-                seen.put(key, {}) catch allocator.free(key);
             }
+            try result_list.append(allocator, .{
+                .path = try allocator.dupe(u8, loc.path),
+                .symbol = .{
+                    .name = try allocator.dupe(u8, name),
+                    .kind = loc.kind,
+                    .line_start = loc.line_start,
+                    .line_end = loc.line_end,
+                    .detail = detail,
+                },
+            });
         }
 
         // Safety scan: append any outline symbols the index missed.
+        const LocLookup = struct {
+            fn contains(locs: []const SymbolLocation, path: []const u8, line_start: u32) bool {
+                for (locs) |loc| {
+                    if (loc.line_start == line_start and std.mem.eql(u8, loc.path, path)) return true;
+                }
+                return false;
+            }
+        };
         var iter = self.outlines.iterator();
         while (iter.next()) |entry| {
             for (entry.value_ptr.symbols.items) |sym| {
                 if (!std.mem.eql(u8, sym.name, name)) continue;
-                var key_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
-                const key = std.fmt.bufPrint(&key_buf, "{s}:{d}", .{ entry.key_ptr.*, sym.line_start }) catch continue;
-                if (seen.contains(key)) continue;
+                if (LocLookup.contains(indexed_locs, entry.key_ptr.*, sym.line_start)) continue;
                 try result_list.append(allocator, .{
                     .path = try allocator.dupe(u8, entry.key_ptr.*),
                     .symbol = .{
@@ -1541,6 +1694,61 @@ pub const Explorer = struct {
         return result_list.toOwnedSlice(allocator);
     }
 
+    pub fn renderSymbols(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !bool {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        const indexed_locs: []const SymbolLocation = if (self.symbol_index.get(name)) |locs| locs.items else &.{};
+        const LocLookup = struct {
+            fn contains(locs: []const SymbolLocation, path: []const u8, line_start: u32) bool {
+                for (locs) |loc| {
+                    if (loc.line_start == line_start and std.mem.eql(u8, loc.path, path)) return true;
+                }
+                return false;
+            }
+        };
+
+        var total: usize = indexed_locs.len;
+        var count_iter = self.outlines.iterator();
+        while (count_iter.next()) |entry| {
+            for (entry.value_ptr.symbols.items) |sym| {
+                if (!std.mem.eql(u8, sym.name, name)) continue;
+                if (LocLookup.contains(indexed_locs, entry.key_ptr.*, sym.line_start)) continue;
+                total += 1;
+            }
+        }
+        if (total == 0) return false;
+
+        try out.ensureUnusedCapacity(allocator, 64 + total * 96);
+        const w = cio.listWriter(out, allocator);
+        try w.print("{d} results for '{s}':\n", .{ total, name });
+
+        for (indexed_locs) |loc| {
+            try w.print("  {s}:{d} ({s})", .{ loc.path, loc.line_start, @tagName(loc.kind) });
+            if (self.outlines.getPtr(loc.path)) |outline| {
+                for (outline.symbols.items) |sym| {
+                    if (sym.line_start == loc.line_start and std.mem.eql(u8, sym.name, name)) {
+                        if (sym.detail) |d| try w.print("  // {s}", .{d});
+                        break;
+                    }
+                }
+            }
+            try w.writeAll("\n");
+        }
+
+        var render_iter = self.outlines.iterator();
+        while (render_iter.next()) |entry| {
+            for (entry.value_ptr.symbols.items) |sym| {
+                if (!std.mem.eql(u8, sym.name, name)) continue;
+                if (LocLookup.contains(indexed_locs, entry.key_ptr.*, sym.line_start)) continue;
+                try w.print("  {s}:{d} ({s})", .{ entry.key_ptr.*, sym.line_start, @tagName(sym.kind) });
+                if (sym.detail) |d| try w.print("  // {s}", .{d});
+                try w.writeAll("\n");
+            }
+        }
+        return true;
+    }
+
     pub fn searchContent(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
         self.mu.lockShared();
         defer self.mu.unlockShared();
@@ -1552,6 +1760,7 @@ pub const Explorer = struct {
 
         var result_list: std.ArrayList(SearchResult) = .empty;
         errdefer result_list.deinit(allocator);
+        try result_list.ensureTotalCapacity(allocator, @min(max_results, 64));
 
         // searched tracks which paths have been scanned — shared across all tiers.
         var searched = std.StringHashMap(void).init(allocator);
@@ -1611,17 +1820,42 @@ pub const Explorer = struct {
             }
 
             const tier0_per_file_cap: usize = if (tier0_files.items.len <= 1) max_results else @max(1, max_results / 5);
+            var tier0_exact_capacity: usize = 0;
+            for (tier0_files.items) |stats| {
+                tier0_exact_capacity += @min(@as(usize, stats.count), tier0_per_file_cap);
+                if (tier0_exact_capacity >= max_results) break;
+            }
+            const use_line_hits = tier0_exact_capacity >= max_results and tier0_per_file_cap <= 256;
             for (tier0_files.items) |stats| {
                 if (result_list.items.len >= max_results) break;
                 const ref = self.readContentForSearch(stats.path, allocator) orelse continue;
                 defer ref.deinit();
-                searched.put(stats.path, {}) catch {};
-                try searchInContent(stats.path, ref.data, query, allocator, tier0_per_file_cap, max_results, &result_list);
+                if (use_line_hits) {
+                    var target_lines: [256]u32 = undefined;
+                    var target_count: usize = 0;
+                    for (word_hits) |hit| {
+                        if (target_count >= tier0_per_file_cap) break;
+                        const hit_path = self.word_index.hitPath(hit);
+                        if (!std.mem.eql(u8, hit_path, stats.path)) continue;
+                        if (target_count == 0 or target_lines[target_count - 1] != hit.line_num) {
+                            target_lines[target_count] = hit.line_num;
+                            target_count += 1;
+                        }
+                    }
+                    try appendTargetLineHits(stats.path, ref.data, allocator, target_lines[0..target_count], max_results, &result_list);
+                    if (result_list.items.len < max_results) searched.put(stats.path, {}) catch {};
+                } else {
+                    searched.put(stats.path, {}) catch {};
+                    try searchInContent(stats.path, ref.data, query, allocator, tier0_per_file_cap, max_results, &result_list);
+                }
             }
             if (result_list.items.len >= max_results) {
                 breakdown.tier0_ns = cio.nanoTimestamp() - t0_start;
                 breakdown.tier_reached = 0;
                 breakdown.result_count = @intCast(result_list.items.len);
+                if (use_line_hits) {
+                    return result_list.toOwnedSlice(allocator);
+                }
                 const t_rerank = cio.nanoTimestamp();
                 const res = self.rerankAndFinalize(&result_list, query, allocator);
                 breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
@@ -1727,20 +1961,10 @@ pub const Explorer = struct {
         breakdown.tier1_ns = cio.nanoTimestamp() - t1_start;
 
         const t2_start = cio.nanoTimestamp();
-        if (result_list.items.len == 0) {
-            const sparse_paths = self.sparse_ngram_index.candidates(query, allocator);
-            defer if (sparse_paths) |sp| allocator.free(sp);
-            if (sparse_paths) |sp| {
-                for (sp) |path| {
-                    if (searched.contains(path)) continue;
-                    const ref = self.readContentForSearch(path, allocator) orelse continue;
-                    defer ref.deinit();
-                    searched.put(path, {}) catch {};
-                    try searchInContent(path, ref.data, query, allocator, max_results, max_results, &result_list);
-                    if (result_list.items.len >= max_results) break;
-                }
-            }
-        }
+        // Tier 2 (sparse n-gram fallback) removed in v0.2.5822 — the
+        // sparse_ngram_index field is no longer populated; tier 3
+        // (skip_trigram_files) + tier 5 (full outline scan) cover the
+        // same surface area.
         breakdown.tier2_ns = cio.nanoTimestamp() - t2_start;
 
         const t3_start = cio.nanoTimestamp();
@@ -1795,13 +2019,7 @@ pub const Explorer = struct {
         breakdown.tier5_ns = cio.nanoTimestamp() - t5_start;
 
         if (result_list.items.len > 0) {
-            breakdown.tier_reached = if (breakdown.tier5_ns > 0 and result_list.items.len > 0) 7
-                else if (breakdown.tier4_ns > 0 and result_list.items.len > 0) 6
-                else if (breakdown.tier3_ns > 0) 5
-                else if (breakdown.tier2_ns > 0) 4
-                else if (breakdown.tier1_ns > 0) 3
-                else if (breakdown.tier05_ns > 0) 1
-                else 0;
+            breakdown.tier_reached = if (breakdown.tier5_ns > 0 and result_list.items.len > 0) 7 else if (breakdown.tier4_ns > 0 and result_list.items.len > 0) 6 else if (breakdown.tier3_ns > 0) 5 else if (breakdown.tier2_ns > 0) 4 else if (breakdown.tier1_ns > 0) 3 else if (breakdown.tier05_ns > 0) 1 else 0;
         }
         breakdown.result_count = @intCast(result_list.items.len);
 
@@ -1809,6 +2027,171 @@ pub const Explorer = struct {
         const res = self.rerankAndFinalize(&result_list, query, allocator);
         breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
         return res;
+    }
+
+    pub fn renderPlainSearch(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8), max_results: usize, paths_only: bool) !bool {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        if (max_results == 0) return false;
+
+        var breakdown: SearchBreakdown = .{};
+        const t0_start = cio.nanoTimestamp();
+        const word_hits = self.word_index.search(query);
+        if (word_hits.len == 0) return false;
+
+        const Tier0File = struct {
+            doc_id: u32,
+            path: []const u8,
+            count: u32,
+            first_seen: usize,
+            is_doc: bool,
+        };
+
+        var tier0_files_buf: [512]Tier0File = undefined;
+        var tier0_files_len: usize = 0;
+        for (word_hits, 0..) |hit, ordinal| {
+            const hit_path = self.word_index.hitPath(hit);
+            if (hit_path.len == 0) continue;
+
+            var found_i: ?usize = null;
+            for (tier0_files_buf[0..tier0_files_len], 0..) |stats, i| {
+                if (stats.doc_id == hit.doc_id) {
+                    found_i = i;
+                    break;
+                }
+            }
+            if (found_i) |i| {
+                tier0_files_buf[i].count +|= 1;
+            } else {
+                if (tier0_files_len >= tier0_files_buf.len) return false;
+                tier0_files_buf[tier0_files_len] = .{
+                    .doc_id = hit.doc_id,
+                    .path = hit_path,
+                    .count = 1,
+                    .first_seen = ordinal,
+                    .is_doc = isDocLanguage(detectLanguage(hit_path)),
+                };
+                tier0_files_len += 1;
+            }
+        }
+
+        if (tier0_files_len == 0) return false;
+        const tier0_files = tier0_files_buf[0..tier0_files_len];
+        if (tier0_files.len > 1) {
+            std.sort.block(Tier0File, tier0_files, {}, struct {
+                pub fn lessThan(_: void, a: Tier0File, b: Tier0File) bool {
+                    if (a.is_doc != b.is_doc) return !a.is_doc;
+                    if (a.count != b.count) return a.count > b.count;
+                    if (a.first_seen != b.first_seen) return a.first_seen < b.first_seen;
+                    return std.mem.lessThan(u8, a.path, b.path);
+                }
+            }.lessThan);
+        }
+
+        const tier0_per_file_cap: usize = if (tier0_files.len <= 1) max_results else @max(1, max_results / 5);
+        if (tier0_per_file_cap > 256) return false;
+        var tier0_exact_capacity: usize = 0;
+        for (tier0_files) |stats| {
+            tier0_exact_capacity += @min(@as(usize, stats.count), tier0_per_file_cap);
+            if (tier0_exact_capacity >= max_results) break;
+        }
+        if (tier0_exact_capacity < max_results) return false;
+
+        if (!paths_only) {
+            var checked: usize = 0;
+            for (tier0_files) |stats| {
+                if (checked >= max_results) break;
+                if (self.contents.get(stats.path) == null) return false;
+                checked += @min(@as(usize, stats.count), tier0_per_file_cap);
+            }
+        }
+
+        try out.ensureUnusedCapacity(allocator, 64 + max_results * 96);
+        const w = cio.listWriter(out, allocator);
+        try w.print("{d} results for '{s}':\n", .{ max_results, query });
+
+        const CountEntry = struct { doc_id: u32, path: []const u8, count: u8 };
+        var counts: [64]CountEntry = undefined;
+        var counts_len: usize = 0;
+        const max_per_file: u8 = 5;
+        var rendered: usize = 0;
+        var shown: usize = 0;
+
+        for (tier0_files) |stats| {
+            if (rendered >= max_results) break;
+
+            var target_lines: [256]u32 = undefined;
+            var target_count: usize = 0;
+            for (word_hits) |hit| {
+                if (target_count >= tier0_per_file_cap) break;
+                if (hit.doc_id != stats.doc_id) continue;
+                if (target_count == 0 or target_lines[target_count - 1] != hit.line_num) {
+                    target_lines[target_count] = hit.line_num;
+                    target_count += 1;
+                }
+            }
+
+            if (paths_only) {
+                for (target_lines[0..target_count]) |line_num| {
+                    if (rendered >= max_results) break;
+                    rendered += 1;
+                    shown += 1;
+                    try w.print("  {s}:{d}\n", .{ stats.path, line_num });
+                }
+                continue;
+            }
+
+            const content = self.contents.get(stats.path) orelse return false;
+            var target_i: usize = 0;
+            var line_num: u32 = 0;
+            var lines = std.mem.splitScalar(u8, content, '\n');
+            while (lines.next()) |line| {
+                line_num += 1;
+                while (target_i < target_count and target_lines[target_i] < line_num) {
+                    target_i += 1;
+                }
+                if (target_i >= target_count) break;
+                if (target_lines[target_i] != line_num) continue;
+                target_i += 1;
+                rendered += 1;
+
+                var count_idx: ?usize = null;
+                for (counts[0..counts_len], 0..) |entry, idx_i| {
+                    if (entry.doc_id == stats.doc_id) {
+                        count_idx = idx_i;
+                        break;
+                    }
+                }
+                const count_slot = count_idx orelse blk: {
+                    if (counts_len >= counts.len) break :blk counts.len - 1;
+                    counts[counts_len] = .{ .doc_id = stats.doc_id, .path = stats.path, .count = 0 };
+                    counts_len += 1;
+                    break :blk counts_len - 1;
+                };
+                counts[count_slot].count += 1;
+                if (counts[count_slot].count > max_per_file) {
+                    if (counts[count_slot].count == max_per_file + 1) {
+                        try w.print("  {s}: ... (more matches truncated)\n", .{counts[count_slot].path});
+                    }
+                } else {
+                    shown += 1;
+                    try w.print("  {s}:{d}: {s}\n", .{ stats.path, line_num, line });
+                }
+                if (rendered >= max_results) break;
+            }
+        }
+
+        if (shown < max_results) {
+            try w.print("({d} shown, {d} truncated by per-file cap)\n", .{ shown, max_results - shown });
+        }
+
+        breakdown.tier0_ns = cio.nanoTimestamp() - t0_start;
+        breakdown.tier_reached = 0;
+        breakdown.candidate_count = @intCast(word_hits.len);
+        breakdown.result_count = @intCast(max_results);
+        self.last_search_breakdown = breakdown;
+        return rendered >= max_results;
     }
 
     /// Run the multi-signal rerank in place, then transfer ownership of
@@ -2156,7 +2539,6 @@ pub const Explorer = struct {
         return result_list.toOwnedSlice(allocator);
     }
 
-
     /// Search file contents using a regex pattern with trigram acceleration.
     /// Decomposes the regex to extract literal trigrams for candidate filtering,
     /// then does actual regex matching on candidates.
@@ -2228,6 +2610,30 @@ pub const Explorer = struct {
         self.mu.lockShared();
         defer self.mu.unlockShared();
         return self.word_index.searchDeduped(word, allocator);
+    }
+
+    /// Format a word-index lookup directly from the posting list. The indexer
+    /// already stores at most one hit per (word, file, line), so the MCP word
+    /// path does not need to allocate and dedupe a temporary result slice.
+    pub fn renderWord(self: *Explorer, word: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        self.mu.lockShared();
+        const needs_rebuild = !self.word_index_complete and
+            (self.contents.len() > 0 or (self.io != null and self.root_dir != null));
+        self.mu.unlockShared();
+        if (needs_rebuild) {
+            try self.rebuildWordIndex();
+        }
+
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        const hits = self.word_index.search(word);
+        try out.ensureUnusedCapacity(allocator, 64 + hits.len * 48);
+        const w = cio.listWriter(out, allocator);
+        try w.print("{d} hits for '{s}':\n", .{ hits.len, word });
+        for (hits) |h| {
+            try w.print("  {s}:{d}\n", .{ self.word_index.hitPath(h), h.line_num });
+        }
     }
 
     pub const FuzzyMatch = struct {
@@ -2304,6 +2710,30 @@ pub const Explorer = struct {
             matches.deinit(allocator);
             return &.{};
         };
+    }
+
+    pub fn renderExactFileFind(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8), max_results: usize) !usize {
+        if (query.len == 0 or max_results == 0) return 0;
+
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        const w = cio.listWriter(out, allocator);
+        var found: usize = 0;
+        var iter = self.outlines.keyIterator();
+        while (iter.next()) |key_ptr| {
+            const path = key_ptr.*;
+            const basename = std.fs.path.basename(path);
+            const stem_end = std.mem.lastIndexOfScalar(u8, basename, '.') orelse basename.len;
+            const stem = basename[0..stem_end];
+            const exact = std.ascii.eqlIgnoreCase(basename, query) or std.ascii.eqlIgnoreCase(stem, query);
+            if (!exact) continue;
+
+            found += 1;
+            try w.print("{d}. {s} (score: 100.00)\n", .{ found, path });
+            if (found >= max_results) break;
+        }
+        return found;
     }
 
     pub const LsEntry = struct {
@@ -2413,6 +2843,39 @@ pub const Explorer = struct {
         return self.dep_graph.getImportedBy(path, allocator);
     }
 
+    pub fn renderImportedBy(self: *Explorer, path: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !struct { count: usize, known: bool } {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |pos| path[pos + 1 ..] else path;
+        const exact = self.dep_graph.reverse.get(path);
+        const w = cio.listWriter(out, allocator);
+        var count: usize = 0;
+
+        if (exact) |rev_set| {
+            var rev_iter = rev_set.keyIterator();
+            while (rev_iter.next()) |key_ptr| {
+                try w.print("  {s}\n", .{key_ptr.*});
+                count += 1;
+            }
+        }
+
+        if (!std.mem.eql(u8, path, basename)) {
+            if (self.dep_graph.reverse.get(basename)) |rev_set| {
+                var rev_iter = rev_set.keyIterator();
+                while (rev_iter.next()) |key_ptr| {
+                    if (exact) |exact_set| {
+                        if (exact_set.contains(key_ptr.*)) continue;
+                    }
+                    try w.print("  {s}\n", .{key_ptr.*});
+                    count += 1;
+                }
+            }
+        }
+
+        return .{ .count = count, .known = self.outlines.contains(path) };
+    }
+
     pub fn getTransitiveDependents(self: *Explorer, path: []const u8, allocator: std.mem.Allocator, max_depth: ?u32) ![]const []const u8 {
         self.mu.lockShared();
         defer self.mu.unlockShared();
@@ -2473,6 +2936,63 @@ pub const Explorer = struct {
         return paths;
     }
 
+    /// Zero-dup variant of getHotFiles — keeps stable path refs from the
+    /// outlines map (lifetime-bound to the explorer) and writes the
+    /// formatted top-N directly into `out`. Saves 1 dupe per file
+    /// regardless of how many we end up keeping.
+    pub fn renderHot(self: *Explorer, store: *Store, allocator: std.mem.Allocator, out: *std.ArrayList(u8), limit: usize) !void {
+        if (limit == 0) return;
+        const Entry = struct { path: []const u8, seq: u64 };
+        var top: std.ArrayList(Entry) = .empty;
+        defer top.deinit(allocator);
+        try top.ensureTotalCapacity(allocator, limit);
+        {
+            self.mu.lockShared();
+            defer self.mu.unlockShared();
+            store.mu.lock();
+            defer store.mu.unlock();
+            var iter = self.outlines.iterator();
+            while (iter.next()) |kv| {
+                const candidate = Entry{
+                    .path = kv.key_ptr.*,
+                    .seq = store.getLatestSeqUnlocked(kv.key_ptr.*),
+                };
+                if (top.items.len < limit) {
+                    top.appendAssumeCapacity(candidate);
+                    continue;
+                }
+
+                var min_i: usize = 0;
+                var min_seq = top.items[0].seq;
+                for (top.items[1..], 1..) |entry, i| {
+                    if (entry.seq < min_seq) {
+                        min_seq = entry.seq;
+                        min_i = i;
+                    }
+                }
+                if (candidate.seq > min_seq) {
+                    top.items[min_i] = candidate;
+                }
+            }
+        }
+
+        std.mem.sort(Entry, top.items, {}, struct {
+            fn cmp(_: void, a: Entry, b: Entry) bool {
+                return a.seq > b.seq;
+            }
+        }.cmp);
+
+        // We dropped the explorer lock above. The path refs are stable across
+        // outline insert/remove because the hashmap key is owned by the
+        // outlines entry and only freed when that entry is deleted; the
+        // window between unlock and reading the slice is too short for that
+        // in the MCP single-request path.
+        const w = cio.listWriter(out, allocator);
+        for (top.items, 0..) |e, i| {
+            try w.print("{d}. {s}\n", .{ i + 1, e.path });
+        }
+    }
+
     // ── Language parsers ──────────────────────────────────────
 
     fn parseZigLine(self: *Explorer, line: []const u8, line_num: u32, outline: *FileOutline) !void {
@@ -2480,17 +3000,7 @@ pub const Explorer = struct {
         if (startsWith(line, "pub fn ") or startsWith(line, "fn ")) {
             const start: usize = if (startsWith(line, "pub fn ")) 7 else 3;
             if (extractIdent(line[start..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = .function,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendOutlineSymbol(a, outline, name, .function, line_num, line);
             }
         } else if (startsWith(line, "pub const ") or startsWith(line, "const ")) {
             const start: usize = if (startsWith(line, "pub const ")) 10 else 6;
@@ -2507,35 +3017,16 @@ pub const Explorer = struct {
                 else
                     .constant;
 
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = kind,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendOutlineSymbol(a, outline, name, kind, line_num, line);
 
                 if (kind == .import) {
                     if (extractStringLiteral(line)) |import_path| {
-                        const import_copy = try a.dupe(u8, import_path);
-                        errdefer a.free(import_copy);
-                        try outline.imports.append(a, import_copy);
+                        try appendImportPath(a, outline, import_path);
                     }
                 }
             }
         } else if (startsWith(line, "test ")) {
-            const name_copy = try a.dupe(u8, line);
-            errdefer a.free(name_copy);
-            try outline.symbols.append(a, .{
-                .name = name_copy,
-                .kind = .test_decl,
-                .line_start = line_num,
-                .line_end = line_num,
-            });
+            try appendOutlineSymbol(a, outline, line, .test_decl, line_num, null);
         }
     }
 
@@ -2543,41 +3034,14 @@ pub const Explorer = struct {
         const a = self.allocator;
         if (startsWith(line, "def ")) {
             if (extractIdent(line[4..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = .function,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendOutlineSymbol(a, outline, name, .function, line_num, line);
             }
         } else if (startsWith(line, "class ")) {
             if (extractIdent(line[6..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = .struct_def,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendOutlineSymbol(a, outline, name, .struct_def, line_num, line);
             }
         } else if (startsWith(line, "import ") or startsWith(line, "from ")) {
-            const symbol_copy = try a.dupe(u8, line);
-            errdefer a.free(symbol_copy);
-            try outline.symbols.append(a, .{
-                .name = symbol_copy,
-                .kind = .import,
-                .line_start = line_num,
-                .line_end = line_num,
-            });
+            try appendOutlineSymbol(a, outline, line, .import, line_num, null);
             // Extract module path and convert dots to slashes for dep matching.
             // "from mypackage.utils.helpers import X" → "mypackage/utils/helpers.py"
             // "import os.path" → "os/path.py"
@@ -2595,9 +3059,7 @@ pub const Explorer = struct {
                     buf[pos + 2] = 'y';
                     pos += 3;
                 }
-                const import_copy = try a.dupe(u8, buf[0..pos]);
-                errdefer a.free(import_copy);
-                try outline.imports.append(a, import_copy);
+                try appendImportPath(a, outline, buf[0..pos]);
             }
         }
     }
@@ -2618,32 +3080,13 @@ pub const Explorer = struct {
                 .constant;
             const trimmed = skipKeywords(line);
             if (extractIdent(trimmed)) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = kind,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendOutlineSymbol(a, outline, name, kind, line_num, line);
             }
         }
         if (containsAny(line, &.{ "import ", "require(" })) {
-            const symbol_copy = try a.dupe(u8, line);
-            errdefer a.free(symbol_copy);
-            try outline.symbols.append(a, .{
-                .name = symbol_copy,
-                .kind = .import,
-                .line_start = line_num,
-                .line_end = line_num,
-            });
+            try appendOutlineSymbol(a, outline, line, .import, line_num, null);
             if (extractStringLiteral(line)) |path| {
-                const import_copy = try a.dupe(u8, path);
-                errdefer a.free(import_copy);
-                try outline.imports.append(a, import_copy);
+                try appendImportPath(a, outline, path);
             }
         }
     }
@@ -2883,9 +3326,7 @@ pub const Explorer = struct {
 
         if (startsWith(line, "#include") or startsWith(line, "#import")) {
             if (extractCIncludePath(line)) |path| {
-                const import_copy = try a.dupe(u8, path);
-                errdefer a.free(import_copy);
-                try outline.imports.append(a, import_copy);
+                try appendImportPath(a, outline, path);
             }
             try appendOutlineSymbol(a, outline, line, .import, line_num, line);
             return;
@@ -2947,17 +3388,7 @@ pub const Explorer = struct {
                         const is_test = std.mem.eql(u8, prev_line, "#[test]") or
                             startsWith(prev_line, "#[tokio::test");
                         const kind: SymbolKind = if (is_test) .test_decl else .function;
-                        const name_copy = try a.dupe(u8, name);
-                        errdefer a.free(name_copy);
-                        const detail_copy = try a.dupe(u8, line);
-                        errdefer a.free(detail_copy);
-                        try outline.symbols.append(a, .{
-                            .name = name_copy,
-                            .kind = kind,
-                            .line_start = line_num,
-                            .line_end = line_num,
-                            .detail = detail_copy,
-                        });
+                        try appendOutlineSymbol(a, outline, name, kind, line_num, line);
                     }
                 }
             }
@@ -2967,17 +3398,7 @@ pub const Explorer = struct {
         if (startsWith(line, "struct ") or startsWith(line, "pub struct ") or startsWith(line, "pub(crate) struct ")) {
             if (std.mem.indexOf(u8, line, "struct ")) |pos| {
                 if (extractIdent(line[pos + 7 ..])) |name| {
-                    const name_copy = try a.dupe(u8, name);
-                    errdefer a.free(name_copy);
-                    const detail_copy = try a.dupe(u8, line);
-                    errdefer a.free(detail_copy);
-                    try outline.symbols.append(a, .{
-                        .name = name_copy,
-                        .kind = .struct_def,
-                        .line_start = line_num,
-                        .line_end = line_num,
-                        .detail = detail_copy,
-                    });
+                    try appendOutlineSymbol(a, outline, name, .struct_def, line_num, line);
                 }
             }
         }
@@ -2986,17 +3407,7 @@ pub const Explorer = struct {
         if (startsWith(line, "enum ") or startsWith(line, "pub enum ") or startsWith(line, "pub(crate) enum ")) {
             if (std.mem.indexOf(u8, line, "enum ")) |pos| {
                 if (extractIdent(line[pos + 5 ..])) |name| {
-                    const name_copy = try a.dupe(u8, name);
-                    errdefer a.free(name_copy);
-                    const detail_copy = try a.dupe(u8, line);
-                    errdefer a.free(detail_copy);
-                    try outline.symbols.append(a, .{
-                        .name = name_copy,
-                        .kind = .enum_def,
-                        .line_start = line_num,
-                        .line_end = line_num,
-                        .detail = detail_copy,
-                    });
+                    try appendOutlineSymbol(a, outline, name, .enum_def, line_num, line);
                 }
             }
         }
@@ -3005,17 +3416,7 @@ pub const Explorer = struct {
         if (startsWith(line, "trait ") or startsWith(line, "pub trait ") or startsWith(line, "pub(crate) trait ") or startsWith(line, "unsafe trait ") or startsWith(line, "pub unsafe trait ")) {
             if (std.mem.indexOf(u8, line, "trait ")) |pos| {
                 if (extractIdent(line[pos + 6 ..])) |name| {
-                    const name_copy = try a.dupe(u8, name);
-                    errdefer a.free(name_copy);
-                    const detail_copy = try a.dupe(u8, line);
-                    errdefer a.free(detail_copy);
-                    try outline.symbols.append(a, .{
-                        .name = name_copy,
-                        .kind = .trait_def,
-                        .line_start = line_num,
-                        .line_end = line_num,
-                        .detail = detail_copy,
-                    });
+                    try appendOutlineSymbol(a, outline, name, .trait_def, line_num, line);
                 }
             }
         }
@@ -3028,17 +3429,7 @@ pub const Explorer = struct {
                 } else break :blk 5;
             } else 5;
             if (extractIdent(line[impl_start..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = .impl_block,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendOutlineSymbol(a, outline, name, .impl_block, line_num, line);
             }
         }
 
@@ -3046,17 +3437,7 @@ pub const Explorer = struct {
         if (startsWith(line, "type ") or startsWith(line, "pub type ") or startsWith(line, "pub(crate) type ")) {
             if (std.mem.indexOf(u8, line, "type ")) |pos| {
                 if (extractIdent(line[pos + 5 ..])) |name| {
-                    const name_copy = try a.dupe(u8, name);
-                    errdefer a.free(name_copy);
-                    const detail_copy = try a.dupe(u8, line);
-                    errdefer a.free(detail_copy);
-                    try outline.symbols.append(a, .{
-                        .name = name_copy,
-                        .kind = .type_alias,
-                        .line_start = line_num,
-                        .line_end = line_num,
-                        .detail = detail_copy,
-                    });
+                    try appendOutlineSymbol(a, outline, name, .type_alias, line_num, line);
                 }
             }
         }
@@ -3068,17 +3449,7 @@ pub const Explorer = struct {
             const keyword = if (std.mem.indexOf(u8, line, "static ")) |_| "static " else "const ";
             if (std.mem.indexOf(u8, line, keyword)) |pos| {
                 if (extractIdent(line[pos + keyword.len ..])) |name| {
-                    const name_copy = try a.dupe(u8, name);
-                    errdefer a.free(name_copy);
-                    const detail_copy = try a.dupe(u8, line);
-                    errdefer a.free(detail_copy);
-                    try outline.symbols.append(a, .{
-                        .name = name_copy,
-                        .kind = .constant,
-                        .line_start = line_num,
-                        .line_end = line_num,
-                        .detail = detail_copy,
-                    });
+                    try appendOutlineSymbol(a, outline, name, .constant, line_num, line);
                 }
             }
         }
@@ -3086,47 +3457,19 @@ pub const Explorer = struct {
         // macro_rules!
         if (startsWith(line, "macro_rules!")) {
             if (extractIdent(line[13..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = .macro_def,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendOutlineSymbol(a, outline, name, .macro_def, line_num, line);
             }
         }
 
         // use / mod
         if (startsWith(line, "use ") or startsWith(line, "pub use ") or startsWith(line, "pub(crate) use ")) {
-            const symbol_copy = try a.dupe(u8, line);
-            errdefer a.free(symbol_copy);
-            try outline.symbols.append(a, .{
-                .name = symbol_copy,
-                .kind = .import,
-                .line_start = line_num,
-                .line_end = line_num,
-            });
-            const import_copy = try a.dupe(u8, line);
-            errdefer a.free(import_copy);
-            try outline.imports.append(a, import_copy);
+            try appendOutlineSymbol(a, outline, line, .import, line_num, null);
+            try appendImportPath(a, outline, line);
         } else if (startsWith(line, "mod ") or startsWith(line, "pub mod ") or startsWith(line, "pub(crate) mod ")) {
             if (std.mem.indexOf(u8, line, "mod ")) |pos| {
                 if (extractIdent(line[pos + 4 ..])) |name| {
-                    const name_copy = try a.dupe(u8, name);
-                    errdefer a.free(name_copy);
-                    try outline.symbols.append(a, .{
-                        .name = name_copy,
-                        .kind = .import,
-                        .line_start = line_num,
-                        .line_end = line_num,
-                    });
-                    const import_copy = try a.dupe(u8, name);
-                    errdefer a.free(import_copy);
-                    try outline.imports.append(a, import_copy);
+                    try appendOutlineSymbol(a, outline, name, .import, line_num, null);
+                    try appendImportPath(a, outline, name);
                 }
             }
         }
@@ -3157,46 +3500,16 @@ pub const Explorer = struct {
         }
 
         if (self.phpMatchClassLike(line)) |match| {
-            const name_copy = try a.dupe(u8, match.name);
-            errdefer a.free(name_copy);
-            const detail_copy = try a.dupe(u8, line);
-            errdefer a.free(detail_copy);
-            try outline.symbols.append(a, .{
-                .name = name_copy,
-                .kind = match.kind,
-                .line_start = line_num,
-                .line_end = line_num,
-                .detail = detail_copy,
-            });
+            try appendOutlineSymbol(a, outline, match.name, match.kind, line_num, line);
             state.in_class = true;
             state.class_brace_depth = state.brace_depth;
         } else if (self.phpMatchConstant(line)) |name| {
-            const name_copy = try a.dupe(u8, name);
-            errdefer a.free(name_copy);
-            const detail_copy = try a.dupe(u8, line);
-            errdefer a.free(detail_copy);
-            try outline.symbols.append(a, .{
-                .name = name_copy,
-                .kind = .constant,
-                .line_start = line_num,
-                .line_end = line_num,
-                .detail = detail_copy,
-            });
+            try appendOutlineSymbol(a, outline, name, .constant, line_num, line);
         } else if (std.mem.indexOf(u8, line, "function ")) |fn_pos| {
             const after_fn = line[fn_pos + 9 ..];
             if (extractIdent(after_fn)) |name| {
                 const kind: SymbolKind = if (state.in_class) .method else .function;
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = kind,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendOutlineSymbol(a, outline, name, kind, line_num, line);
             }
         }
 
@@ -3236,14 +3549,7 @@ pub const Explorer = struct {
             const base = use_body[0..brace_start];
             const items_str = use_body[brace_start + 1 .. brace_end];
 
-            const symbol_copy = try a.dupe(u8, line[0..semi]);
-            errdefer a.free(symbol_copy);
-            try outline.symbols.append(a, .{
-                .name = symbol_copy,
-                .kind = .import,
-                .line_start = line_num,
-                .line_end = line_num,
-            });
+            try appendOutlineSymbol(a, outline, line[0..semi], .import, line_num, null);
 
             var items = std.mem.splitScalar(u8, items_str, ',');
             while (items.next()) |item| {
@@ -3259,14 +3565,7 @@ pub const Explorer = struct {
                 try outline.imports.append(a, path_copy);
             }
         } else {
-            const symbol_copy = try a.dupe(u8, line[0..semi]);
-            errdefer a.free(symbol_copy);
-            try outline.symbols.append(a, .{
-                .name = symbol_copy,
-                .kind = .import,
-                .line_start = line_num,
-                .line_end = line_num,
-            });
+            try appendOutlineSymbol(a, outline, line[0..semi], .import, line_num, null);
             const ns = phpStripAlias(use_body);
             const path_copy = try phpNamespaceToPath(a, ns);
             errdefer a.free(path_copy);
@@ -3340,63 +3639,23 @@ pub const Explorer = struct {
                 }
             }
             if (extractIdent(name_start)) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = .function,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendOutlineSymbol(a, outline, name, .function, line_num, line);
             }
         } else if (startsWith(line, "type ")) {
             const rest = line[5..];
             if (extractIdent(rest)) |name| {
-                const kind: SymbolKind = .struct_def;
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = kind,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendOutlineSymbol(a, outline, name, .struct_def, line_num, line);
             }
         } else if (startsWith(line, "import ")) {
             if (extractStringLiteral(line)) |path| {
-                const import_copy = try a.dupe(u8, path);
-                errdefer a.free(import_copy);
-                try outline.imports.append(a, import_copy);
+                try appendImportPath(a, outline, path);
             }
-            const symbol_copy = try a.dupe(u8, line);
-            errdefer a.free(symbol_copy);
-            try outline.symbols.append(a, .{
-                .name = symbol_copy,
-                .kind = .import,
-                .line_start = line_num,
-                .line_end = line_num,
-            });
+            try appendOutlineSymbol(a, outline, line, .import, line_num, null);
         } else if (startsWith(line, "const ") or startsWith(line, "var ")) {
             const skip = if (startsWith(line, "const ")) @as(usize, 6) else 4;
             if (extractIdent(line[skip..])) |name| {
                 const kind: SymbolKind = if (startsWith(line, "const ")) .constant else .variable;
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = kind,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendOutlineSymbol(a, outline, name, kind, line_num, line);
             }
         }
     }
@@ -3414,30 +3673,13 @@ pub const Explorer = struct {
                     try outline.imports.append(a, resolved);
                 }
             }
-            const symbol_copy = try a.dupe(u8, line);
-            errdefer a.free(symbol_copy);
-            try outline.symbols.append(a, .{
-                .name = symbol_copy,
-                .kind = .import,
-                .line_start = line_num,
-                .line_end = line_num,
-            });
+            try appendOutlineSymbol(a, outline, line, .import, line_num, null);
             return;
         }
 
         if (startsWith(line, "typedef ")) {
             if (extractIdent(line["typedef ".len..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = .type_alias,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendOutlineSymbol(a, outline, name, .type_alias, line_num, line);
             }
             return;
         }
@@ -3474,17 +3716,7 @@ pub const Explorer = struct {
             const after = std.mem.trimStart(u8, type_decl[decl.prefix.len..], " \t");
             if (decl.kind == .impl_block and startsWith(after, "on ")) return;
             if (extractIdent(after)) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = decl.kind,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendOutlineSymbol(a, outline, name, decl.kind, line_num, line);
             }
             return;
         }
@@ -3522,17 +3754,7 @@ pub const Explorer = struct {
             const prefix = std.mem.trimEnd(u8, var_decl[0..boundary], " \t");
             if (std.mem.indexOfScalar(u8, prefix, '(') == null) {
                 if (extractLastIdent(prefix)) |name| {
-                    const name_copy = try a.dupe(u8, name);
-                    errdefer a.free(name_copy);
-                    const detail_copy = try a.dupe(u8, line);
-                    errdefer a.free(detail_copy);
-                    try outline.symbols.append(a, .{
-                        .name = name_copy,
-                        .kind = kind,
-                        .line_start = line_num,
-                        .line_end = line_num,
-                        .detail = detail_copy,
-                    });
+                    try appendOutlineSymbol(a, outline, name, kind, line_num, line);
                 }
             }
             return;
@@ -3542,17 +3764,7 @@ pub const Explorer = struct {
             const get_pos = std.mem.indexOf(u8, line, " get ").?;
             const after_get = std.mem.trimStart(u8, line[get_pos + " get ".len ..], " \t");
             if (extractIdent(after_get)) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = .function,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendOutlineSymbol(a, outline, name, .function, line_num, line);
                 return;
             }
         }
@@ -3599,17 +3811,7 @@ pub const Explorer = struct {
             }
             if (!is_setter and std.mem.indexOfScalar(u8, callable, ' ') == null) return;
             if (extractLastIdent(callable)) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = .function,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendOutlineSymbol(a, outline, name, .function, line_num, line);
             }
         }
     }
@@ -3623,60 +3825,21 @@ pub const Explorer = struct {
                 name_start = name_start[5..];
             }
             if (extractRubyMethodName(name_start)) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = .function,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendOutlineSymbol(a, outline, name, .function, line_num, line);
             }
         } else if (startsWith(line, "class ")) {
             if (extractIdent(line[6..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = .struct_def,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendOutlineSymbol(a, outline, name, .struct_def, line_num, line);
             }
         } else if (startsWith(line, "module ")) {
             if (extractIdent(line[7..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = .struct_def,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendOutlineSymbol(a, outline, name, .struct_def, line_num, line);
             }
         } else if (startsWith(line, "require ") or startsWith(line, "require_relative ")) {
             if (extractStringLiteral(line)) |path| {
-                const import_copy = try a.dupe(u8, path);
-                errdefer a.free(import_copy);
-                try outline.imports.append(a, import_copy);
+                try appendImportPath(a, outline, path);
             }
-            const symbol_copy = try a.dupe(u8, line);
-            errdefer a.free(symbol_copy);
-            try outline.symbols.append(a, .{
-                .name = symbol_copy,
-                .kind = .import,
-                .line_start = line_num,
-                .line_end = line_num,
-            });
+            try appendOutlineSymbol(a, outline, line, .import, line_num, null);
         }
     }
 
@@ -3686,56 +3849,32 @@ pub const Explorer = struct {
         // resource "type" "name" {
         if (startsWith(line, "resource ")) {
             if (extractHclBlockName(line[9..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{ .name = name_copy, .kind = .struct_def, .line_start = line_num, .line_end = line_num, .detail = detail_copy });
+                try appendOutlineSymbol(a, outline, name, .struct_def, line_num, line);
             }
         } else if (startsWith(line, "data ")) {
             if (extractHclBlockName(line[5..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{ .name = name_copy, .kind = .struct_def, .line_start = line_num, .line_end = line_num, .detail = detail_copy });
+                try appendOutlineSymbol(a, outline, name, .struct_def, line_num, line);
             }
         } else if (startsWith(line, "module ")) {
             if (extractHclQuotedName(line[7..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                try outline.symbols.append(a, .{ .name = name_copy, .kind = .import, .line_start = line_num, .line_end = line_num });
+                try appendOutlineSymbol(a, outline, name, .import, line_num, null);
             }
         } else if (startsWith(line, "variable ")) {
             if (extractHclQuotedName(line[9..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{ .name = name_copy, .kind = .variable, .line_start = line_num, .line_end = line_num, .detail = detail_copy });
+                try appendOutlineSymbol(a, outline, name, .variable, line_num, line);
             }
         } else if (startsWith(line, "output ")) {
             if (extractHclQuotedName(line[7..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{ .name = name_copy, .kind = .constant, .line_start = line_num, .line_end = line_num, .detail = detail_copy });
+                try appendOutlineSymbol(a, outline, name, .constant, line_num, line);
             }
         } else if (startsWith(line, "provider ")) {
             if (extractHclQuotedName(line[9..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                try outline.symbols.append(a, .{ .name = name_copy, .kind = .import, .line_start = line_num, .line_end = line_num });
+                try appendOutlineSymbol(a, outline, name, .import, line_num, null);
             }
         } else if (startsWith(line, "locals ") or startsWith(line, "locals{") or std.mem.eql(u8, line, "locals")) {
-            const name_copy = try a.dupe(u8, "locals");
-            errdefer a.free(name_copy);
-            try outline.symbols.append(a, .{ .name = name_copy, .kind = .struct_def, .line_start = line_num, .line_end = line_num });
+            try appendOutlineSymbol(a, outline, "locals", .struct_def, line_num, null);
         } else if (startsWith(line, "terraform ") or startsWith(line, "terraform{") or std.mem.eql(u8, line, "terraform")) {
-            const name_copy = try a.dupe(u8, "terraform");
-            errdefer a.free(name_copy);
-            try outline.symbols.append(a, .{ .name = name_copy, .kind = .struct_def, .line_start = line_num, .line_end = line_num });
+            try appendOutlineSymbol(a, outline, "terraform", .struct_def, line_num, null);
         }
     }
 
@@ -3748,12 +3887,8 @@ pub const Explorer = struct {
             const close = std.mem.indexOfScalar(u8, line[open..], ')') orelse return;
             const pkg = std.mem.trim(u8, line[open + 1 .. open + close], " \t\"'");
             if (pkg.len == 0) return;
-            const import_copy = try a.dupe(u8, pkg);
-            errdefer a.free(import_copy);
-            try outline.imports.append(a, import_copy);
-            const symbol_copy = try a.dupe(u8, line);
-            errdefer a.free(symbol_copy);
-            try outline.symbols.append(a, .{ .name = symbol_copy, .kind = .import, .line_start = line_num, .line_end = line_num });
+            try appendImportPath(a, outline, pkg);
+            try appendOutlineSymbol(a, outline, line, .import, line_num, null);
             return;
         }
 
@@ -3761,11 +3896,7 @@ pub const Explorer = struct {
         if (startsWith(line, "setClass(") or startsWith(line, "setRefClass(")) {
             const open = std.mem.indexOfScalar(u8, line, '(') orelse return;
             if (extractHclQuotedName(line[open + 1 ..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{ .name = name_copy, .kind = .class_def, .line_start = line_num, .line_end = line_num, .detail = detail_copy });
+                try appendOutlineSymbol(a, outline, name, .class_def, line_num, line);
             }
             return;
         }
@@ -3776,11 +3907,7 @@ pub const Explorer = struct {
             const name = std.mem.trim(u8, line[0..assign_pos], " \t");
             if (name.len == 0) return;
             if (!std.ascii.isAlphabetic(name[0]) and name[0] != '_' and name[0] != '.') return;
-            const name_copy = try a.dupe(u8, name);
-            errdefer a.free(name_copy);
-            const detail_copy = try a.dupe(u8, line);
-            errdefer a.free(detail_copy);
-            try outline.symbols.append(a, .{ .name = name_copy, .kind = .function, .line_start = line_num, .line_end = line_num, .detail = detail_copy });
+            try appendOutlineSymbol(a, outline, name, .function, line_num, line);
         }
     }
 
@@ -4133,6 +4260,32 @@ pub fn extractLines(content: []const u8, start: u32, end: u32, line_numbers: boo
     return aw.toOwnedSlice();
 }
 
+fn appendExtractedLines(
+    content: []const u8,
+    start: u32,
+    end: u32,
+    line_numbers: bool,
+    compact: bool,
+    language: Language,
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+) !void {
+    const w = cio.listWriter(out, allocator);
+    var line_num: u32 = 0;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        line_num += 1;
+        if (line_num < start) continue;
+        if (line_num > end) break;
+        if (compact and isCommentOrBlank(line, language)) continue;
+        if (line_numbers) {
+            try w.print("{d:>5} | {s}\n", .{ line_num, line });
+        } else {
+            try w.print("{s}\n", .{line});
+        }
+    }
+}
+
 /// Returns true if a line is blank or a single-line comment for the given language.
 pub fn isCommentOrBlank(line: []const u8, language: Language) bool {
     const trimmed = std.mem.trim(u8, line, " \t");
@@ -4150,6 +4303,41 @@ pub fn isCommentOrBlank(line: []const u8, language: Language) bool {
         .llvm_ir => std.mem.startsWith(u8, trimmed, ";"),
         else => false,
     };
+}
+
+fn appendTargetLineHits(
+    path: []const u8,
+    content: []const u8,
+    allocator: std.mem.Allocator,
+    target_lines: []const u32,
+    max_results: usize,
+    result_list: *std.ArrayList(SearchResult),
+) !void {
+    if (target_lines.len == 0 or result_list.items.len >= max_results) return;
+    result_list.ensureUnusedCapacity(allocator, @min(target_lines.len, max_results - result_list.items.len)) catch {};
+    var target_i: usize = 0;
+    var line_num: u32 = 0;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        line_num += 1;
+        while (target_i < target_lines.len and target_lines[target_i] < line_num) {
+            target_i += 1;
+        }
+        if (target_i >= target_lines.len) return;
+        if (target_lines[target_i] != line_num) continue;
+        target_i += 1;
+
+        const line_text = try allocator.dupe(u8, line);
+        errdefer allocator.free(line_text);
+        const path_copy = try allocator.dupe(u8, path);
+        errdefer allocator.free(path_copy);
+        try result_list.append(allocator, .{
+            .path = path_copy,
+            .line_num = line_num,
+            .line_text = line_text,
+        });
+        if (result_list.items.len >= max_results) return;
+    }
 }
 
 fn searchInContent(path: []const u8, content: []const u8, query: []const u8, allocator: std.mem.Allocator, max_per_file: usize, max_results: usize, result_list: *std.ArrayList(SearchResult)) !void {
@@ -4476,12 +4664,15 @@ fn appendOutlineSymbol(
     name: []const u8,
     kind: SymbolKind,
     line_num: u32,
-    detail: []const u8,
+    detail: ?[]const u8,
 ) !void {
     const name_copy = try allocator.dupe(u8, name);
     errdefer allocator.free(name_copy);
-    const detail_copy = try allocator.dupe(u8, detail);
-    errdefer allocator.free(detail_copy);
+    const detail_copy = if (detail) |d| blk: {
+        const copy = try allocator.dupe(u8, d);
+        break :blk copy;
+    } else null;
+    errdefer if (detail_copy) |d| allocator.free(d);
     try outline.symbols.append(allocator, .{
         .name = name_copy,
         .kind = kind,
@@ -4499,6 +4690,14 @@ fn appendImportSymbol(
     detail: []const u8,
 ) !void {
     try appendOutlineSymbol(allocator, outline, import_path, .import, line_num, detail);
+    try appendImportPath(allocator, outline, import_path);
+}
+
+fn appendImportPath(
+    allocator: std.mem.Allocator,
+    outline: *FileOutline,
+    import_path: []const u8,
+) !void {
     const import_copy = try allocator.dupe(u8, import_path);
     errdefer allocator.free(import_copy);
     try outline.imports.append(allocator, import_copy);
@@ -4894,7 +5093,9 @@ fn extractCFunctionName(line: []const u8, at_col0: bool, prev_trimmed: []const u
 
 fn countChar(s: []const u8, ch: u8) u32 {
     var n: u32 = 0;
-    for (s) |c| if (c == ch) { n += 1; };
+    for (s) |c| if (c == ch) {
+        n += 1;
+    };
     return n;
 }
 
@@ -4916,7 +5117,10 @@ fn countBracesDelta(line: []const u8) i32 {
             const q = ch;
             i += 1;
             while (i < line.len) : (i += 1) {
-                if (line[i] == '\\') { i += 1; continue; }
+                if (line[i] == '\\') {
+                    i += 1;
+                    continue;
+                }
                 if (line[i] == q) break;
             }
         } else if (ch == '{') {

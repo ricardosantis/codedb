@@ -8001,6 +8001,26 @@ test "issue-359: mcp.globMatch backtracks across **/* boundary" {
     try testing.expect(!mcp_mod.globMatch("docs/*.md", "src/mcp.zig"));
 }
 
+test "issue-511: glob supports brace alternatives" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    try explorer.indexFile(".github/workflows/release.yml", "name: release");
+    try explorer.indexFile("config.yaml", "name: app");
+    try explorer.indexFile("docs/readme.md", "# docs");
+
+    const matches = try explorer.globPaths(testing.allocator, "**/*.{yaml,yml}", 10);
+    defer testing.allocator.free(matches);
+
+    try testing.expectEqual(@as(usize, 2), matches.len);
+    try testing.expectEqualStrings(".github/workflows/release.yml", matches[0]);
+    try testing.expectEqualStrings("config.yaml", matches[1]);
+
+    try testing.expect(mcp_mod.globMatch("src/{mcp,explore}.zig", "src/mcp.zig"));
+    try testing.expect(mcp_mod.globMatch("src/{mcp,explore}.zig", "src/explore.zig"));
+    try testing.expect(!mcp_mod.globMatch("src/{mcp,explore}.zig", "src/main.zig"));
+}
+
 test "issue-359: globPaths recall — every matching path survives at every depth" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
@@ -10410,6 +10430,52 @@ test "issue-424-B: bundle falls through to inline args when arguments is empty o
     try testing.expect(std.mem.indexOf(u8, out.items, "received keys: []") == null);
 }
 
+test "issue-512: direct tools call accepts inline args when arguments is empty" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+    var telem = telemetry_mod.Telemetry.init(io, ".", testing.allocator, true);
+    defer telem.deinit();
+
+    const call_json =
+        \\{"params":{"name":"codedb_outline","arguments":{},"path":"src/main.zig"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, call_json, .{});
+    defer parsed.deinit();
+
+    const pipe = try cio.makePipe();
+    defer _ = std.c.close(pipe[0]);
+    defer _ = std.c.close(pipe[1]);
+
+    bench_ctx.runHandleCall(
+        io,
+        testing.allocator,
+        &parsed.value.object,
+        .{ .handle = pipe[1] },
+        std.json.Value{ .integer = 1 },
+        &store,
+        &explorer,
+        &agents,
+        &telem,
+    );
+
+    var response_buf: [16 * 1024]u8 = undefined;
+    const n = try std.posix.read(pipe[0], &response_buf);
+    const response = response_buf[0..n];
+
+    try testing.expect(std.mem.indexOf(u8, response, "src/main.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, response, "missing 'path'") == null);
+}
+
 test "issue-424-D: received-keys diagnostic hints at inline-args workaround when empty" {
     // When a sub-op fails with truly-empty args, the diagnostic should
     // point users at the inline-args fallback so a broken client wrapper
@@ -11618,4 +11684,3 @@ test "issue-471b: codedb_find error message enumerates accepted aliases" {
     try testing.expect(std.mem.indexOf(u8, out.items, "path") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "pattern") != null);
 }
-
