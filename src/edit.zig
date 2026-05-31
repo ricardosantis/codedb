@@ -133,7 +133,7 @@ pub fn applyEdit(
     // delimiter-balance scan so a mis-spliced multi-line edit (orphaned/
     // duplicated bracket) surfaces back to the agent instead of shipping a
     // file that no longer parses.
-    const health_msg = try describeHealth(allocator, result, detectLanguage(req.path));
+    const health_msg = try describeHealth(allocator, source, result, detectLanguage(req.path));
     errdefer if (health_msg) |h| allocator.free(h);
 
     if (req.dry_run) {
@@ -489,13 +489,149 @@ fn scanDelimiterBalance(content: []const u8, language: Language) ?Imbalance {
     return null;
 }
 
-/// Returns an owned advisory message when the edited content has a delimiter
-/// imbalance, else null. Caller frees. Pure helper — exposed for tests.
-pub fn describeHealth(allocator: std.mem.Allocator, content: []const u8, language: Language) !?[]u8 {
-    const imb = scanDelimiterBalance(content, language) orelse return null;
+fn formatImbalance(allocator: std.mem.Allocator, imb: Imbalance) ![]u8 {
     return switch (imb.kind) {
         .unmatched_close => try std.fmt.allocPrint(allocator, "\n⚠ syntax check: unmatched '{c}' at line {d} — this edit may have broken the file; re-read and verify before continuing.", .{ imb.found_char, imb.line }),
         .mismatched => try std.fmt.allocPrint(allocator, "\n⚠ syntax check: '{c}' at line {d} closes the wrong delimiter (open '{c}') — possible broken edit; re-read and verify.", .{ imb.found_char, imb.line, imb.open_char }),
         .unclosed_open => try std.fmt.allocPrint(allocator, "\n⚠ syntax check: '{c}' opened at line {d} is never closed — possible broken edit; re-read and verify.", .{ imb.open_char, imb.line }),
     };
+}
+
+// ── Dropped-import scan (P0b, trial/graph-based-codedb) ────────────────────
+//
+// The other half of the benchmark breakage: an edit that regenerates an import
+// block and drops a name that is still referenced — e.g. codedb's narwhals
+// patch removed `unstable` / `ExprNode` from a `from ... import (...)` while the
+// names were still used, a NameError at import (syntactically valid, so the
+// delimiter scan above cannot see it). Compare imports before vs after the edit
+// and flag any binding that was removed yet is still used in the file.
+
+const DroppedName = struct { name: []const u8, line: usize };
+
+fn isIdentByte(c: u8, first: bool) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or (!first and c >= '0' and c <= '9');
+}
+
+fn leadingIdent(s: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < s.len and isIdentByte(s[i], i == 0)) i += 1;
+    return s[0..i];
+}
+
+/// Add the names a Python import statement binds (handling `as` aliases and
+/// dotted modules) into `set`. `seg` is the text after `import`.
+fn addBoundNames(set: *std.StringHashMap(void), seg_in: []const u8, dotted: bool) !void {
+    var seg = seg_in;
+    if (std.mem.indexOfScalar(u8, seg, '#')) |h| seg = seg[0..h];
+    if (std.mem.indexOfScalar(u8, seg, ')')) |p| seg = seg[0..p];
+    var parts = std.mem.splitScalar(u8, seg, ',');
+    while (parts.next()) |part| {
+        const t = std.mem.trim(u8, part, " \t\r()");
+        if (t.len == 0) continue;
+        if (std.mem.indexOf(u8, t, " as ")) |ai| {
+            const id = leadingIdent(std.mem.trimStart(u8, t[ai + 4 ..], " \t\r"));
+            if (id.len > 0) try set.put(id, {});
+        } else if (dotted) {
+            // `import a.b.c` binds `a`; leadingIdent stops at '.'.
+            const id = leadingIdent(t);
+            if (id.len > 0) try set.put(id, {});
+        } else {
+            const id = leadingIdent(t);
+            if (id.len > 0) try set.put(id, {});
+        }
+    }
+}
+
+fn collectImportNames(content: []const u8, set: *std.StringHashMap(void)) !void {
+    var in_paren = false;
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (in_paren) {
+            try addBoundNames(set, line, false);
+            if (std.mem.indexOfScalar(u8, line, ')') != null) in_paren = false;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "from ")) {
+            const idx = std.mem.indexOf(u8, line, " import ") orelse continue;
+            const rest = line[idx + 8 ..];
+            const rest_trimmed = std.mem.trimStart(u8, rest, " \t\r");
+            if (std.mem.startsWith(u8, rest_trimmed, "*")) continue; // star import: untrackable
+            if (std.mem.indexOfScalar(u8, rest, '(') != null) {
+                try addBoundNames(set, rest, false);
+                if (std.mem.indexOfScalar(u8, rest, ')') == null) in_paren = true;
+            } else {
+                try addBoundNames(set, rest, false);
+            }
+        } else if (std.mem.startsWith(u8, line, "import ")) {
+            try addBoundNames(set, line[7..], true);
+        }
+    }
+}
+
+/// First line (1-based) where `name` is used as a whole word in `content`,
+/// ignoring comment lines and import lines. null if unused.
+fn firstUsageLine(content: []const u8, name: []const u8) ?usize {
+    var line: usize = 0;
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |raw| {
+        line += 1;
+        const st = std.mem.trim(u8, raw, " \t\r");
+        if (st.len > 0 and st[0] == '#') continue;
+        if (std.mem.startsWith(u8, st, "from ") or std.mem.startsWith(u8, st, "import ")) continue;
+        var idx: usize = 0;
+        while (std.mem.indexOfPos(u8, raw, idx, name)) |p| {
+            const before_ok = p == 0 or !isIdentByte(raw[p - 1], false);
+            const after_pos = p + name.len;
+            const after_ok = after_pos >= raw.len or !isIdentByte(raw[after_pos], false);
+            if (before_ok and after_ok) return line;
+            idx = p + 1;
+        }
+    }
+    return null;
+}
+
+/// Find an import binding removed by the edit that is still referenced in the
+/// new file. Python-only for now. The returned name slices into `after_src`.
+fn findDroppedImport(allocator: std.mem.Allocator, before: []const u8, after: []const u8, language: Language) !?DroppedName {
+    if (language != .python) return null;
+    var before_names = std.StringHashMap(void).init(allocator);
+    defer before_names.deinit();
+    var after_names = std.StringHashMap(void).init(allocator);
+    defer after_names.deinit();
+    try collectImportNames(before, &before_names);
+    try collectImportNames(after, &after_names);
+
+    var it = before_names.keyIterator();
+    while (it.next()) |k| {
+        const name = k.*;
+        if (after_names.contains(name)) continue; // re-imported elsewhere
+        if (firstUsageLine(after, name)) |ln| return .{ .name = name, .line = ln };
+    }
+    return null;
+}
+
+/// Returns an owned advisory message describing any post-edit health problem
+/// (unbalanced delimiter and/or a dropped-but-used import), or null when the
+/// edit looks structurally clean. Caller frees. Exposed for tests.
+pub fn describeHealth(allocator: std.mem.Allocator, before: []const u8, after: []const u8, language: Language) !?[]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    if (scanDelimiterBalance(after, language)) |imb| {
+        const m = try formatImbalance(allocator, imb);
+        defer allocator.free(m);
+        try buf.appendSlice(allocator, m);
+    }
+    if (findDroppedImport(allocator, before, after, language) catch null) |dropped| {
+        const m = try std.fmt.allocPrint(allocator, "\n⚠ import check: '{s}' was removed from the imports but is still used at line {d} — this edit likely breaks the module (NameError); re-add the import or revert.", .{ dropped.name, dropped.line });
+        defer allocator.free(m);
+        try buf.appendSlice(allocator, m);
+    }
+
+    if (buf.items.len == 0) {
+        buf.deinit(allocator);
+        return null;
+    }
+    return try buf.toOwnedSlice(allocator);
 }

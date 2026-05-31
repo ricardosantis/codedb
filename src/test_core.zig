@@ -395,7 +395,7 @@ test "edit-health: flags unmatched close from a mis-spliced import edit (httpx-s
         \\)
         \\x = 1
     ;
-    const msg = (try edit_mod.describeHealth(testing.allocator, broken, .python)).?;
+    const msg = (try edit_mod.describeHealth(testing.allocator, broken, broken, .python)).?;
     defer testing.allocator.free(msg);
     try testing.expect(std.mem.indexOf(u8, msg, "unmatched") != null);
     try testing.expect(std.mem.indexOf(u8, msg, "line 6") != null);
@@ -411,7 +411,7 @@ test "edit-health: flags an unclosed opener (orphaned signature, narwhals-style)
         \\:
         \\    return window_size
     ;
-    const msg = (try edit_mod.describeHealth(testing.allocator, broken, .python)).?;
+    const msg = (try edit_mod.describeHealth(testing.allocator, broken, broken, .python)).?;
     defer testing.allocator.free(msg);
     try testing.expect(std.mem.indexOf(u8, msg, "never closed") != null);
 }
@@ -424,13 +424,13 @@ test "edit-health: no false positive on balanced python with brackets in strings
         \\def g(n):
         \\    return [i for i in range(n)]
     ;
-    const msg = try edit_mod.describeHealth(testing.allocator, ok, .python);
+    const msg = try edit_mod.describeHealth(testing.allocator, ok, ok, .python);
     try testing.expect(msg == null);
 }
 
 test "edit-health: stays silent on non-code content (unknown language)" {
     const txt = "a note with ( an unbalanced paren which is perfectly fine\n";
-    const msg = try edit_mod.describeHealth(testing.allocator, txt, .unknown);
+    const msg = try edit_mod.describeHealth(testing.allocator, txt, txt, .unknown);
     try testing.expect(msg == null);
 }
 
@@ -493,6 +493,65 @@ test "edit-health: a clean python edit produces no warning (happy path unchanged
     });
     defer if (result.health) |h| testing.allocator.free(h);
     try testing.expect(result.health == null);
+}
+
+test "edit-health: flags an import name dropped but still used (narwhals NameError-style)" {
+    // Faithful to codedb's narwhals break: a name removed from a `from ... import`
+    // while still referenced. Syntactically valid, so only the import scan sees it.
+    const before =
+        \\from narwhals._utils import (
+        \\    no_default,
+        \\    unstable,
+        \\)
+        \\
+        \\@unstable
+        \\def rolling_min(): ...
+    ;
+    const after =
+        \\from narwhals._utils import (
+        \\    no_default,
+        \\)
+        \\
+        \\@unstable
+        \\def rolling_min(): ...
+    ;
+    const msg = (try edit_mod.describeHealth(testing.allocator, before, after, .python)).?;
+    defer testing.allocator.free(msg);
+    try testing.expect(std.mem.indexOf(u8, msg, "unstable") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "still used") != null);
+}
+
+test "edit-health: dropping an import that is no longer used is clean" {
+    const before =
+        \\from m import used, gone
+        \\
+        \\x = used()
+    ;
+    const after =
+        \\from m import used
+        \\
+        \\x = used()
+    ;
+    const msg = try edit_mod.describeHealth(testing.allocator, before, after, .python);
+    try testing.expect(msg == null);
+}
+
+test "edit-health: a name re-imported from another module is not flagged" {
+    // `helper` moves from module a to module b — removed from one import,
+    // added in another. It is still bound, so must not be flagged.
+    const before =
+        \\from a import helper, other
+        \\
+        \\y = helper()
+    ;
+    const after =
+        \\from a import other
+        \\from b import helper
+        \\
+        \\y = helper()
+    ;
+    const msg = try edit_mod.describeHealth(testing.allocator, before, after, .python);
+    try testing.expect(msg == null);
 }
 
 
