@@ -764,6 +764,47 @@ test "linter-pref: write then read round-trips on/off; missing file is unset" {
 }
 
 
+// ── Linter execution + output parsing (trial/graph-based-codedb) ──────────
+
+test "linter: installFor maps only ruff and biome; toolchain langs are null" {
+    try testing.expectEqualStrings("uv", linter.installFor(.python).?[0]);
+    try testing.expectEqualStrings("ruff", linter.installFor(.python).?[3]);
+    try testing.expectEqualStrings("npm", linter.installFor(.typescript).?[0]);
+    try testing.expect(linter.installFor(.zig) == null);
+    try testing.expect(linter.installFor(.go_lang) == null);
+}
+
+test "linter: summarizeRuffJson builds a summary and treats [] as clean" {
+    try testing.expect((try linter.summarizeRuffJson(testing.allocator, "[]")) == null);
+
+    const json =
+        \\[{"code":"F821","message":"Undefined name x","location":{"row":109,"column":5},"filename":"a.py"},
+        \\ {"code":"E501","message":"line too long","location":{"row":4,"column":1},"filename":"a.py"}]
+    ;
+    const msg = (try linter.summarizeRuffJson(testing.allocator, json)).?;
+    defer testing.allocator.free(msg);
+    try testing.expect(std.mem.indexOf(u8, msg, "ruff 2 issues") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "F821") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "L109") != null);
+}
+
+test "linter: summarizeBiomeJson uses categories and treats empty diagnostics as clean" {
+    try testing.expect((try linter.summarizeBiomeJson(testing.allocator, "{\"diagnostics\":[]}")) == null);
+
+    const json =
+        \\{"diagnostics":[{"category":"lint/correctness/noUndeclaredVariables"}]}
+    ;
+    const msg = (try linter.summarizeBiomeJson(testing.allocator, json)).?;
+    defer testing.allocator.free(msg);
+    try testing.expect(std.mem.indexOf(u8, msg, "biome 1 issue") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "noUndeclaredVariables") != null);
+}
+
+test "linter: runCheck errors NoLinter for a language with no registered tool" {
+    try testing.expectError(error.NoLinter, linter.runCheck(testing.allocator, .cpp, "/tmp/x.cpp"));
+}
+
+
 test "issue-101: Store.max_versions is configurable (caps per-file history)" {
     // Default cap is 100. After setting max_versions = 3, writing 5 versions
     // of the same file must leave exactly 3 in-memory.

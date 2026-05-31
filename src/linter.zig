@@ -140,3 +140,147 @@ pub fn toolOnPath(allocator: std.mem.Allocator, name: []const u8) bool {
     }
     return false;
 }
+
+// ── Execution + output parsing (Tier-1 run, off the hot path) ─────────────
+
+pub const RunError = error{ NoLinter, SpawnFailed, LinterCrashed, OutOfMemory };
+
+/// argv to install the linter for `language`, or null when it ships with a
+/// toolchain / has no one-shot installer. Static — nothing to free. Only the
+/// two recommended installable tools are returned (ruff, biome).
+pub fn installFor(language: Language) ?[]const []const u8 {
+    return switch (language) {
+        .python => &.{ "uv", "tool", "install", "ruff" },
+        .javascript, .typescript => &.{ "npm", "i", "-g", "@biomejs/biome" },
+        else => null,
+    };
+}
+
+fn plural(n: usize) []const u8 {
+    return if (n == 1) "" else "s";
+}
+
+fn clip(s: []const u8, max: usize) []const u8 {
+    return s[0..@min(s.len, max)];
+}
+
+fn appendFmt(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {
+    const s = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(s);
+    try buf.appendSlice(allocator, s);
+}
+
+fn strField(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = o.get(key) orelse return null;
+    return if (v == .string) v.string else null;
+}
+
+fn rowField(o: std.json.ObjectMap) i64 {
+    const loc = o.get("location") orelse return 0;
+    if (loc != .object) return 0;
+    const r = loc.object.get("row") orelse return 0;
+    return if (r == .integer) r.integer else 0;
+}
+
+fn firstLine(s: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, s, " \t\r\n");
+    const end = std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len;
+    return trimmed[0..end];
+}
+
+/// Summarize `ruff check --output-format json` output (a JSON array of
+/// diagnostics). Returns an owned one-line summary, or null when the array is
+/// empty (clean). Errors on malformed JSON. Pure — exposed for tests.
+pub fn summarizeRuffJson(allocator: std.mem.Allocator, stdout: []const u8) RunError!?[]u8 {
+    const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch return error.LinterCrashed;
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.LinterCrashed;
+    const items = parsed.value.array.items;
+    if (items.len == 0) return null;
+
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try appendFmt(allocator, &buf, "ruff {d} issue{s} -", .{ items.len, plural(items.len) });
+    const show = @min(items.len, 3);
+    var i: usize = 0;
+    while (i < show) : (i += 1) {
+        if (items[i] != .object) continue;
+        const o = items[i].object;
+        const code = strField(o, "code") orelse "?";
+        const msg = strField(o, "message") orelse "";
+        try appendFmt(allocator, &buf, " {s} {s} at L{d}{s}", .{ code, clip(msg, 48), rowField(o), if (i + 1 < show) "," else "" });
+    }
+    if (items.len > show) try appendFmt(allocator, &buf, " (+{d} more)", .{items.len - show});
+    return buf.toOwnedSlice(allocator) catch error.OutOfMemory;
+}
+
+/// Summarize `biome lint --reporter=json` output (an object with a
+/// `diagnostics` array). biome reports byte spans, not line numbers, so only
+/// the rule category is shown. null = clean. Pure — exposed for tests.
+pub fn summarizeBiomeJson(allocator: std.mem.Allocator, stdout: []const u8) RunError!?[]u8 {
+    const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch return error.LinterCrashed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.LinterCrashed;
+    const diags_v = parsed.value.object.get("diagnostics") orelse return null;
+    if (diags_v != .array) return error.LinterCrashed;
+    const items = diags_v.array.items;
+    if (items.len == 0) return null;
+
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try appendFmt(allocator, &buf, "biome {d} issue{s} -", .{ items.len, plural(items.len) });
+    const show = @min(items.len, 3);
+    var i: usize = 0;
+    while (i < show) : (i += 1) {
+        if (items[i] != .object) continue;
+        const cat = strField(items[i].object, "category") orelse "lint";
+        try appendFmt(allocator, &buf, " {s}{s}", .{ clip(cat, 60), if (i + 1 < show) "," else "" });
+    }
+    if (items.len > show) try appendFmt(allocator, &buf, " (+{d} more)", .{items.len - show});
+    return buf.toOwnedSlice(allocator) catch error.OutOfMemory;
+}
+
+/// Run the registered linter for `language` on `abs_path` and fold the result
+/// into a SHORT owned summary string, or null when the file is clean. Spawns a
+/// subprocess (via cio.runCapture, which itself uses a drain thread) — MUST be
+/// called off the synchronous edit path. Caller frees the returned slice and,
+/// on error, marks the language .unavailable in its LinterSession.
+pub fn runCheck(allocator: std.mem.Allocator, language: Language, abs_path: []const u8) RunError!?[]u8 {
+    const spec = linterFor(language) orelse return error.NoLinter;
+
+    var argv = allocator.alloc([]const u8, spec.check_args.len + 1) catch return error.OutOfMemory;
+    defer allocator.free(argv);
+    argv[0] = spec.tool;
+    for (spec.check_args, 0..) |a, i| {
+        argv[i + 1] = if (std.mem.eql(u8, a, FILE_TOKEN)) abs_path else a;
+    }
+
+    const res = cio.runCapture(.{ .allocator = allocator, .argv = argv, .max_output_bytes = 256 * 1024 }) catch return error.SpawnFailed;
+    defer allocator.free(res.stdout);
+    defer allocator.free(res.stderr);
+
+    // A linter killed by a signal (segfault/OOM) is .Signal/.Stopped — treat
+    // every non-.Exited outcome as a crash so the caller disables it.
+    const code: u8 = switch (res.term) {
+        .Exited => |c| c,
+        else => return error.LinterCrashed,
+    };
+
+    if (spec.json) {
+        if (std.mem.eql(u8, spec.tool, "ruff")) {
+            // ruff: 0 = clean, 1 = violations, >=2 = usage/internal error.
+            if (code >= 2 and std.mem.trim(u8, res.stdout, " \t\r\n").len == 0) return error.LinterCrashed;
+            return summarizeRuffJson(allocator, res.stdout);
+        }
+        return summarizeBiomeJson(allocator, res.stdout);
+    }
+
+    // Exit-code tools (zig ast-check, gofmt -e, ruby -c, php -l): 0 = clean.
+    if (code == 0) return null;
+    const line = firstLine(if (res.stderr.len > 0) res.stderr else res.stdout);
+    return std.fmt.allocPrint(allocator, "{s} check failed - {s}", .{ spec.tool, clip(line, 120) }) catch error.OutOfMemory;
+}
