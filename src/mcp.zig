@@ -2370,10 +2370,12 @@ fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
     // declaring the task done, instead of shipping an unparseable file.
     if (result.health) |h| out.appendSlice(alloc, h) catch {};
 
-    // External-linter (Tier-1): on a real write, piggyback any cached
-    // diagnostics for this exact content, then kick a linter off the hot path
-    // for the new content (no-op unless the user opted in and a tool exists).
-    if (!req.dry_run) {
+    // External-linter (Tier-1): only when the user opted in. `enabled` is set
+    // once at startup and read-only after, so this guard adds nothing to the
+    // edit hot path when linters are off (the default) — no cache lock, no
+    // detect, no thread spawn. When on, the linter runs on a DETACHED thread
+    // after this response is built, so it never adds latency to the edit.
+    if (!req.dry_run and cache.linter.enabled) {
         _ = cache.diag.appendIfFresh(alloc, out, path, result.new_hash);
         const lang = explore_mod.detectLanguage(path);
         if (cache.linter.shouldTry(lang) and cache.diag.tryBeginWork(path, result.new_hash)) {
