@@ -197,6 +197,15 @@ pub fn posixGetenv(name: []const u8) ?[]const u8 {
     return std.mem.span(ptr);
 }
 
+/// Read one line from stdin (fd 0) into `buf`, trimming trailing CR/LF. Returns
+/// null on EOF/error. For interactive CLI prompts only — NEVER call this in the
+/// MCP server path, where stdin is the JSON-RPC transport.
+pub fn readLine(buf: []u8) ?[]const u8 {
+    const n = read(0, buf.ptr, buf.len);
+    if (n <= 0) return null;
+    return std.mem.trimEnd(u8, buf[0..@intCast(n)], "\r\n");
+}
+
 // ── Arguments ────────────────────────────────────────────────────────────
 
 // Darwin: argv lives in __NSGetArgv() (libc, from <crt_externs.h>).

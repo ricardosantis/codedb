@@ -804,6 +804,14 @@ test "linter: runCheck errors NoLinter for a language with no registered tool" {
     try testing.expectError(error.NoLinter, linter.runCheck(testing.allocator, .cpp, "/tmp/x.cpp"));
 }
 
+test "linter: the interactive prompt entrypoint compiles (analysis guard)" {
+    // maybePromptAndInstall is reached only from the exe (update.zig), so the
+    // test build would otherwise skip analysing it (Zig is lazy). Reference it
+    // so a compile error there fails `zig build test`, not just the CLI build.
+    _ = &linter.maybePromptAndInstall;
+    _ = &cio.readLine;
+}
+
 
 test "issue-101: Store.max_versions is configurable (caps per-file history)" {
     // Default cap is 100. After setting max_versions = 3, writing 5 versions

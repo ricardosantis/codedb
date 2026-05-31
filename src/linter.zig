@@ -21,6 +21,7 @@
 const std = @import("std");
 const Language = @import("explore.zig").Language;
 const cio = @import("cio.zig");
+const linter_pref = @import("linter_pref.zig");
 
 // std.fs / std.posix are not available in this Io-based build, so use libc
 // access(2) directly for the PATH probe (libc is already linked; see cio.zig).
@@ -283,4 +284,61 @@ pub fn runCheck(allocator: std.mem.Allocator, language: Language, abs_path: []co
     if (code == 0) return null;
     const line = firstLine(if (res.stderr.len > 0) res.stderr else res.stdout);
     return std.fmt.allocPrint(allocator, "{s} check failed - {s}", .{ spec.tool, clip(line, 120) }) catch error.OutOfMemory;
+}
+
+// ── Install / update-time opt-in prompt (interactive CLI only) ────────────
+
+fn installToolIfMissing(allocator: std.mem.Allocator, out: cio.File, name: []const u8, argv_opt: ?[]const []const u8) void {
+    if (toolOnPath(allocator, name)) {
+        out.print("  {s}: already installed\n", .{name}) catch {};
+        return;
+    }
+    const argv = argv_opt orelse return;
+    if (!toolOnPath(allocator, argv[0])) {
+        out.print("  {s}: skipped ({s} not found — install it, then re-run `codedb update`)\n", .{ name, argv[0] }) catch {};
+        return;
+    }
+    out.print("  installing {s} via {s} (this may take a moment)...\n", .{ name, argv[0] }) catch {};
+    const res = cio.runCapture(.{ .allocator = allocator, .argv = argv, .max_output_bytes = 256 * 1024 }) catch {
+        out.print("  {s}: install failed (could not run {s})\n", .{ name, argv[0] }) catch {};
+        return;
+    };
+    defer allocator.free(res.stdout);
+    defer allocator.free(res.stderr);
+    const ok = switch (res.term) {
+        .Exited => |c| c == 0,
+        else => false,
+    };
+    out.print("  {s}: {s}\n", .{ name, if (ok) "installed" else "install failed" }) catch {};
+}
+
+/// Interactive opt-in for the external-linter bridge, run from the CLI install /
+/// `codedb update` path. No-op unless BOTH stdin and stdout are TTYs (so it never
+/// fires in the MCP server, CI, or a curl|bash pipe) and the preference is still
+/// unset (asked at most once; the remembered choice is respected thereafter).
+/// On yes: installs ruff + biome if missing and records the preference; on no:
+/// records the decline. Best-effort — never fails the caller.
+pub fn maybePromptAndInstall(io: std.Io, allocator: std.mem.Allocator) void {
+    if (!cio.File.stdin().isTty() or !cio.File.stdout().isTty()) return;
+    if (linter_pref.read(io, allocator) != .unset) return;
+
+    const out = cio.File.stdout();
+    out.print("\ncodedb can run fast linters (ruff for Python, biome for JS/TS, ...) after edits\nto catch real errors (undefined names, type/lint issues) on top of its built-in\nchecks. Install the recommended linters now? [y/N] ", .{}) catch return;
+
+    var buf: [64]u8 = undefined;
+    const line = cio.readLine(&buf) orelse {
+        linter_pref.write(io, allocator, .off);
+        return;
+    };
+    const yes = line.len > 0 and (line[0] == 'y' or line[0] == 'Y');
+    if (!yes) {
+        out.print("Skipping — codedb will use its built-in heuristics. Re-run `codedb update` to change.\n", .{}) catch {};
+        linter_pref.write(io, allocator, .off);
+        return;
+    }
+
+    installToolIfMissing(allocator, out, "ruff", installFor(.python));
+    installToolIfMissing(allocator, out, "biome", installFor(.javascript));
+    linter_pref.write(io, allocator, .on);
+    out.print("Enabled. codedb will run available linters after edits (built-in checks always run).\n", .{}) catch {};
 }
