@@ -19,6 +19,7 @@
 //! return null here and simply use the heuristics.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Language = @import("explore.zig").Language;
 const cio = @import("cio.zig");
 const linter_pref = @import("linter_pref.zig");
@@ -153,6 +154,16 @@ pub fn toolOnPath(allocator: std.mem.Allocator, name: []const u8) bool {
         if (access(cpath, X_OK) == 0) return true;
     }
     return false;
+}
+
+/// Path to a usable nanobrew (`nb`), or null. nanobrew is justrach's fast Zig
+/// package manager (installs Homebrew bottles in ~1s; macOS + Linux). Checks
+/// PATH first, then the canonical install location — its installer only adds
+/// that to PATH for new shells, so a freshly-installed nb is found here too.
+pub fn nanobrewPath(allocator: std.mem.Allocator) ?[]const u8 {
+    if (toolOnPath(allocator, "nb")) return "nb";
+    if (access("/opt/nanobrew/prefix/bin/nb", X_OK) == 0) return "/opt/nanobrew/prefix/bin/nb";
+    return null;
 }
 
 // ── Execution + output parsing (Tier-1 run, off the hot path) ─────────────
@@ -350,10 +361,61 @@ pub fn maybePromptAndInstall(io: std.Io, allocator: std.mem.Allocator) void {
         return;
     }
 
-    installToolIfMissing(allocator, out, "ruff", installFor(.python));
-    installToolIfMissing(allocator, out, "biome", installFor(.javascript));
+    installLinters(allocator, out);
     linter_pref.write(io, allocator, .on);
     out.print("Enabled. codedb will run available linters after edits (built-in checks always run).\n", .{}) catch {};
+}
+
+/// Install the recommended linters. Prefers nanobrew (justrach's fast Zig
+/// package manager) when present; on macOS/Linux, if it is absent, ASKS once
+/// whether to install it (with a one-line reason) and uses it on yes; otherwise
+/// falls back to the per-tool installers (uv for ruff, npm for biome).
+fn installLinters(allocator: std.mem.Allocator, out: cio.File) void {
+    var nb = nanobrewPath(allocator);
+
+    if (nb == null and (builtin.os.tag == .macos or builtin.os.tag == .linux)) {
+        out.print("\nnanobrew (a fast Zig package manager) can fetch the linters as prebuilt\nbinaries in about a second. Install nanobrew to use it? [y/N] ", .{}) catch {};
+        var b2: [64]u8 = undefined;
+        if (cio.readLine(&b2)) |l2| {
+            if (l2.len > 0 and (l2[0] == 'y' or l2[0] == 'Y')) {
+                out.print("  installing nanobrew...\n", .{}) catch {};
+                if (cio.runCapture(.{ .allocator = allocator, .argv = &.{ "sh", "-c", "curl -fsSL https://nanobrew.trilok.ai/install | bash" }, .max_output_bytes = 1024 * 1024 })) |res| {
+                    allocator.free(res.stdout);
+                    allocator.free(res.stderr);
+                } else |_| {}
+                nb = nanobrewPath(allocator);
+                if (nb != null) {
+                    out.print("  nanobrew: ready\n", .{}) catch {};
+                } else {
+                    out.print("  nanobrew: unavailable — using fallback installers\n", .{}) catch {};
+                }
+            }
+        }
+    }
+
+    if (nb) |nbpath| {
+        out.print("  installing linters via nanobrew: ruff, biome...\n", .{}) catch {};
+        if (cio.runCapture(.{ .allocator = allocator, .argv = &.{ nbpath, "install", "ruff", "biome" }, .max_output_bytes = 1024 * 1024 })) |res| {
+            defer allocator.free(res.stdout);
+            defer allocator.free(res.stderr);
+            const ok = switch (res.term) {
+                .Exited => |c| c == 0,
+                else => false,
+            };
+            if (ok) {
+                out.print("  linters: installed via nanobrew\n", .{}) catch {};
+            } else {
+                out.print("  linters: nanobrew reported errors (codedb will use whatever is present)\n", .{}) catch {};
+            }
+        } else |_| {
+            out.print("  linters: nanobrew run failed — falling back\n", .{}) catch {};
+            installToolIfMissing(allocator, out, "ruff", installFor(.python));
+            installToolIfMissing(allocator, out, "biome", installFor(.javascript));
+        }
+    } else {
+        installToolIfMissing(allocator, out, "ruff", installFor(.python));
+        installToolIfMissing(allocator, out, "biome", installFor(.javascript));
+    }
 }
 
 // ── Diagnostics cache (off-hot-path results, delivered out of band) ───────

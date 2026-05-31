@@ -809,6 +809,7 @@ test "linter: the interactive prompt entrypoint compiles (analysis guard)" {
     // test build would otherwise skip analysing it (Zig is lazy). Reference it
     // so a compile error there fails `zig build test`, not just the CLI build.
     _ = &linter.maybePromptAndInstall;
+    _ = &linter.nanobrewPath;
     _ = &cio.readLine;
 }
 
