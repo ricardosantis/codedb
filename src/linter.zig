@@ -109,21 +109,33 @@ pub const LinterSession = struct {
     /// declined (or hasn't opted in), this stays false and codedb uses only the
     /// Tier-0 heuristics — the edit path carries zero linter cost.
     enabled: bool = false,
+    /// Guards `statuses`: the main thread reads via shouldTry()/status() while a
+    /// detached worker writes via mark(). `enabled` is set once at startup and
+    /// then read-only, so it needs no lock.
+    mu: cio.Mutex = .{},
     statuses: std.EnumArray(Language, LinterStatus) = std.EnumArray(Language, LinterStatus).initFill(.unknown),
 
-    pub fn status(self: *const LinterSession, language: Language) LinterStatus {
+    pub fn status(self: *LinterSession, language: Language) LinterStatus {
+        self.mu.lock();
+        defer self.mu.unlock();
         return self.statuses.get(language);
     }
 
     pub fn mark(self: *LinterSession, language: Language, s: LinterStatus) void {
+        self.mu.lock();
+        defer self.mu.unlock();
         self.statuses.set(language, s);
     }
 
     /// True if we should attempt the external linter for `language`: the user
     /// opted in, the language has a registered tool, and it has not already been
     /// ruled out this session (missing/failed/crashed -> naive heuristics).
-    pub fn shouldTry(self: *const LinterSession, language: Language) bool {
-        return self.enabled and linterFor(language) != null and self.statuses.get(language) != .unavailable;
+    pub fn shouldTry(self: *LinterSession, language: Language) bool {
+        if (!self.enabled) return false;
+        if (linterFor(language) == null) return false;
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.statuses.get(language) != .unavailable;
     }
 };
 

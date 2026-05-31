@@ -17,6 +17,8 @@ const AgentRegistry = @import("agent.zig").AgentRegistry;
 const snapshot_json = @import("snapshot_json.zig");
 const watcher = @import("watcher.zig");
 const edit_mod = @import("edit.zig");
+const linter_mod = @import("linter.zig");
+const linter_pref = @import("linter_pref.zig");
 const idx = @import("index.zig");
 const snapshot_mod = @import("snapshot.zig");
 const telemetry_mod = @import("telemetry.zig");
@@ -233,6 +235,12 @@ const ProjectCache = struct {
     default_path: []const u8,
     default_snapshot_cache: SnapshotCache,
     content_cache_capacity: u32,
+    // External-linter state for this connection (trial/graph-based-codedb).
+    // LinterSession.enabled is seeded from the persisted preference in run().
+    // The diagnostics cache uses c_allocator (malloc, thread-safe) because a
+    // detached worker thread writes to it off the request path.
+    linter: linter_mod.LinterSession = .{},
+    diag: linter_mod.DiagnosticsCache,
 
     fn init(alloc_: std.mem.Allocator, default_path_: []const u8, content_cache_capacity_: u32) ProjectCache {
         return .{
@@ -242,10 +250,14 @@ const ProjectCache = struct {
             .default_path = default_path_,
             .default_snapshot_cache = .{},
             .content_cache_capacity = content_cache_capacity_,
+            .linter = .{},
+            .diag = linter_mod.DiagnosticsCache.init(std.heap.c_allocator),
         };
     }
 
     fn deinit(self: *ProjectCache) void {
+        // Drain in-flight linter workers BEFORE freeing anything they touch.
+        self.diag.deinit();
         self.default_snapshot_cache.deinit(self.alloc);
         for (&self.entries) |*slot| {
             if (slot.*) |entry| {
@@ -496,6 +508,7 @@ pub const Tool = enum {
     codedb_glob,
     codedb_ls,
     codedb_context,
+    codedb_diagnostics,
 };
 
 pub const tools_list =
@@ -507,6 +520,7 @@ pub const tools_list =
     \\{"name":"codedb_word","description":"Exact-identifier lookup via inverted index — every occurrence of one word, O(1). Use for single identifiers; use codedb_search for substrings or phrases.","inputSchema":{"type":"object","properties":{"word":{"type":"string","description":"Exact word/identifier to look up"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["word"]}},
     \\{"name":"codedb_callers","description":"Find every call site of a named symbol — fuses word-index occurrences with outline scope info. One round-trip vs codedb_word + codedb_outline-per-file. Returns {path, line, snippet, scope_name, scope_kind, scope_lines}. Excludes the symbol's own definition site.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (exact identifier match)"},"max_results":{"type":"integer","description":"Maximum call sites to return (default: 30, raise for hot symbols)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
     \\{"name":"codedb_context","description":"Task-shaped composer: pass a natural-language task; returns ONE tight block (keywords used + symbol definitions + ranked files + top file:line snippets). Replaces 3-5 sequential search/word/symbol calls — use for first-touch orientation on a new task. For narrow follow-ups stick with codedb_search/codedb_symbol.","inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Natural-language task description (3-1024 chars). Include candidate identifiers (camelCase / snake_case) or \"quoted strings\" so the composer can extract keywords."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["task"]}},
+    \\{"name":"codedb_diagnostics","description":"Fetch the latest linter diagnostics for a file, produced off the edit path (ruff/biome/etc.) after a recent codedb_edit. Call right after an edit to surface real errors the change may have introduced (undefined names, type/lint issues) on top of codedb's built-in checks. Returns 'no diagnostics available yet' when none are cached or external linters are disabled.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to fetch diagnostics for"}},"required":["path"]}},
     \\{"name":"codedb_hot","description":"Most recently modified files in the project, newest first.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","description":"Number of files to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_deps","description":"Dependency graph: who imports a file (default) or what a file imports (direction=depends_on). Set transitive=true for the full BFS blast radius.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to check dependencies for"},"direction":{"type":"string","enum":["imported_by","depends_on"],"description":"imported_by (default): who imports this file. depends_on: what this file imports."},"transitive":{"type":"boolean","description":"Follow dependency chain transitively (default: false)"},"max_depth":{"type":"integer","description":"Max traversal depth for transitive queries (default: unlimited)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
     \\{"name":"codedb_read","description":"Read file contents, optionally a line range. Run codedb_outline first to pick the range — large files burn tokens fast. Pass if_hash to skip re-reads when the file is unchanged.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"line_start":{"type":"integer","description":"Start line (1-indexed, inclusive). Omit for full file."},"line_end":{"type":"integer","description":"End line (1-indexed, inclusive). Omit to read to EOF."},"if_hash":{"type":"string","description":"Previous content hash. If unchanged, returns short 'unchanged:HASH' response."},"compact":{"type":"boolean","description":"Skip comment and blank lines (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
@@ -742,6 +756,9 @@ pub fn run(
 
     var cache = ProjectCache.init(alloc, default_path, content_cache_capacity);
     defer cache.deinit();
+    // Seed the external-linter opt-in from the persisted preference. The server
+    // never prompts/installs — that happens at install / `codedb update` time.
+    cache.linter.enabled = linter_pref.enabledFromPref(linter_pref.read(io, alloc));
 
     // Build the `tools/list` payload. The discriminated `oneOf` on the
     // codedb_bundle ops items (issue #437) is incompatible with OpenAI's
@@ -1145,7 +1162,7 @@ fn dispatch(
         .codedb_hot => handleHot(alloc, args, out, ctx.store, ctx.explorer),
         .codedb_deps => handleDeps(alloc, args, out, ctx.explorer),
         .codedb_read => handleRead(io, alloc, args, out, ctx.explorer),
-        .codedb_edit => handleEdit(io, alloc, args, out, default_store, default_explorer, agents),
+        .codedb_edit => handleEdit(io, alloc, args, out, default_store, default_explorer, agents, cache),
         .codedb_changes => handleChanges(alloc, args, out, default_store),
         .codedb_status => handleStatus(alloc, out, ctx.store, ctx.explorer),
         .codedb_snapshot => handleSnapshot(alloc, out, ctx.explorer, ctx.store, ctx.snapshot_cache),
@@ -1158,6 +1175,7 @@ fn dispatch(
         .codedb_glob => handleGlob(alloc, args, out, ctx.explorer),
         .codedb_ls => handleLs(alloc, args, out, ctx.explorer),
         .codedb_context => handleContext(io, alloc, args, out, ctx.explorer, project_path orelse cache.default_path),
+        .codedb_diagnostics => handleDiagnostics(alloc, args, out, cache),
     }
     appendScanProgressHint(alloc, out, tool);
 }
@@ -2264,7 +2282,7 @@ fn handleRead(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
     }
 }
 
-fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer, agents: *AgentRegistry) void {
+fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer, agents: *AgentRegistry, cache: *ProjectCache) void {
     const path = getStr(args, "path") orelse {
         out.appendSlice(alloc, "error: missing 'path'") catch {};
         return;
@@ -2351,6 +2369,89 @@ fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
     // mis-spliced multi-line edit so the agent can re-read and fix before
     // declaring the task done, instead of shipping an unparseable file.
     if (result.health) |h| out.appendSlice(alloc, h) catch {};
+
+    // External-linter (Tier-1): on a real write, piggyback any cached
+    // diagnostics for this exact content, then kick a linter off the hot path
+    // for the new content (no-op unless the user opted in and a tool exists).
+    if (!req.dry_run) {
+        _ = cache.diag.appendIfFresh(alloc, out, path, result.new_hash);
+        const lang = explore_mod.detectLanguage(path);
+        if (cache.linter.shouldTry(lang) and cache.diag.tryBeginWork(path, result.new_hash)) {
+            spawnLintWorker(cache, path, result.new_hash, lang);
+        }
+    }
+}
+
+// ── External-linter worker (runs off the synchronous edit path) ───────────
+
+const LintJob = struct {
+    cache: *ProjectCache,
+    path: []u8, // owned (c_allocator); freed by run()
+    hash: u64,
+    language: explore_mod.Language,
+
+    fn run(job: *LintJob) void {
+        const ca = std.heap.c_allocator;
+        defer {
+            ca.free(job.path);
+            ca.destroy(job);
+        }
+        const summary = linter_mod.runCheck(ca, job.language, job.path) catch {
+            // Tool missing / crashed: disable this language for the session,
+            // then clear the in-flight mark. mark() MUST precede endWork() so
+            // the cache (and session) are still alive — endWork drops the
+            // inflight count the owner drains on before freeing them.
+            job.cache.linter.mark(job.language, .unavailable);
+            job.cache.diag.endWork(job.path);
+            return;
+        };
+        if (summary) |s| {
+            defer ca.free(s);
+            job.cache.diag.store(job.path, job.hash, s); // clears in-flight
+        } else {
+            job.cache.diag.endWork(job.path); // clean file: nothing to store
+        }
+    }
+};
+
+/// Spawn a detached linter worker for (path, hash). Caller has already reserved
+/// the slot via cache.diag.tryBeginWork(); on any failure here we must release
+/// it with endWork() so the in-flight count cannot leak.
+fn spawnLintWorker(cache: *ProjectCache, path: []const u8, hash: u64, language: explore_mod.Language) void {
+    const ca = std.heap.c_allocator;
+    const pdup = ca.dupe(u8, path) catch {
+        cache.diag.endWork(path);
+        return;
+    };
+    const job = ca.create(LintJob) catch {
+        ca.free(pdup);
+        cache.diag.endWork(path);
+        return;
+    };
+    job.* = .{ .cache = cache, .path = pdup, .hash = hash, .language = language };
+    const t = std.Thread.spawn(.{}, LintJob.run, .{job}) catch {
+        ca.free(pdup);
+        ca.destroy(job);
+        cache.diag.endWork(path);
+        return;
+    };
+    t.detach();
+}
+
+fn handleDiagnostics(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), cache: *ProjectCache) void {
+    const path = getStr(args, "path") orelse {
+        out.appendSlice(alloc, "error: missing 'path' argument") catch {};
+        return;
+    };
+    if (!isPathSafe(path)) {
+        out.appendSlice(alloc, "error: path traversal not allowed") catch {};
+        return;
+    }
+    if (!cache.diag.appendLatest(alloc, out, path)) {
+        out.appendSlice(alloc, "no diagnostics available yet for ") catch {};
+        out.appendSlice(alloc, path) catch {};
+        out.appendSlice(alloc, " (linters run shortly after an edit; retry, or they may be disabled — `codedb update` to enable)") catch {};
+    }
 }
 
 fn handleChanges(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store) void {
