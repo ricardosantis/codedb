@@ -74,7 +74,7 @@
 curl -fsSL https://codedb.codegraff.com/install.sh | bash
 ```
 
-Downloads the binary for your platform and auto-registers codedb as an MCP server in **Claude Code**, **Codex**, **Gemini CLI**, and **Cursor** directly, plus **Windsurf** and **Devin** via [mcpsync](https://github.com/justrach/mcpsync) (auto-installed if missing; tools that aren't installed are skipped). The installer prints the exact `codedb mcp` command it registered plus hook setup pointers for Codex and Claude Code.
+Downloads the binary for your platform and auto-registers codedb as an MCP server in **Claude Code**, **Codex**, **Gemini CLI**, **Cursor**, **Windsurf**, and **Devin** — each written directly and additively into that tool's config (only when the tool is present). The installer prints the exact `codedb mcp` command it registered plus hook setup pointers for Codex and Claude Code.
 
 ### Or via npm/npx (zero-install for MCP clients)
 
