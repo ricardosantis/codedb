@@ -831,6 +831,7 @@ pub const Explorer = struct {
         var in_string: u8 = 0; // 0=none, '"', '\''
         var in_triple_quote: u8 = 0; // 0=none, '"', '\''
         var interp_depth: i32 = 0;
+        var paren_depth: i32 = 0; // params/types before the body brace
         var in_line_comment = false;
         var in_block_comment = false;
         var i = start_idx;
@@ -843,7 +844,7 @@ pub const Explorer = struct {
                 current_line += 1;
                 in_line_comment = false;
                 // Bail out if no opening brace found within 10 lines
-                if (!found_open and current_line > line_start + 10) return line_start;
+                if (!found_open and current_line > line_start + 24) return line_start;
                 continue;
             }
 
@@ -913,13 +914,24 @@ pub const Explorer = struct {
                 continue;
             }
 
-            if (c == '{') {
-                depth += 1;
-                found_open = true;
+            if (c == '(') {
+                if (!found_open) paren_depth += 1;
+            } else if (c == ')') {
+                if (!found_open and paren_depth > 0) paren_depth -= 1;
+            } else if (c == '{') {
+                // Before the body opens, only a brace at paren-depth 0 is the
+                // body brace; braces inside the parameter list (inline object
+                // types, default values) must be ignored, or a multi-line
+                // signature gets a wrongly-short line_end. Once found_open, count
+                // every brace so the body balances correctly.
+                if (found_open or paren_depth == 0) {
+                    depth += 1;
+                    found_open = true;
+                }
             } else if (c == '}') {
-                depth -= 1;
-                if (found_open and depth == 0) {
-                    return @min(current_line, total_lines);
+                if (found_open) {
+                    depth -= 1;
+                    if (depth == 0) return @min(current_line, total_lines);
                 }
             }
         }
@@ -1377,6 +1389,96 @@ pub const Explorer = struct {
             }
         }
         return true;
+    }
+
+    /// Signature-only "skeleton" view: each symbol's declaration line with its
+    /// body elided as "{ … N lines }". A large file collapses to ~one line per
+    /// symbol — lossless at the API surface, so an agent can grasp a file's
+    /// shape cheaply and codedb_read a range to expand a body. Mirrors
+    /// renderOutline's locking and header. Returns false when not indexed.
+    pub fn renderSkeleton(
+        self: *Explorer,
+        path: []const u8,
+        alloc: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+    ) !bool {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        const outline = self.outlines.getPtr(path) orelse return false;
+        const ref_opt = self.readContentForSearch(path, alloc);
+        defer if (ref_opt) |r| r.deinit();
+        const content: []const u8 = if (ref_opt) |r| r.data else "";
+
+        // One pass to record the byte offset of each line start (line 1 → offsets[0]).
+        var offsets: std.ArrayList(usize) = .empty;
+        defer offsets.deinit(alloc);
+        try offsets.append(alloc, 0);
+        for (content, 0..) |ch, i| {
+            if (ch == '\n') try offsets.append(alloc, i + 1);
+        }
+
+        try out.ensureUnusedCapacity(alloc, 128 + outline.symbols.items.len * 96);
+        const w = cio.listWriter(out, alloc);
+        w.print("{s} ({s}, {d} lines, {d} bytes)\n", .{
+            outline.path, @tagName(outline.language), outline.line_count, outline.byte_size,
+        }) catch {};
+
+        const body_start = out.items.len;
+        var covered_until: u32 = 0;
+        var elided: u32 = 0;
+        for (outline.symbols.items) |sym| {
+            // Skip symbols nested inside an already-emitted symbol's body — a
+            // skeleton shows the file's top-level shape, with bodies (and the
+            // local declarations inside them) elided.
+            if (sym.line_start <= covered_until) continue;
+            covered_until = @max(covered_until, sym.line_end);
+            const first = lineSlice(content, offsets.items, sym.line_start);
+            const sig = std.mem.trim(u8, first, " \t\r");
+            // Single-line symbol (imports, consts, one-liners) or no source: keep verbatim.
+            if (sym.line_end <= sym.line_start or sig.len == 0) {
+                if (sig.len == 0) {
+                    w.print("  L{d}: {s} {s}\n", .{ sym.line_start, @tagName(sym.kind), sym.name }) catch {};
+                } else {
+                    w.print("  L{d}: {s}\n", .{ sym.line_start, sig }) catch {};
+                }
+                continue;
+            }
+            const hidden = sym.line_end - sym.line_start;
+            elided += 1;
+            if (std.mem.indexOfScalar(u8, sig, '{')) |bpos| {
+                // Brace body opens on the declaration line: keep up to and including '{', stub the rest.
+                w.print("  L{d}: {s} … {d} lines }}\n", .{ sym.line_start, sig[0 .. bpos + 1], hidden }) catch {};
+            } else {
+                // No brace on the first line (Python ':' / multi-line signature).
+                w.print("  L{d}: {s} … {d} lines\n", .{ sym.line_start, sig, hidden }) catch {};
+            }
+        }
+        // Escalation footer — skeleton fails safe by eliding bodies, so tell
+        // the model exactly how to recover when it isn't enough.
+        const skel_bytes = out.items.len - body_start;
+        const full_bytes: usize = @intCast(outline.byte_size);
+        if (elided == 0) {
+            w.print("— skeleton: all symbols shown inline · codedb_read {s} for source · codedb_outline {s} for members\n", .{ outline.path, outline.path }) catch {};
+        } else if (full_bytes == 0 or skel_bytes * 2 >= full_bytes) {
+            w.print("— skeleton: {d} bodies elided; small file ({d}B) · codedb_read {s} for full source · codedb_outline {s} for members\n", .{ elided, full_bytes, outline.path, outline.path }) catch {};
+        } else {
+            const saved = 100 - (skel_bytes * 100 / full_bytes);
+            w.print("— skeleton: {d} bodies elided (~{d}% smaller than {d}B) · expand a body: codedb_read {s} -L <start>-<end> · members: codedb_outline {s}\n", .{ elided, saved, full_bytes, outline.path, outline.path }) catch {};
+        }
+        return true;
+    }
+
+    /// Byte slice of 1-indexed `line` from `content`, given precomputed line
+    /// start offsets. Returns empty when out of range.
+    fn lineSlice(content: []const u8, offsets: []const usize, line: u32) []const u8 {
+        if (line == 0 or line > offsets.len) return "";
+        const start = offsets[line - 1];
+        if (start > content.len) return "";
+        const end = if (line < offsets.len) offsets[line] -| 1 else content.len;
+        const e = @min(end, content.len);
+        if (e < start) return "";
+        return content[start..e];
     }
 
     /// Return a caller-owned copy of cached file content.

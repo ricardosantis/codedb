@@ -1941,3 +1941,63 @@ test "issue-208: content cache evicts cold entries under pressure" {
     try testing.expect(s.evictions > 0);
 }
 
+
+
+test "explorer: renderSkeleton elides bodies, keeps signatures" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    try explorer.indexFile("sk.zig",
+        \\const std = @import("std");
+        \\pub fn parseConfig(path: []const u8) !void {
+        \\    const a = 1;
+        \\    const b = 2;
+        \\    _ = a;
+        \\    _ = b;
+        \\}
+        \\pub const MAX = 100;
+    );
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    const found = try explorer.renderSkeleton("sk.zig", testing.allocator, &out);
+    try testing.expect(found);
+
+    const s = out.items;
+    // Declaration line is shown, with the body collapsed to a line-count stub.
+    try testing.expect(std.mem.indexOf(u8, s, "pub fn parseConfig(path: []const u8) !void {") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "lines }") != null);
+    // Body lines are elided — the whole point.
+    try testing.expect(std.mem.indexOf(u8, s, "const a = 1") == null);
+    // Single-line declarations stay verbatim.
+    try testing.expect(std.mem.indexOf(u8, s, "pub const MAX = 100;") != null);
+    // Escalation footer points the model to the fallback tools when skeleton isn't enough.
+    try testing.expect(std.mem.indexOf(u8, s, "codedb_read sk.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "codedb_outline sk.zig") != null);
+}
+
+
+test "explorer: multi-line signature gets correct line_end (findBraceEnd paren-awareness)" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    try explorer.indexFile("mlsig.ts",
+        \\export function f(
+        \\  opts: { a?: number } = {},
+        \\): string {
+        \\  const x = 1;
+        \\  return String(x);
+        \\}
+        \\export const Z = 2;
+    );
+
+    var outline = (try explorer.getOutline("mlsig.ts", testing.allocator)).?;
+    defer outline.deinit();
+    var f_end: u32 = 0;
+    for (outline.symbols.items) |s| {
+        if (std.mem.eql(u8, s.name, "f")) f_end = s.line_end;
+    }
+    // Body close brace is line 6. Pre-fix, the inline object-type param `{ a?: number }`
+    // on line 2 ended the scope early (line_end ~2); paren-awareness fixes it.
+    try testing.expect(f_end >= 6);
+}
