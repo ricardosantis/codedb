@@ -22,6 +22,10 @@ pub const EditRequest = struct {
     new_string: ?[]const u8 = null,
     if_hash: ?[]const u8 = null,
     dry_run: bool = false,
+    /// Create a NEW file at `path` with `content`. codedb_edit otherwise only
+    /// edits existing files; with create=true a missing path is authored rather
+    /// than erroring, and an existing path returns error.FileExists.
+    create: bool = false,
 };
 
 pub const EditResult = struct {
@@ -50,6 +54,23 @@ pub fn applyEdit(
     if (!has_lock) return error.FileLocked;
     errdefer agents.releaseLock(req.agent_id, req.path);
 
+    const edit_dir = if (explorer) |exp| exp.root_dir orelse std.Io.Dir.cwd() else std.Io.Dir.cwd();
+
+    // Create op (trial/graph-based-codedb): author a NEW file. The write path in
+    // finalizeEdit already handles a nonexistent path, so create just skips the
+    // read and feeds an empty source. Refuse to clobber an existing file.
+    if (req.create) {
+        const new_content = req.content orelse return error.MissingContent;
+        if (edit_dir.readFileAlloc(io, req.path, allocator, .limited(10 * 1024 * 1024))) |existing| {
+            allocator.free(existing);
+            return error.FileExists;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+        return try finalizeEdit(io, allocator, edit_dir, store, agents, explorer, req, "", new_content);
+    }
+
     // Validate required op-specific args BEFORE doing any work that
     // mutates Store.seq or rewrites the file (#401). Anchor-based str_replace
     // (old_string set) uses neither range nor after.
@@ -62,7 +83,6 @@ pub fn applyEdit(
     } else if (req.old_string.?.len == 0) {
         return error.MissingContent;
     }
-    const edit_dir = if (explorer) |exp| exp.root_dir orelse std.Io.Dir.cwd() else std.Io.Dir.cwd();
 
     const source = try edit_dir.readFileAlloc(io, req.path, allocator, .limited(10 * 1024 * 1024));
     defer allocator.free(source);

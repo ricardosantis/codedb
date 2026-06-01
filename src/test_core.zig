@@ -674,6 +674,65 @@ test "edit-str_replace: health check still runs on an anchored edit that breaks 
 }
 
 
+// ── op=create: author new files (trial/graph-based-codedb) ────────────────
+
+test "edit-create: op=create authors a new file that did not exist" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/created.py", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const agent_id = try agents.register("cr-1");
+
+    const body = "def hello():\n    return 42\n";
+    const result = try edit_mod.applyEdit(io, testing.allocator, &store, &agents, null, .{
+        .path = rel_path,
+        .agent_id = agent_id,
+        .op = .replace,
+        .create = true,
+        .content = body,
+    });
+    defer if (result.health) |h| testing.allocator.free(h);
+
+    const after = try std.Io.Dir.cwd().readFileAlloc(io, rel_path, testing.allocator, .limited(10 * 1024));
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(body, after);
+    try testing.expect(result.changed);
+}
+
+test "edit-create: op=create refuses to clobber an existing file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/exists.py", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    var file = try tmp.dir.createFile(io, "exists.py", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "keep = 1\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const agent_id = try agents.register("cr-2");
+
+    try testing.expectError(error.FileExists, edit_mod.applyEdit(io, testing.allocator, &store, &agents, null, .{
+        .path = rel_path,
+        .agent_id = agent_id,
+        .op = .replace,
+        .create = true,
+        .content = "clobber = 2\n",
+    }));
+    const after = try std.Io.Dir.cwd().readFileAlloc(io, rel_path, testing.allocator, .limited(10 * 1024));
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings("keep = 1\n", after);
+}
+
+
 // ── Tier-1 linter registry + session policy (trial/graph-based-codedb) ────
 
 fn argsHaveFileToken(args: []const []const u8) bool {

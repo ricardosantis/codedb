@@ -612,7 +612,7 @@ pub const Tool = enum {
 pub const tools_list =
     \\{"tools":[
     \\{"name":"codedb_tree","description":"Whole-repo file tree with per-file language, line counts, and symbol counts. Use to orient in an unfamiliar project.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
-    \\{"name":"codedb_outline","description":"Symbol outline of one file: functions, structs, enums, imports, consts with line numbers. 4-15x smaller than reading the raw file. Run before codedb_read to find the lines you actually need.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"compact":{"type":"boolean","description":"Condensed format without detail comments (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
+    \\{"name":"codedb_outline","description":"Symbol outline of one file: functions, structs, enums, imports, consts with line numbers. 4-15x smaller than reading the raw file. Run before codedb_read to find the lines you actually need. Pass skeleton=true for a signature view — each symbol's declaration line with its body elided as '{ … N lines }', so a 2,000-line file collapses to ~one line per symbol.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"compact":{"type":"boolean","description":"Condensed format without detail comments (default: false)"},"skeleton":{"type":"boolean","description":"Signature view: each symbol's declaration line with its body elided as '{ … N lines }'. Lossless at the API surface; codedb_read the range to expand a body (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
     \\{"name":"codedb_symbol","description":"Find where a named symbol is defined across the index. Returns file, line, and kind. Pass body=true for source. Pick this over codedb_search when you have an exact identifier.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name to search for (exact match)"},"body":{"type":"boolean","description":"Include source body for each symbol (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
     \\{"name":"codedb_search","description":"Substring full-text search across the index (regex if regex=true). For one identifier prefer codedb_word; for a definition prefer codedb_symbol. Scope with path_glob to filter by language.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match, or regex if regex=true)"},"max_results":{"type":"integer","description":"Maximum results to return (default: 20, raise to 50 for broad surveys)"},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"},"paths_only":{"type":"boolean","description":"Return path:line per result without the matching line text — ~50% fewer tokens per call, useful for broad surveys or for budget-conscious agents (default: false)"},"regex":{"type":"boolean","description":"Treat query as regex pattern (default: false)"},"path_glob":{"type":"string","description":"Filter results to paths matching this glob, e.g. '*.zig', 'src/**/*.zig', or '**/*.{yaml,yml}'. Bare patterns like '*.zig' are auto-promoted to '**/*.zig' to match nested files."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
     \\{"name":"codedb_word","description":"Exact-identifier lookup via inverted index — every occurrence of one word, O(1). Use for single identifiers; use codedb_search for substrings or phrases.","inputSchema":{"type":"object","properties":{"word":{"type":"string","description":"Exact word/identifier to look up"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["word"]}},
@@ -622,7 +622,7 @@ pub const tools_list =
     \\{"name":"codedb_hot","description":"Most recently modified files in the project, newest first.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","description":"Number of files to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_deps","description":"Dependency graph: who imports a file (default) or what a file imports (direction=depends_on). Set transitive=true for the full BFS blast radius.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to check dependencies for"},"direction":{"type":"string","enum":["imported_by","depends_on"],"description":"imported_by (default): who imports this file. depends_on: what this file imports."},"transitive":{"type":"boolean","description":"Follow dependency chain transitively (default: false)"},"max_depth":{"type":"integer","description":"Max traversal depth for transitive queries (default: unlimited)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
     \\{"name":"codedb_read","description":"Read file contents, optionally a line range. Run codedb_outline first to pick the range — large files burn tokens fast. Pass if_hash to skip re-reads when the file is unchanged.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"line_start":{"type":"integer","description":"Start line (1-indexed, inclusive). Omit for full file."},"line_end":{"type":"integer","description":"End line (1-indexed, inclusive). Omit to read to EOF."},"if_hash":{"type":"string","description":"Previous content hash. If unchanged, returns short 'unchanged:HASH' response."},"compact":{"type":"boolean","description":"Skip comment and blank lines (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
-    \\{"name":"codedb_edit","description":"File edit. Prefer op=str_replace with old_string/new_string for a safe anchored edit (old_string must match exactly once) — it cannot mis-target surrounding lines the way a range replace can. Also supports line ops: replace (range), insert (after line), delete (range). The result includes a syntax-health warning if the edit unbalances delimiters or drops a still-used import — heed it and re-read before continuing. Pass if_hash from the latest codedb_read to reject stale-line edits. Set dry_run=true for a diff preview.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to edit"},"op":{"type":"string","enum":["str_replace","replace","insert","delete"],"description":"Edit operation. str_replace=anchored (old_string/new_string); replace/delete use range; insert uses after."},"content":{"type":"string","description":"New content (for replace/insert)"},"old_string":{"type":"string","description":"For op=str_replace: exact text to find; must occur exactly once in the file."},"new_string":{"type":"string","description":"For op=str_replace: replacement text for old_string."},"range_start":{"type":"integer","description":"Start line number (for replace/delete, 1-indexed)"},"range_end":{"type":"integer","description":"End line number (for replace/delete, 1-indexed)"},"after":{"type":"integer","description":"Insert after this line number (for insert)"},"if_hash":{"type":"string","description":"Hex hash from codedb_read's 'hash:' line. Edit is rejected with HashMismatch if the file has changed since."},"dry_run":{"type":"boolean","description":"If true, return a diff preview without writing. Disk and store are untouched. Default: false."}},"required":["path","op"]}},
+    \\{"name":"codedb_edit","description":"Fallback editor — prefer your own native file-editing tool. codedb is a context/navigation tool, not an editor; reach for codedb_edit only when no native edit capability is available. When you do edit through codedb, op=str_replace with old_string/new_string is safest (old_string must match exactly once) — it cannot mis-target surrounding lines the way a range replace can. Also supports line ops: replace (range), insert (after line), delete (range), and create (author a new file from content). The result includes a syntax-health warning if the edit unbalances delimiters or drops a still-used import — heed it and re-read before continuing. Pass if_hash from the latest codedb_read to reject stale-line edits. Set dry_run=true for a diff preview.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to edit"},"op":{"type":"string","enum":["str_replace","replace","insert","delete","create"],"description":"Edit operation. str_replace=anchored (old_string/new_string); replace/delete use range; insert uses after; create=author a NEW file from content (errors if the path already exists)."},"content":{"type":"string","description":"New content (for replace/insert/create)"},"old_string":{"type":"string","description":"For op=str_replace: exact text to find; must occur exactly once in the file."},"new_string":{"type":"string","description":"For op=str_replace: replacement text for old_string."},"range_start":{"type":"integer","description":"Start line number (for replace/delete, 1-indexed)"},"range_end":{"type":"integer","description":"End line number (for replace/delete, 1-indexed)"},"after":{"type":"integer","description":"Insert after this line number (for insert)"},"if_hash":{"type":"string","description":"Hex hash from codedb_read's 'hash:' line. Edit is rejected with HashMismatch if the file has changed since."},"dry_run":{"type":"boolean","description":"If true, return a diff preview without writing. Disk and store are untouched. Default: false."}},"required":["path","op"]}},
     \\{"name":"codedb_changes","description":"Files changed since a given sequence number. Pair with codedb_status to poll for updates.","inputSchema":{"type":"object","properties":{"since":{"type":"integer","description":"Sequence number to get changes since (default: 0)"}},"required":[]}},
     \\{"name":"codedb_status","description":"Current indexed-file count, sequence number, and scan phase.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_snapshot","description":"Pre-rendered JSON snapshot of the entire index — tree, outlines, symbols, deps. For caching or shipping to edge workers.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
@@ -991,7 +991,7 @@ fn handleInitialize(s: *Session, root: *const std.json.ObjectMap, id: ?std.json.
         if (negotiateProtocolVersion(requested)) |v| negotiated = v;
     }
     const init_result = std.fmt.allocPrint(s.alloc,
-        \\{{"protocolVersion":"{s}","capabilities":{{"tools":{{"listChanged":false}}}},"serverInfo":{{"name":"codedb","version":"{s}"}}}}
+        \\{{"protocolVersion":"{s}","capabilities":{{"tools":{{"listChanged":false}}}},"serverInfo":{{"name":"codedb","version":"{s}"}},"instructions":"codedb is a code-intelligence and context tool — not your editor. Use it to understand the codebase before you change it: search, symbol/caller lookup, dependency graph, outlines, and codedb_context for task-shaped orientation. Make edits with your own native file tools. codedb_edit is only a fallback for clients with no native editing."}}
     , .{ negotiated, release_info.semver }) catch return;
     defer s.alloc.free(init_result);
     writeResult(s.alloc, s.stdout, id, init_result);
@@ -1402,10 +1402,17 @@ fn handleOutline(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
         return;
     };
     const compact = getBool(args, "compact");
-    const found = explorer.renderOutline(path, alloc, out, compact) catch {
-        out.appendSlice(alloc, "error: outline retrieval failed") catch {};
-        return;
-    };
+    const skeleton = getBool(args, "skeleton");
+    const found = if (skeleton)
+        explorer.renderSkeleton(path, alloc, out) catch {
+            out.appendSlice(alloc, "error: outline retrieval failed") catch {};
+            return;
+        }
+    else
+        explorer.renderOutline(path, alloc, out, compact) catch {
+            out.appendSlice(alloc, "error: outline retrieval failed") catch {};
+            return;
+        };
     if (!found) {
         out.appendSlice(alloc, "error: file not indexed: ") catch {};
         out.appendSlice(alloc, path) catch {};
@@ -2052,7 +2059,7 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
     };
     var by_file = std.StringHashMap(PerFile).init(A);
 
-    const SymRef = struct { kw: []const u8, kind: []const u8, path: []const u8, line: u32 };
+    const SymRef = struct { kw: []const u8, kind: []const u8, path: []const u8, line: u32, line_end: u32 };
     var sym_refs: std.ArrayList(SymRef) = .empty;
     var seen_syms = std.StringHashMap(void).init(A);
 
@@ -2069,6 +2076,7 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                     .kind = @tagName(d.symbol.kind),
                     .path = d.path,
                     .line = d.symbol.line_start,
+                    .line_end = d.symbol.line_end,
                 }) catch break;
             }
         } else |_| {}
@@ -2132,8 +2140,8 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
     if (sym_refs.items.len > 0) {
         w.print("\n## Symbol definitions\n", .{}) catch {};
         // Enhancement (closes T1 flask variance gap): when there are ≤3
-        // symbol definitions, inline the first ~6 lines of each so the agent
-        // doesn't need a follow-up `codedb_read` to see the body. For wider
+        // symbol definitions, inline each symbol's FULL body (capped at 40
+        // lines) so the agent doesn't need a follow-up `codedb_read`. For wider
         // result sets this would bloat the response, so cap at 3.
         const inline_bodies = sym_refs.items.len <= 3;
         for (sym_refs.items) |sr| {
@@ -2144,9 +2152,10 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                     var i: usize = 0;
                     var line_start: ?usize = null;
                     var captured: u32 = 0;
-                    const want_end: u32 = sr.line + 6;
+                    const body_end: u32 = if (sr.line_end > sr.line) @min(sr.line_end, sr.line + 39) else sr.line;
+                    const max_lines: u32 = body_end - sr.line + 1;
                     if (cur_line == sr.line) line_start = 0;
-                    while (i < content.len and captured < 6) : (i += 1) {
+                    while (i < content.len and captured < max_lines) : (i += 1) {
                         if (content[i] == '\n') {
                             if (line_start) |ls| {
                                 const line_end = i;
@@ -2154,7 +2163,7 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                                 captured += 1;
                             }
                             cur_line += 1;
-                            if (cur_line >= sr.line and cur_line <= want_end) {
+                            if (cur_line >= sr.line and cur_line <= body_end) {
                                 line_start = i + 1;
                             } else {
                                 line_start = null;
@@ -2162,7 +2171,7 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                         }
                     }
                     if (line_start) |ls| {
-                        if (captured < 6) {
+                        if (captured < max_lines) {
                             w.print("       {d:>5} | {s}\n", .{ cur_line, content[ls..] }) catch {};
                         }
                     }
@@ -2555,14 +2564,15 @@ fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
         return;
     }
     const op_str = getStr(args, "op") orelse "replace";
+    const is_create = eql(op_str, "create");
     const op: @import("version.zig").Op = if (eql(op_str, "insert"))
         .insert
     else if (eql(op_str, "delete"))
         .delete
-    else if (eql(op_str, "replace") or eql(op_str, "str_replace"))
+    else if (eql(op_str, "replace") or eql(op_str, "str_replace") or is_create)
         .replace
     else {
-        out.appendSlice(alloc, "error: unknown op, must be 'replace', 'str_replace', 'insert', or 'delete'") catch {};
+        out.appendSlice(alloc, "error: unknown op, must be 'create', 'replace', 'str_replace', 'insert', or 'delete'") catch {};
         return;
     };
 
@@ -2584,6 +2594,7 @@ fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
         .new_string = getStr(args, "new_string"),
         .if_hash = getStr(args, "if_hash"),
         .dry_run = getBool(args, "dry_run"),
+        .create = is_create,
     };
     if (range_start != null and range_end != null) {
         if (range_start.? <= 0 or range_end.? <= 0) {
@@ -2612,6 +2623,28 @@ fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
                 const w = cio.listWriter(out, alloc);
                 w.print(" (current hash: {x})", .{std.hash.Wyhash.hash(0, bytes)}) catch {};
             } else |_| {}
+        } else if (err == error.PatternNotFound) {
+            out.appendSlice(alloc, " (old_string not found \u{2014} re-read the file and copy the exact text, including whitespace and indentation)") catch {};
+        } else if (err == error.PatternNotUnique) {
+            // Tell the agent how many times old_string matched so it knows how much
+            // surrounding context to add to make the anchor unique.
+            const edit_dir = explorer.root_dir orelse std.Io.Dir.cwd();
+            if (edit_dir.readFileAlloc(io, path, alloc, .limited(10 * 1024 * 1024))) |bytes| {
+                defer alloc.free(bytes);
+                const old = getStr(args, "old_string") orelse "";
+                var count: usize = 0;
+                if (old.len > 0) {
+                    var i: usize = 0;
+                    while (std.mem.indexOfPos(u8, bytes, i, old)) |pos| {
+                        count += 1;
+                        i = pos + old.len;
+                    }
+                }
+                const w = cio.listWriter(out, alloc);
+                w.print(" (old_string matched {d} times \u{2014} add surrounding lines to make it unique)", .{count}) catch {};
+            } else |_| {}
+        } else if (err == error.FileExists) {
+            out.appendSlice(alloc, " (file already exists \u{2014} use op=str_replace or op=replace to edit it, not op=create)") catch {};
         }
         return;
     };
@@ -4716,15 +4749,17 @@ pub fn mcpGenerateGuidance(
     if (eql(tool_name, "codedb_tree")) {
         buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_outline path=<file> to inspect symbols" ++ MCP_RESET) catch {};
     } else if (eql(tool_name, "codedb_outline")) {
-        buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_symbol name=<fn> to read a function body" ++ MCP_RESET) catch {};
+        buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_symbol name=<fn> body=true for a symbol's full source in one call" ++ MCP_RESET) catch {};
     } else if (eql(tool_name, "codedb_symbol")) {
         // Bug 8: don't tell the agent to "edit this symbol" when the lookup
         // returned 0 results — there's nothing to edit. Hint at codedb_search
         // instead so they can broaden the lookup.
         if (std.mem.startsWith(u8, output, "no results for:")) {
             buf.appendSlice(alloc, MCP_DIM ++ "hint: try codedb_search query=<name> to find references — symbol not defined" ++ MCP_RESET) catch {};
+        } else if (getBool(args, "body")) {
+            buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_callers name=<fn> for call sites, then edit with your native tool" ++ MCP_RESET) catch {};
         } else {
-            buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_edit to modify this symbol" ++ MCP_RESET) catch {};
+            buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_symbol name=<fn> body=true to see the source" ++ MCP_RESET) catch {};
         }
     } else if (eql(tool_name, "codedb_search")) {
         const has_regex_meta = blk: {
