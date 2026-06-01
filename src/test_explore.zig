@@ -2065,3 +2065,35 @@ test "explorer: multi-line signature gets correct line_end (findBraceEnd paren-a
     // on line 2 ended the scope early (line_end ~2); paren-awareness fixes it.
     try testing.expect(f_end >= 6);
 }
+
+test "resolveCallees: resolves call sites in a function body to their definitions" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var exp = Explorer.init(a, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try exp.indexFile("util.zig", "pub fn helper() void {}\npub fn other() void {}\n");
+    try exp.indexFile("main.zig",
+        \\pub fn run() void {
+        \\    helper();
+        \\    other();
+        \\}
+        \\
+    );
+
+    // run() spans lines 1-4; both calls resolve to definitions in util.zig.
+    const callees = try exp.resolveCallees("main.zig", 1, 4, a, 8);
+    var saw_helper = false;
+    var saw_other = false;
+    for (callees) |c| {
+        if (std.mem.eql(u8, c.name, "helper")) {
+            saw_helper = true;
+            try testing.expectEqualStrings("util.zig", c.path);
+            try testing.expect(c.kind == .function);
+        }
+        if (std.mem.eql(u8, c.name, "other")) saw_other = true;
+        // The defining function must not appear as its own callee.
+        try testing.expect(!std.mem.eql(u8, c.name, "run"));
+    }
+    try testing.expect(saw_helper);
+    try testing.expect(saw_other);
+}
