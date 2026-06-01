@@ -2079,6 +2079,7 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
     const PerFileHit = struct { line: u32, text: []const u8 };
     const PerFile = struct {
         total: u32 = 0,
+        bm25: f32 = 0,
         top: std.ArrayList(PerFileHit) = .empty,
     };
     var by_file = std.StringHashMap(PerFile).init(A);
@@ -2111,6 +2112,7 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
             const gop = by_file.getOrPut(h.path) catch continue;
             if (!gop.found_existing) gop.value_ptr.* = .{};
             gop.value_ptr.total += 1;
+            gop.value_ptr.bm25 += h.score;
             if (gop.value_ptr.top.items.len < CONTEXT_TOP_LINES_PER_FILE) {
                 gop.value_ptr.top.append(A, .{ .line = h.line_num, .text = h.line_text }) catch {};
             }
@@ -2124,24 +2126,17 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
     var symbol_files = std.StringHashMap(void).init(A);
     for (sym_refs.items) |sr| symbol_files.put(sr.path, {}) catch {};
 
-    const FileRank = struct { path: []const u8, hits: u32, score: i32, top: []const PerFileHit };
+    const FileRank = struct { path: []const u8, hits: u32, score: f32, top: []const PerFileHit };
     var ranked: std.ArrayList(FileRank) = .empty;
     var iter = by_file.iterator();
     while (iter.next()) |entry| {
         const path = entry.key_ptr.*;
-        var score: i32 = @intCast(entry.value_ptr.total);
-        if (symbol_files.contains(path)) score += 5; // definition beats pure usage
-        const is_test = std.mem.indexOf(u8, path, "/test") != null or
-            std.mem.indexOf(u8, path, "_test.") != null or
-            std.mem.indexOf(u8, path, ".test.") != null or
-            std.mem.indexOf(u8, path, "/__tests__/") != null or
-            std.mem.indexOf(u8, path, "/spec/") != null or
-            std.mem.indexOf(u8, path, "/fixtures/") != null;
-        const is_doc = std.mem.endsWith(u8, path, ".md") or
-            std.mem.endsWith(u8, path, ".rst") or
-            std.mem.indexOf(u8, path, "/docs/") != null;
-        if (is_test) score -= 3;
-        if (is_doc) score -= 2;
+        // Rank by summed BM25 score, which already carries BM25+ and the
+        // path-relevance multiplier (test/doc down-weight + filename boost) from
+        // searchContentRanked. Files that DEFINE a keyword get the edge
+        // (definition beats usage — codedb_context's unique signal).
+        var score: f32 = entry.value_ptr.bm25;
+        if (symbol_files.contains(path)) score *= 1.5;
         ranked.append(A, .{
             .path = path,
             .hits = entry.value_ptr.total,
