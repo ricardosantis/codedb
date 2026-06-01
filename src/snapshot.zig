@@ -558,9 +558,8 @@ pub fn loadSnapshotValidated(
         // Re-index from disk if file was modified after the snapshot
         var disk_content: ?[]u8 = null;
         if (snap_mtime > 0) blk: {
-            const df = std.Io.Dir.cwd().openFile(io, path_buf, .{}) catch break :blk;
-            defer df.close(io);
-            const ds = df.stat(io) catch break :blk;
+            // statFile (no open/close): only the mtime is needed here.
+            const ds = std.Io.Dir.cwd().statFile(io, path_buf, .{}) catch break :blk;
             const ds_mtime: i128 = @intCast(ds.mtime.nanoseconds);
             if (ds_mtime <= snap_mtime) break :blk;
             disk_content = std.Io.Dir.cwd().readFileAlloc(io, path_buf, allocator, .limited(16 * 1024 * 1024)) catch break :blk;
@@ -862,9 +861,11 @@ fn loadSnapshotFast(
 
         var disk_content: ?[]u8 = null;
         if (snap_mtime > 0) blk: {
-            const df = std.Io.Dir.cwd().openFile(io, path_buf, .{}) catch break :blk;
-            defer df.close(io);
-            const ds = df.stat(io) catch break :blk;
+            // statFile (no open/close) — we only need the mtime to detect edits
+            // made since the snapshot. Saves 2 syscalls/file vs openFile+stat+close
+            // across the whole tree; the file is only opened (readFileAlloc below)
+            // when it's actually newer, which is the rare case.
+            const ds = std.Io.Dir.cwd().statFile(io, path_buf, .{}) catch break :blk;
             const ds_mtime: i128 = @intCast(ds.mtime.nanoseconds);
             if (ds_mtime <= snap_mtime) break :blk;
             disk_content = std.Io.Dir.cwd().readFileAlloc(io, path_buf, allocator, .limited(16 * 1024 * 1024)) catch break :blk;
