@@ -21,6 +21,10 @@
 </p>
 
 <p align="center">
+  <em><strong>A context engine, not an editor.</strong> codedb helps agents <strong>find and understand</strong> code — search, symbols, callers, dependencies, outlines — and hands editing back to your native tools. <code>codedb_edit</code> is only a fallback.</em>
+</p>
+
+<p align="center">
   <a href="#-status">Status</a> ·
   <a href="#-install">Install</a> ·
   <a href="#-quick-start">Quick Start</a> ·
@@ -52,7 +56,7 @@
 | O(1) inverted word index for identifier lookup         | Multi-project support                    |
 | Structural outlines (functions, structs, imports)      | mmap-backed trigram index                |
 | Reverse dependency graph                               |                                          |
-| Atomic line-range edits with version tracking          |                                          |
+| Fallback editor: atomic line-range edits + version tracking          |                                          |
 | Auto-registration in Claude, Codex, Gemini, Cursor     |                                          |
 | Polling file watcher with filtered directory walker    |                                          |
 | Portable snapshot for instant MCP startup              |                                          |
@@ -162,7 +166,7 @@ codedb hot                            # recently modified files
 
 ## 🔧 MCP Tools
 
-21 tools over the Model Context Protocol (JSON-RPC 2.0 over stdio):
+21 tools over the Model Context Protocol (JSON-RPC 2.0 over stdio). codedb's job is to **give agents context** — fast structural search, symbols, callers, dependencies, and outlines — **not** to be your editor. Editing is intentionally a fallback (`codedb_edit`); prefer your client's native edit tools.
 
 | Tool | Description |
 |------|-------------|
@@ -176,7 +180,7 @@ codedb hot                            # recently modified files
 | `codedb_hot` | Most recently modified files |
 | `codedb_deps` | Dependency graph: `imported_by` (default) or `depends_on`; `transitive=true` for full BFS |
 | `codedb_read` | Read file content (line ranges, `if_hash` skip-unchanged, `compact` mode) |
-| `codedb_edit` | Apply line-range edits (replace, insert, delete — atomic writes, optional `if_hash` guard) |
+| `codedb_edit` | **Fallback editor** — `str_replace`/`replace`/`insert`/`delete`/`create` (atomic writes, optional `if_hash` guard). Prefer your client's native edit tool; codedb is for context, not editing |
 | `codedb_changes` | Changed files since a sequence number |
 | `codedb_status` | Index status (file count, current sequence, scan phase) |
 | `codedb_snapshot` | Full pre-rendered JSON snapshot of the codebase |

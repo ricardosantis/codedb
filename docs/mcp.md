@@ -8,6 +8,12 @@ context, etc. — backed by the indexes in `~/.codedb/projects/<hash>/`.
 This guide covers per-client setup, how codedb decides which project to
 scan, and the most common failure modes.
 
+> **codedb is a context tool, not an editor.** Its job is to help an agent
+> *find and understand* code — fast structural search, symbol/caller lookup,
+> dependency graph, outlines, and task-shaped context. Edits belong to your
+> client's native file tools; `codedb_edit` exists only as a fallback for
+> clients that have no native editing capability.
+
 ---
 
 ## 1. Quick install (auto-configures all detected clients)
