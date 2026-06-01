@@ -460,11 +460,30 @@ fn parseInitialScanEntry(io: std.Io, root: []const u8, entry: InitialScanEntry, 
 }
 
 fn initialScanWorker(io: std.Io, results: *WorkerParsedResults, root: []const u8, entries: []const InitialScanEntry) void {
-    const arena_alloc = results.arena.allocator();
+    const persist = results.arena.allocator();
+    // Parse each file in a per-file scratch arena that is reset between files,
+    // then copy only the keep-data (content + outline) into the persistent
+    // results arena. parseContentForIndexing allocates large transient parse
+    // state (AST/token buffers) that is not part of the returned content/outline;
+    // without resetting per file, a worker's arena retains every file's
+    // transients chunk-wide (high-water-mark, never reclaimed), which dominated
+    // initial-scan RSS on large repos (~4.3GB -> contents+outline only).
+    // The results arena (and thus the clone) is touched by this worker only, so
+    // the copy is race-free; commit on the main thread re-dups both anyway.
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
     for (entries) |entry| {
-        const parsed = parseInitialScanEntry(io, root, entry, arena_alloc) catch null;
+        _ = scratch.reset(.retain_capacity);
+        const parsed = parseInitialScanEntry(io, root, entry, scratch.allocator()) catch null;
         if (parsed) |file| {
-            results.items.append(arena_alloc, file) catch return;
+            const content_copy = persist.dupe(u8, file.content) catch continue;
+            const outline_copy = explore_mod.Explorer.cloneOutline(&file.outline, persist) catch continue;
+            results.items.append(persist, .{
+                .path = file.path,
+                .content = content_copy,
+                .outline = outline_copy,
+                .skip_trigram = file.skip_trigram,
+            }) catch continue;
         }
     }
 }
