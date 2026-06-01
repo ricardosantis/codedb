@@ -168,6 +168,67 @@ PYEOF
   printf "  ${G}✓${N} cursor       ${D}→ $config${N}\n"
 }
 
+register_windsurf_devin() {
+  local codedb_bin="$1"
+  # Windsurf and Devin are registered via mcpsync (a codegraff product that keeps
+  # MCP servers in sync across AI tools). Only these two are delegated to mcpsync;
+  # the tools above are registered directly. mcpsync skips tools that aren't
+  # installed, so this is a no-op for users without Windsurf or Devin.
+  local mcpsync_bin
+  mcpsync_bin="$(command -v mcpsync 2>/dev/null || true)"
+  if [ -z "$mcpsync_bin" ]; then
+    for p in "$HOME/.local/bin/mcpsync" "$HOME/bin/mcpsync" "/usr/local/bin/mcpsync"; do
+      [ -x "$p" ] && mcpsync_bin="$p" && break
+    done
+  fi
+  # Auto-install mcpsync if missing (same trust domain as codedb). Never fail the
+  # codedb install if this is unavailable.
+  if [ -z "$mcpsync_bin" ]; then
+    curl -fsSL https://mcpsync.codegraff.com | bash >/dev/null 2>&1 || true
+    mcpsync_bin="$(command -v mcpsync 2>/dev/null || true)"
+    if [ -z "$mcpsync_bin" ]; then
+      for p in "$HOME/.local/bin/mcpsync" "$HOME/bin/mcpsync" "/usr/local/bin/mcpsync"; do
+        [ -x "$p" ] && mcpsync_bin="$p" && break
+      done
+    fi
+  fi
+  if [ -z "$mcpsync_bin" ]; then
+    printf "  ${D}windsurf/devin: skip (mcpsync unavailable)${N}\n"
+    return
+  fi
+
+  # Add codedb to mcpsync's source of truth (~/.mcpconfig.json), then sync ONLY
+  # windsurf + devin (named) so we don't re-touch the tools registered above.
+  # Writing the source-of-truth directly (rather than `mcpsync add`, which
+  # auto-syncs to every detected tool) keeps mcpsync's footprint to these two.
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$HOME/.mcpconfig.json" "$codedb_bin" << 'PYEOF'
+import json, sys
+config_path, codedb_bin = sys.argv[1], sys.argv[2]
+try:
+    with open(config_path) as f:
+        data = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    data = {}
+servers = data.setdefault("mcpServers", {})
+servers["codedb"] = {"command": codedb_bin, "args": ["mcp"], "transport": "stdio"}
+with open(config_path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PYEOF
+  else
+    # No python3: fall back to `mcpsync add` (also syncs other detected tools,
+    # additively and idempotently — same codedb entry).
+    "$mcpsync_bin" add codedb --cmd "$codedb_bin" --args mcp >/dev/null 2>&1 || true
+  fi
+
+  if "$mcpsync_bin" sync windsurf devin >/dev/null 2>&1; then
+    printf "  ${G}✓${N} windsurf/devin ${D}→ via mcpsync (~/.mcpconfig.json)${N}\n"
+  else
+    printf "  ${D}windsurf/devin: skip (mcpsync sync failed)${N}\n"
+  fi
+}
+
 register_hooks() {
   if ! command -v python3 >/dev/null 2>&1; then
     printf "  ${D}hooks:   skip (python3 not found)${N}\n"
@@ -350,6 +411,7 @@ main() {
   register_codex "$dest"
   register_gemini "$dest"
   register_cursor "$dest"
+  register_windsurf_devin "$dest"
   register_hooks
   print_hook_notes "$dest"
 
