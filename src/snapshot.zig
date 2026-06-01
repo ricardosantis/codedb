@@ -812,53 +812,65 @@ fn loadSnapshotFast(
     const file_stat = content_file.stat(io) catch return false;
     if (content_entry.offset + content_entry.length > file_stat.size) return false;
 
-    var read_pos: u64 = content_entry.offset;
     const snap_mtime: i128 = @intCast(file_stat.mtime.nanoseconds);
-    var bytes_read: u64 = 0;
     var file_count: u32 = 0;
     var word_index_can_load_from_disk = true;
-    while (bytes_read < content_entry.length) {
-        var pl_buf: [2]u8 = undefined;
-        const pln = content_file.readPositionalAll(io, &pl_buf, read_pos) catch return false;
-        if (pln != 2) break;
-        read_pos += 2;
-        const path_len = std.mem.readInt(u16, &pl_buf, .little);
+
+    // Read the content section as one block, then parse records from memory.
+    // This replaces ~4 readPositionalAll syscalls per file (path_len, path,
+    // content_len, content — ~156k syscalls on a 39k-file repo) with in-memory
+    // slicing. Prefer a file-backed mmap (no heap spike — pages are demand-paged
+    // and reclaimable); fall back to a heap bulk-read if mmap is unavailable.
+    const sec_len: usize = std.math.cast(usize, content_entry.length) orelse return false;
+    const sec_base: usize = std.math.cast(usize, content_entry.offset) orelse return false;
+    var map: ?[]align(std.heap.page_size_min) const u8 = null;
+    var heap_section: ?[]u8 = null;
+    defer if (map) |m| std.posix.munmap(m);
+    defer if (heap_section) |h| allocator.free(h);
+    const section: []const u8 = section_blk: {
+        const fsize: usize = std.math.cast(usize, file_stat.size) orelse return false;
+        if (std.posix.mmap(null, fsize, .{ .READ = true }, .{ .TYPE = .SHARED }, content_file.handle, 0)) |m| {
+            map = m;
+            break :section_blk m[sec_base..][0..sec_len];
+        } else |_| {}
+        const h = allocator.alloc(u8, sec_len) catch return false;
+        if ((content_file.readPositionalAll(io, h, content_entry.offset) catch 0) != sec_len) {
+            allocator.free(h);
+            return false;
+        }
+        heap_section = h;
+        break :section_blk h;
+    };
+
+    var sc: usize = 0; // cursor into `section`
+    while (sc < section.len) {
+        if (sc + 2 > section.len) break;
+        const path_len = std.mem.readInt(u16, section[sc..][0..2], .little);
+        sc += 2;
         if (path_len == 0 or path_len > 4096) break;
-        bytes_read += 2;
+        if (sc + path_len > section.len) break;
 
         const path_buf = allocator.alloc(u8, path_len) catch return false;
-        const prn = content_file.readPositionalAll(io, path_buf, read_pos) catch return false;
-        if (prn != path_len) {
-            allocator.free(path_buf);
-            break;
-        }
-        read_pos += path_len;
-        bytes_read += path_len;
+        @memcpy(path_buf, section[sc..][0..path_len]);
+        sc += path_len;
 
-        var cl_buf: [4]u8 = undefined;
-        const cln = content_file.readPositionalAll(io, &cl_buf, read_pos) catch return false;
-        if (cln != 4) {
+        if (sc + 4 > section.len) {
             allocator.free(path_buf);
             break;
         }
-        read_pos += 4;
-        const content_len = std.mem.readInt(u32, &cl_buf, .little);
-        if (content_len > 64 * 1024 * 1024) {
+        const content_len = std.mem.readInt(u32, section[sc..][0..4], .little);
+        sc += 4;
+        if (content_len > 64 * 1024 * 1024 or sc + content_len > section.len) {
             allocator.free(path_buf);
             break;
         }
-        bytes_read += 4;
 
-        const content = allocator.alloc(u8, content_len) catch return false;
-        const crn = content_file.readPositionalAll(io, content, read_pos) catch return false;
-        if (crn != content_len) {
+        const content = allocator.alloc(u8, content_len) catch {
             allocator.free(path_buf);
-            allocator.free(content);
-            break;
-        }
-        read_pos += content_len;
-        bytes_read += content_len;
-
+            return false;
+        };
+        @memcpy(content, section[sc..][0..content_len]);
+        sc += content_len;
         var disk_content: ?[]u8 = null;
         if (snap_mtime > 0) blk: {
             // statFile (no open/close) — we only need the mtime to detect edits
