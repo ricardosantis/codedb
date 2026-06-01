@@ -2539,6 +2539,11 @@ pub const Explorer = struct {
         // BM25 constants.
         const k1: f32 = 1.2;
         const b: f32 = 0.75;
+        // BM25+ (Lv & Zhai 2011) lower-bound on the TF term: every matching term
+        // contributes at least idf*delta regardless of length normalization, so
+        // long source files that genuinely match aren't penalized toward zero
+        // (a known BM25 weakness). delta=0.5 matches bm25s's BM25+/BM25L default.
+        const bm25_plus_delta: f32 = 0.5;
         // Fall back to the total indexed-doc count when the per-doc length
         // table is empty (the bulk `codedb index` path writes the disk word
         // index without doc lengths) so ranked search still returns idf-weighted
@@ -2600,7 +2605,8 @@ pub const Explorer = struct {
                 const dl_raw = self.word_index.docLength(doc_id);
                 const dl: f32 = if (dl_raw == 0) 1.0 else @floatFromInt(dl_raw);
                 const norm = 1.0 - b + b * (dl / avgdl);
-                const term_score = idf * (tf * (k1 + 1.0)) / (tf + k1 * norm);
+                const tf_sat = (tf * (k1 + 1.0)) / (tf + k1 * norm);
+                const term_score = idf * (tf_sat + bm25_plus_delta);
 
                 const ln_info = doc_best_line.get(doc_id) orelse continue;
                 const agg_gop = try per_doc.getOrPut(doc_id);
