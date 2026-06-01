@@ -614,21 +614,50 @@ fn readSectionString(buf: []const u8, cursor: *usize, allocator: std.mem.Allocat
     return out;
 }
 
-fn loadOutlineStateMap(io: std.Io, snapshot_path: []const u8, allocator: std.mem.Allocator) !std.StringHashMap(FileOutline) {
-    const bytes = (try readSectionBytes(io, snapshot_path, .outline_state, allocator)) orelse return error.InvalidData;
-    defer allocator.free(bytes);
+/// Like readSectionString but returns a slice that aliases `buf` (no copy, no
+/// allocation). Valid only while `buf` is alive — callers that retain the
+/// result must keep `buf` alive at least as long (see loadOutlineStateMap).
+fn readSectionStringBorrowed(buf: []const u8, cursor: *usize, max_len: usize) ![]const u8 {
+    const len = try readSectionInt(u16, buf, cursor);
+    if (len > max_len) return error.InvalidData;
+    if (cursor.* + len > buf.len) return error.InvalidData;
+    const out = buf[cursor.* .. cursor.* + len];
+    cursor.* += len;
+    return out;
+}
+/// On success, `backing_out.*` is set to the raw outline_state section buffer
+/// and ownership transfers to the caller (the restored FileOutlines borrow
+/// their import/symbol strings as slices into it — see FileOutline.borrows_strings).
+/// On any error the buffer is freed here and `backing_out.*` is left null.
+///
+/// The backing buffer is allocated from `backing_allocator` (the Explorer's
+/// allocator), NOT `allocator` (the per-load allocator): it is retained by the
+/// Explorer and must share its lifetime/allocator. Everything else (the map,
+/// keys/paths) uses `allocator` exactly as before.
+fn loadOutlineStateMap(io: std.Io, snapshot_path: []const u8, allocator: std.mem.Allocator, backing_allocator: std.mem.Allocator, expected: ?u32, backing_out: *?[]const u8) !std.StringHashMap(FileOutline) {
+    backing_out.* = null;
+    const bytes = (try readSectionBytes(io, snapshot_path, .outline_state, backing_allocator)) orelse return error.InvalidData;
+    // Kept alive on success (handed to backing_out); freed here on any error.
+    var release_bytes = true;
+    defer if (release_bytes) backing_allocator.free(bytes);
 
     var result = std.StringHashMap(FileOutline).init(allocator);
     errdefer deinitOutlineStateMap(&result, allocator);
+    // Pre-size to the known file count: the map otherwise grows 0 -> ~N with
+    // ~log2(N) rehashes, each re-hashing every entry inserted so far.
+    if (expected) |e| result.ensureTotalCapacity(e) catch {};
 
     var cursor: usize = 0;
     const file_count = try readSectionInt(u32, bytes, &cursor);
     for (0..file_count) |_| {
+        // `path` is the map key and stays individually owned (deinitOutlineStateMap
+        // / Explorer.deinit free it). Only the import/symbol strings are borrowed.
         const path = try readSectionString(bytes, &cursor, allocator, 4096);
         if (path.len == 0) return error.InvalidData;
         errdefer allocator.free(path);
 
         var outline = FileOutline.init(allocator, path);
+        outline.borrows_strings = true;
         errdefer outline.deinit();
 
         const language_raw = try readSectionByte(bytes, &cursor);
@@ -638,16 +667,14 @@ fn loadOutlineStateMap(io: std.Io, snapshot_path: []const u8, allocator: std.mem
 
         const import_count = try readSectionInt(u32, bytes, &cursor);
         for (0..import_count) |_| {
-            const imp = try readSectionString(bytes, &cursor, allocator, 4096);
-            errdefer allocator.free(imp);
+            const imp = try readSectionStringBorrowed(bytes, &cursor, 4096);
             try outline.imports.append(allocator, imp);
         }
 
         const symbol_count = try readSectionInt(u32, bytes, &cursor);
         for (0..symbol_count) |_| {
-            const name = try readSectionString(bytes, &cursor, allocator, std.math.maxInt(u16));
+            const name = try readSectionStringBorrowed(bytes, &cursor, std.math.maxInt(u16));
             if (name.len == 0) return error.InvalidData;
-            errdefer allocator.free(name);
 
             const kind_raw = try readSectionByte(bytes, &cursor);
             const kind = std.enums.fromInt(SymbolKind, kind_raw) orelse return error.InvalidData;
@@ -656,10 +683,9 @@ fn loadOutlineStateMap(io: std.Io, snapshot_path: []const u8, allocator: std.mem
             const has_detail = try readSectionByte(bytes, &cursor);
             const detail = switch (has_detail) {
                 0 => null,
-                1 => try readSectionString(bytes, &cursor, allocator, std.math.maxInt(u16)),
+                1 => try readSectionStringBorrowed(bytes, &cursor, std.math.maxInt(u16)),
                 else => return error.InvalidData,
             };
-            errdefer if (detail) |d| allocator.free(d);
 
             try outline.symbols.append(allocator, Symbol{
                 .name = name,
@@ -674,6 +700,9 @@ fn loadOutlineStateMap(io: std.Io, snapshot_path: []const u8, allocator: std.mem
     }
 
     if (cursor != bytes.len) return error.InvalidData;
+    // Success: transfer the backing buffer to the caller.
+    backing_out.* = bytes;
+    release_bytes = false;
     return result;
 }
 
@@ -717,8 +746,32 @@ fn loadSnapshotFast(
     store: *Store,
     allocator: std.mem.Allocator,
 ) !bool {
-    var outline_states = loadOutlineStateMap(io, snapshot_path, allocator) catch std.StringHashMap(FileOutline).init(allocator);
+    var section_backing: ?[]const u8 = null;
+    // backing_allocator = explorer.allocator: the section buffer is retained by
+    // the Explorer (outline_section_bufs) and freed via explorer.allocator, so it
+    // must be allocated from the same allocator (matters when the per-load
+    // allocator differs from the Explorer's, e.g. arena-backed Explorers).
+    var outline_states = loadOutlineStateMap(io, snapshot_path, allocator, explorer.allocator, expected_file_count, &section_backing) catch std.StringHashMap(FileOutline).init(allocator);
     defer deinitOutlineStateMap(&outline_states, allocator);
+
+    // Restored outlines borrow their import/symbol strings as slices into this
+    // buffer; hand it to the Explorer so it outlives them. If the Explorer can't
+    // retain it the borrows would dangle, so free it and abort to a full re-index.
+    if (section_backing) |b| {
+        explorer.adoptOutlineSection(b) catch {
+            explorer.allocator.free(b);
+            return false;
+        };
+    }
+
+    // Pre-size the explorer maps the restore loop fills. Without this they grow
+    // 0 -> ~N with ~log2(N) rehashes apiece, each re-inserting every prior entry
+    // (an O(N log N) churn over the whole load). The file count is known up front.
+    if (expected_file_count) |fc| {
+        explorer.outlines.ensureTotalCapacity(fc) catch {};
+        explorer.dep_graph.forward.ensureTotalCapacity(fc) catch {};
+        explorer.dep_graph.reverse.ensureTotalCapacity(fc) catch {};
+    }
 
     var sections = (try readSections(io, snapshot_path, allocator)) orelse return false;
     defer sections.deinit();

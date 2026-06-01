@@ -63,6 +63,11 @@ pub const FileOutline = struct {
     imports: std.ArrayList([]const u8) = .empty,
     allocator: std.mem.Allocator,
     owns_path: bool = false,
+    /// When true, `imports` and each `symbols[].name`/`.detail` are borrowed
+    /// slices into an externally-owned buffer (the snapshot outline_state
+    /// section, retained by the Explorer) rather than individual allocations,
+    /// so deinit must not free them. The ArrayLists themselves are still owned.
+    borrows_strings: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) FileOutline {
         return .{
@@ -75,12 +80,14 @@ pub const FileOutline = struct {
     }
     pub fn deinit(self: *FileOutline) void {
         if (self.owns_path) self.allocator.free(self.path);
-        for (self.symbols.items) |sym| {
-            self.allocator.free(sym.name);
-            if (sym.detail) |d| self.allocator.free(d);
+        if (!self.borrows_strings) {
+            for (self.symbols.items) |sym| {
+                self.allocator.free(sym.name);
+                if (sym.detail) |d| self.allocator.free(d);
+            }
+            for (self.imports.items) |imp| self.allocator.free(imp);
         }
         self.symbols.deinit(self.allocator);
-        for (self.imports.items) |imp| self.allocator.free(imp);
         self.imports.deinit(self.allocator);
     }
 };
@@ -628,6 +635,11 @@ pub const Explorer = struct {
     /// Production code does not read this field.
     search_tier5_count: u64 = 0,
     last_search_breakdown: SearchBreakdown = .{},
+    /// Buffers adopted from snapshot loads (the raw outline_state section).
+    /// Restored FileOutlines borrow their import/symbol strings as slices into
+    /// these (see FileOutline.borrows_strings), so they must outlive every
+    /// restored outline; freed once here at Explorer.deinit.
+    outline_section_bufs: std.ArrayList([]const u8) = .empty,
 
     /// Default file-content cache capacity. Was 16384, but on typical
     /// projects (≤2000 files) the cache only ever holds a few hundred
@@ -677,9 +689,18 @@ pub const Explorer = struct {
         self.word_index.deinit();
         self.trigram_index.deinit();
         self.skip_trigram_files.deinit();
+        // Freed after outlines (above) since restored outlines borrow into these.
+        for (self.outline_section_bufs.items) |b| self.allocator.free(b);
+        self.outline_section_bufs.deinit(self.allocator);
         if (self.root_dir) |d| {
             if (self.io) |io| d.close(io);
         }
+    }
+
+    /// Take ownership of a snapshot outline_state section buffer that restored
+    /// FileOutlines borrow their import/symbol strings from. Freed at deinit.
+    pub fn adoptOutlineSection(self: *Explorer, buf: []const u8) !void {
+        try self.outline_section_bufs.append(self.allocator, buf);
     }
 
     /// Number of slots in the heap trigram index id_to_path array (benchmark helper).

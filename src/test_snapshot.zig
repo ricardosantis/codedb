@@ -203,6 +203,63 @@ test "issue-46: empty-repo snapshot rejected on load" {
     try testing.expect(exp2.outlines.count() == 0);
 }
 
+// Restored FileOutlines borrow their import/symbol strings as slices into a
+// section buffer the Explorer retains (FileOutline.borrows_strings). This test
+// pins two things the borrow optimization must preserve:
+//   1. the strings survive the round-trip intact (slices point at the right bytes)
+//   2. explorer.deinit() frees the adopted section buffer exactly once and does
+//      NOT double-free the borrowed strings (DebugAllocator flags either).
+test "snapshot: restored outlines borrow strings (round-trip intact + clean deinit)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var exp = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    // A path that does not exist on disk, so the load takes the restore path
+    // (the freshness check can't find a newer file) rather than re-indexing.
+    try exp.indexFile("borrow_test_pkg/main.zig",
+        \\const std = @import("std");
+        \\const helper = @import("helper.zig");
+        \\pub fn alphaFn() void {}
+        \\pub fn betaFn(x: u32) u32 {
+        \\    return x + 1;
+        \\}
+        \\
+    );
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/borrow.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
+
+    // Fresh Explorer, loaded with the same allocator and explicitly deinit'd —
+    // the production pattern. This verifies explorer.deinit() cleanly frees the
+    // adopted section backing AND that the borrowed import/symbol strings are
+    // not double-freed (DebugAllocator would flag either).
+    var exp2 = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer exp2.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const loaded = snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, testing.allocator);
+    try testing.expect(loaded);
+
+    const outline = exp2.outlines.get("borrow_test_pkg/main.zig") orelse return error.MissingOutline;
+    try testing.expect(outline.borrows_strings);
+    try testing.expect(outline.imports.items.len >= 1);
+
+    var saw_alpha = false;
+    var saw_beta = false;
+    for (outline.symbols.items) |s| {
+        if (std.mem.eql(u8, s.name, "alphaFn")) saw_alpha = true;
+        if (std.mem.eql(u8, s.name, "betaFn")) saw_beta = true;
+    }
+    try testing.expect(saw_alpha);
+    try testing.expect(saw_beta);
+}
+
 
 test "issue-220: snapshot fast load restores outlines and lazily rebuilds word index" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
