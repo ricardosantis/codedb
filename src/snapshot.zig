@@ -865,11 +865,11 @@ fn loadSnapshotFast(
             break;
         }
 
-        const content = allocator.alloc(u8, content_len) catch {
-            allocator.free(path_buf);
-            return false;
-        };
-        @memcpy(content, section[sc..][0..content_len]);
+        // `content` borrows the mapped section directly — no transient copy.
+        // The consumers below (insertRestoredFile/indexFile*/recordSnapshot)
+        // only read it or dupe it into the content cache, and the mapping is
+        // alive for the whole loop, so the slice never outlives its backing.
+        const content = section[sc..][0..content_len];
         sc += content_len;
         var disk_content: ?[]u8 = null;
         if (snap_mtime > 0) blk: {
@@ -894,36 +894,30 @@ fn loadSnapshotFast(
 
             explorer.indexFile(path_buf, dc) catch {
                 allocator.free(path_buf);
-                allocator.free(content);
                 continue;
             };
             const hash = std.hash.Wyhash.hash(0, dc);
             _ = store.recordSnapshot(path_buf, dc.len, hash) catch {};
             allocator.free(path_buf);
-            allocator.free(content);
         } else if (outline_states.fetchRemove(path_buf)) |removed| {
             allocator.free(path_buf);
             insertRestoredFile(explorer, removed.key, content, removed.value, allocator) catch {
                 allocator.free(removed.key);
                 var bad_outline = removed.value;
                 bad_outline.deinit();
-                allocator.free(content);
                 continue;
             };
             const hash = std.hash.Wyhash.hash(0, content);
             _ = store.recordSnapshot(removed.key, content.len, hash) catch {};
-            allocator.free(content);
         } else {
             word_index_can_load_from_disk = false;
             explorer.indexFileOutlineOnly(path_buf, content) catch {
                 allocator.free(path_buf);
-                allocator.free(content);
                 continue;
             };
             const hash = std.hash.Wyhash.hash(0, content);
             _ = store.recordSnapshot(path_buf, content.len, hash) catch {};
             allocator.free(path_buf);
-            allocator.free(content);
         }
 
         file_count += 1;
