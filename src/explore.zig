@@ -774,7 +774,7 @@ pub const Explorer = struct {
         }
 
         try self.rebuildDepsFor(stable_path, &persistent_outline);
-        self.rebuildSymbolIndexFor(stable_path, &persistent_outline);
+        self.rebuildSymbolIndexFor(stable_path, &persistent_outline, !is_new);
 
         outline_gop.value_ptr.* = persistent_outline;
         if (prior_outline) |*old_outline| old_outline.deinit();
@@ -1577,7 +1577,7 @@ pub const Explorer = struct {
         }
     }
 
-    fn cloneOutline(src: *const FileOutline, allocator: std.mem.Allocator) !FileOutline {
+    pub fn cloneOutline(src: *const FileOutline, allocator: std.mem.Allocator) !FileOutline {
         const copied_path = try allocator.dupe(u8, src.path);
         // No errdefer here: dst.deinit() below handles freeing copied_path via owns_path.
 
@@ -4075,8 +4075,12 @@ pub const Explorer = struct {
         try self.dep_graph.setDeps(path, deps);
     }
 
-    fn rebuildSymbolIndexFor(self: *Explorer, path: []const u8, outline: *FileOutline) void {
-        self.removeSymbolIndexFor(path);
+    fn rebuildSymbolIndexFor(self: *Explorer, path: []const u8, outline: *FileOutline, had_prior: bool) void {
+        // removeSymbolIndexFor scans the entire global symbol index, so calling
+        // it per file makes a cold scan O(files * total_symbols). A brand-new
+        // path has no prior entries to evict, so skip the scan entirely — only
+        // re-indexed (already-present) files need the removal.
+        if (had_prior) self.removeSymbolIndexFor(path);
         for (outline.symbols.items) |sym| {
             const gop = self.symbol_index.getOrPut(sym.name) catch continue;
             if (!gop.found_existing) {
