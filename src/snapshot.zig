@@ -753,6 +753,7 @@ fn insertRestoredFile(
     content: []const u8,
     outline: FileOutline,
     allocator: std.mem.Allocator,
+    borrow_content: bool,
 ) !void {
     var restored_outline = outline;
     restored_outline.path = path;
@@ -762,7 +763,13 @@ fn insertRestoredFile(
     outline_gop.key_ptr.* = path;
     outline_gop.value_ptr.* = restored_outline;
 
-    try explorer.contents.put(path, content);
+    // When the content was read from an mmap the Explorer has adopted, store a
+    // borrowed (zero-copy) cache value; otherwise dupe it as usual.
+    if (borrow_content) {
+        try explorer.contents.putBorrowed(path, content);
+    } else {
+        try explorer.contents.put(path, content);
+    }
 
     try rebuildDepsFromOutline(explorer, path, &restored_outline, allocator);
 }
@@ -823,15 +830,22 @@ fn loadSnapshotFast(
     // and reclaimable); fall back to a heap bulk-read if mmap is unavailable.
     const sec_len: usize = std.math.cast(usize, content_entry.length) orelse return false;
     const sec_base: usize = std.math.cast(usize, content_entry.offset) orelse return false;
-    var map: ?[]align(std.heap.page_size_min) const u8 = null;
     var heap_section: ?[]u8 = null;
-    defer if (map) |m| std.posix.munmap(m);
     defer if (heap_section) |h| allocator.free(h);
+    // When the content comes from an mmap, the Explorer adopts it (munmap'd at its
+    // deinit) and the ContentCache borrows zero-copy slices into it — no per-file
+    // content dupe. The heap fallback is transient (freed below), so in that case
+    // the content is duped into the cache as usual.
+    var content_borrowed = false;
     const section: []const u8 = section_blk: {
         const fsize: usize = std.math.cast(usize, file_stat.size) orelse return false;
         if (std.posix.mmap(null, fsize, .{ .READ = true }, .{ .TYPE = .SHARED }, content_file.handle, 0)) |m| {
-            map = m;
-            break :section_blk m[sec_base..][0..sec_len];
+            if (explorer.adoptContentSection(m)) {
+                content_borrowed = true;
+                break :section_blk m[sec_base..][0..sec_len];
+            } else |_| {
+                std.posix.munmap(m);
+            }
         } else |_| {}
         const h = allocator.alloc(u8, sec_len) catch return false;
         if ((content_file.readPositionalAll(io, h, content_entry.offset) catch 0) != sec_len) {
@@ -901,7 +915,7 @@ fn loadSnapshotFast(
             allocator.free(path_buf);
         } else if (outline_states.fetchRemove(path_buf)) |removed| {
             allocator.free(path_buf);
-            insertRestoredFile(explorer, removed.key, content, removed.value, allocator) catch {
+            insertRestoredFile(explorer, removed.key, content, removed.value, allocator, content_borrowed) catch {
                 allocator.free(removed.key);
                 var bad_outline = removed.value;
                 bad_outline.deinit();

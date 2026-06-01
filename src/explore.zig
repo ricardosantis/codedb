@@ -640,6 +640,10 @@ pub const Explorer = struct {
     /// these (see FileOutline.borrows_strings), so they must outlive every
     /// restored outline; freed once here at Explorer.deinit.
     outline_section_bufs: std.ArrayList([]const u8) = .empty,
+    /// mmap'd snapshot content sections adopted at load. The ContentCache stores
+    /// borrowed (value_owned=false) slices into these for restored files, so they
+    /// must outlive the cache; munmap'd once here at Explorer.deinit.
+    content_section_maps: std.ArrayList([]align(std.heap.page_size_min) const u8) = .empty,
 
     /// Default file-content cache capacity. Was 16384, but on typical
     /// projects (≤2000 files) the cache only ever holds a few hundred
@@ -692,6 +696,11 @@ pub const Explorer = struct {
         // Freed after outlines (above) since restored outlines borrow into these.
         for (self.outline_section_bufs.items) |b| self.allocator.free(b);
         self.outline_section_bufs.deinit(self.allocator);
+        // munmap'd after contents.deinit (above): the cache holds borrowed slices
+        // into these maps, but deinit skips freeing borrowed values, so the maps
+        // are still valid through it and only released here.
+        for (self.content_section_maps.items) |m| std.posix.munmap(m);
+        self.content_section_maps.deinit(self.allocator);
         if (self.root_dir) |d| {
             if (self.io) |io| d.close(io);
         }
@@ -701,6 +710,12 @@ pub const Explorer = struct {
     /// FileOutlines borrow their import/symbol strings from. Freed at deinit.
     pub fn adoptOutlineSection(self: *Explorer, buf: []const u8) !void {
         try self.outline_section_bufs.append(self.allocator, buf);
+    }
+
+    /// Take ownership of an mmap'd snapshot content section that the ContentCache
+    /// borrows (value_owned=false) slices from. munmap'd at deinit.
+    pub fn adoptContentSection(self: *Explorer, map: []align(std.heap.page_size_min) const u8) !void {
+        try self.content_section_maps.append(self.allocator, map);
     }
 
     /// Number of slots in the heap trigram index id_to_path array (benchmark helper).
