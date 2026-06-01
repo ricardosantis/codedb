@@ -193,6 +193,16 @@ fn deregisterInstalledIntegrations(io: std.Io, allocator: std.mem.Allocator, hom
     defer allocator.free(codex_config);
     if (deregisterCodexIntegrationFile(io, allocator, codex_config) catch false) removed += 1;
 
+    // Windsurf and Devin are registered via mcpsync; both store servers under a
+    // standard `mcpServers` object, so the JSON deregister handles them too.
+    const windsurf_config = std.fmt.allocPrint(allocator, "{s}/.codeium/windsurf/mcp_config.json", .{home}) catch return removed;
+    defer allocator.free(windsurf_config);
+    if (deregisterJsonIntegrationFile(io, allocator, windsurf_config) catch false) removed += 1;
+
+    const devin_config = std.fmt.allocPrint(allocator, "{s}/.config/devin/config.json", .{home}) catch return removed;
+    defer allocator.free(devin_config);
+    if (deregisterJsonIntegrationFile(io, allocator, devin_config) catch false) removed += 1;
+
     return removed;
 }
 
