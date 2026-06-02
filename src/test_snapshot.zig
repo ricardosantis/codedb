@@ -311,6 +311,43 @@ test "snapshot: call-graph centrality persists and restores (no lazy rebuild)" {
     try testing.expectEqual(want, got);
 }
 
+// The CONTENT_HASHES section lets the loader record Store baselines without
+// re-hashing content. This pins that the stored hash equals Wyhash of the
+// content for each file — i.e. the section is read in the correct (content)
+// order, so hashes are not misaligned across files.
+test "snapshot: CONTENT_HASHES records the correct per-file hash (order-aligned)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var exp = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    const Pair = struct { p: []const u8, c: []const u8 };
+    const files = [_]Pair{
+        .{ .p = "ch_pkg/alpha.zig", .c = "pub fn alpha() void { beta(); }\n" },
+        .{ .p = "ch_pkg/beta.zig", .c = "pub fn beta() void {}\npub fn extra() void {}\n" },
+        .{ .p = "ch_pkg/gamma.zig", .c = "const value = 123456;\n" },
+    };
+    for (files) |f| try exp.indexFile(f.p, f.c);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/ch.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
+
+    var exp2 = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer exp2.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    try testing.expect(snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, testing.allocator));
+
+    for (files) |f| {
+        const v = store.getLatest(f.p) orelse return error.MissingVersion;
+        try testing.expectEqual(std.hash.Wyhash.hash(0, f.c), v.hash);
+    }
+}
+
 
 test "issue-220: snapshot fast load restores outlines and lazily rebuilds word index" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

@@ -44,6 +44,7 @@ pub const SectionId = enum(u32) {
     meta = 6,
     outline_state = 7,
     call_centrality = 8,
+    content_hashes = 9,
 };
 
 const SectionEntry = struct {
@@ -228,6 +229,12 @@ pub fn writeSnapshot(
     }
 
     // ── Section: CONTENT ──
+    // Per-file content hashes, collected in lockstep with the records below and
+    // written as a separate CONTENT_HASHES section. The loader records these in
+    // the Store version log instead of re-hashing every file's content at load
+    // (which also faults in the whole mmap'd content section).
+    var content_hashes: std.ArrayList(u64) = .empty;
+    defer content_hashes.deinit(allocator);
     {
         const offset = file_writer.logicalPos();
         var root_dir = std.Io.Dir.cwd().openDir(io, root_path, .{}) catch null;
@@ -248,6 +255,7 @@ pub fn writeSnapshot(
                 std.mem.writeInt(u32, &cl_buf, @intCast(content.len), .little);
                 try fw.writeAll(&cl_buf);
                 try fw.writeAll(content);
+                try content_hashes.append(allocator, std.hash.Wyhash.hash(0, content));
             } else if (root_dir) |*dir| {
                 const disk_content = dir.readFileAlloc(io, path, allocator, .limited(64 * 1024 * 1024)) catch continue;
                 errdefer allocator.free(disk_content);
@@ -260,11 +268,27 @@ pub fn writeSnapshot(
                 std.mem.writeInt(u32, &cl_buf, @intCast(disk_content.len), .little);
                 try fw.writeAll(&cl_buf);
                 try fw.writeAll(disk_content);
+                try content_hashes.append(allocator, std.hash.Wyhash.hash(0, disk_content));
                 allocator.free(disk_content);
             }
         }
         const end = file_writer.logicalPos();
         try sections.append(allocator, .{ .id = @intFromEnum(SectionId.content), .offset = offset, .length = end - offset });
+    }
+
+    // ── Section: CONTENT_HASHES ──
+    // u64 Wyhash per content record, in the exact order of the CONTENT section,
+    // so the loader can record Store baselines without re-hashing content. An
+    // absent section just makes the loader recompute (older snapshots).
+    {
+        const offset = file_writer.logicalPos();
+        for (content_hashes.items) |h| {
+            var hbuf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &hbuf, h, .little);
+            try fw.writeAll(&hbuf);
+        }
+        const end = file_writer.logicalPos();
+        try sections.append(allocator, .{ .id = @intFromEnum(SectionId.content_hashes), .offset = offset, .length = end - offset });
     }
 
     // ── Section: FREQ TABLE ──
@@ -782,6 +806,12 @@ fn loadSnapshotFast(
     store: *Store,
     allocator: std.mem.Allocator,
 ) !bool {
+    // Optional phase profiler (CODEDB_LOAD_PROFILE): prints a load breakdown to
+    // stderr. Near-zero cost when off (one getenv + a few timestamps).
+    const prof = cio.posixGetenv("CODEDB_LOAD_PROFILE") != null;
+    const t_load0: i128 = if (prof) cio.nanoTimestamp() else 0;
+    var fresh_ns: i128 = 0;
+
     var section_backing: ?[]const u8 = null;
     // backing_allocator = explorer.allocator: the section buffer is retained by
     // the Explorer (outline_section_bufs) and freed via explorer.allocator, so it
@@ -809,6 +839,7 @@ fn loadSnapshotFast(
         explorer.dep_graph.reverse.ensureTotalCapacity(fc) catch {};
     }
 
+    const t_outline: i128 = if (prof) cio.nanoTimestamp() else 0;
     var sections = (try readSections(io, snapshot_path, allocator)) orelse return false;
     defer sections.deinit();
 
@@ -822,6 +853,13 @@ fn loadSnapshotFast(
     const snap_mtime: i128 = @intCast(file_stat.mtime.nanoseconds);
     var file_count: u32 = 0;
     var word_index_can_load_from_disk = true;
+
+    // Precomputed per-record content hashes (CONTENT_HASHES section), in content
+    // order. Lets the restored branch record Store baselines without re-hashing
+    // (which would also fault in all content pages). Absent => recompute.
+    const content_hashes_buf: ?[]u8 = readSectionBytes(io, snapshot_path, .content_hashes, allocator) catch null;
+    defer if (content_hashes_buf) |b| allocator.free(b);
+    var rec: usize = 0; // 0-based content-record index, matches content_hashes order
 
     // Read the content section as one block, then parse records from memory.
     // This replaces ~4 readPositionalAll syscalls per file (path_len, path,
@@ -885,7 +923,18 @@ fn loadSnapshotFast(
         // alive for the whole loop, so the slice never outlives its backing.
         const content = section[sc..][0..content_len];
         sc += content_len;
+        const rec_idx = rec;
+        rec += 1;
+        // Precomputed hash of this record's content, if the snapshot carries it.
+        // Used for the restored/outline-only branches (content == snapshot content)
+        // so we don't re-hash + fault every page. The changed-file branch below
+        // re-hashes the fresh disk content instead.
+        const stored_hash: ?u64 = if (content_hashes_buf) |hb| blk: {
+            const off = rec_idx * 8;
+            break :blk if (off + 8 <= hb.len) std.mem.readInt(u64, hb[off..][0..8], .little) else null;
+        } else null;
         var disk_content: ?[]u8 = null;
+        const t_fresh0: i128 = if (prof) cio.nanoTimestamp() else 0;
         if (snap_mtime > 0) blk: {
             // statFile (no open/close) — we only need the mtime to detect edits
             // made since the snapshot. Saves 2 syscalls/file vs openFile+stat+close
@@ -896,6 +945,7 @@ fn loadSnapshotFast(
             if (ds_mtime <= snap_mtime) break :blk;
             disk_content = std.Io.Dir.cwd().readFileAlloc(io, path_buf, allocator, .limited(16 * 1024 * 1024)) catch break :blk;
         }
+        if (prof) fresh_ns += cio.nanoTimestamp() - t_fresh0;
         defer if (disk_content) |dc| allocator.free(dc);
 
         if (disk_content) |dc| {
@@ -921,7 +971,7 @@ fn loadSnapshotFast(
                 bad_outline.deinit();
                 continue;
             };
-            const hash = std.hash.Wyhash.hash(0, content);
+            const hash = stored_hash orelse std.hash.Wyhash.hash(0, content);
             _ = store.recordSnapshot(removed.key, content.len, hash) catch {};
         } else {
             word_index_can_load_from_disk = false;
@@ -929,7 +979,7 @@ fn loadSnapshotFast(
                 allocator.free(path_buf);
                 continue;
             };
-            const hash = std.hash.Wyhash.hash(0, content);
+            const hash = stored_hash orelse std.hash.Wyhash.hash(0, content);
             _ = store.recordSnapshot(path_buf, content.len, hash) catch {};
             allocator.free(path_buf);
         }
@@ -976,6 +1026,21 @@ fn loadSnapshotFast(
     // early once this is set). Best-effort: any failure just leaves it unbuilt.
     if (sections.get(@intFromEnum(SectionId.call_centrality))) |cc_entry| {
         restoreCallCentrality(io, snapshot_path, cc_entry, explorer, allocator) catch {};
+    }
+
+    if (prof) {
+        const now = cio.nanoTimestamp();
+        const ms = struct {
+            fn f(ns: i128) f64 {
+                return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+            }
+        }.f;
+        const outline_ns = t_outline - t_load0;
+        const loop_ns = now - t_outline;
+        std.debug.print(
+            "[load-profile] {d} files  total={d:.1}ms  outline={d:.1}ms  loop={d:.1}ms (freshness={d:.1}ms, rest={d:.1}ms)\n",
+            .{ file_count, ms(now - t_load0), ms(outline_ns), ms(loop_ns), ms(fresh_ns), ms(loop_ns - fresh_ns) },
+        );
     }
 
     return true;
