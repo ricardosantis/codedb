@@ -48,6 +48,36 @@ the query hot path.
   `next`, …) are filtered out — guessing would assert a false edge in an
   LLM-facing block, so ambiguous calls are omitted rather than mis-resolved.
 
+### Snapshot load performance (~3× faster load, ~338 MB lower RSS)
+
+A series of load-path changes, each A/B-measured on openclaw/openclaw (~39k
+files; interleaved warm loads, zero overlap between arms), found with a new gated
+`CODEDB_LOAD_PROFILE` phase profiler (near-zero cost when off). Cumulatively the
+load went from ~380 ms to ~125 ms and peak RSS from ~795 MB to ~457 MB.
+
+- **Borrow restored outline strings + pre-size the load maps.** Imports / symbol
+  names / details are now slices into the retained `OUTLINE_STATE` section instead
+  of ~170k (millions on a dense repo) per-string dupes, and the load's hashmaps are
+  pre-sized to the known file count. ~34% faster.
+- **`statFile` instead of `openFile` + `stat` + `close` in the freshness check.**
+  Only the mtime is needed, so one syscall per file instead of three. ~36% faster,
+  and far more resilient to machine load.
+- **mmap the content section.** Records are parsed from one memory mapping instead
+  of ~4 `readPositionalAll` syscalls per file (~156k on a 39k-file repo); file-
+  backed and demand-paged, with a heap bulk-read fallback. ~23% faster.
+- **Borrow content from the mmap.** Drops the transient per-file content copy — a
+  full pass over all content plus ~39k alloc/free pairs. ~8% faster.
+- **Zero-copy `ContentCache`.** Cache values are borrowed (`putBorrowed`,
+  `value_owned=false`) directly from the retained mmap instead of duped into owned
+  heap; the Explorer munmaps at deinit, and a later re-index safely replaces a
+  borrowed entry with an owned one. ~17% faster load and ~237 MB lower RSS — the
+  ~268 MB owned content dupe is gone; content lives in the reclaimable mmap.
+- **Stored content hashes (`CONTENT_HASHES` section).** Per-file content hashes are
+  computed once at write time and read back at load, so the loader no longer
+  re-hashes every file's content (which also faulted in every content page). ~14%
+  faster and ~100 MB lower RSS; an absent section makes the loader recompute
+  (backward compatible).
+
 ### Validation
 
 - `zig build test` — all pass, including new codegraph unit tests, `resolveCallees`
@@ -57,6 +87,11 @@ the query hot path.
 - `codedb_context` verified end-to-end through the MCP server on codedb itself
   (e.g. `searchContentRanked` → `lockShared` / `posixGetenv` / `ensureCallCentrality`
   / `normalizeChar` / `splitIdentifier`, all correctly resolved).
+- Snapshot load + RSS A/B'd on openclaw/openclaw (~39k files), two binaries on the
+  same snapshot, interleaved warm loads: load ~380 ms → ~125 ms, peak RSS
+  ~795 MB → ~457 MB, with no overlap between arms on any step. New ContentCache
+  borrow tests and a `CONTENT_HASHES` order-alignment test pass under the
+  DebugAllocator.
 
 ## 0.2.5823 - 2026-05-29
 
