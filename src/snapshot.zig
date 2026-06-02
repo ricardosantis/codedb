@@ -822,24 +822,23 @@ const LoadRecord = struct {
     stored_hash: ?u64,
 };
 
-// Outcome of one file's freshness check. `content` is non-null only when the file
-// on disk was modified after the snapshot: the fresh bytes, allocated from the page
-// allocator (the scan may run on a worker thread) and freed by the insert pass.
-// null = unchanged, or the stat/read failed (treated as unchanged).
+// Outcome of one file's freshness check: was the on-disk file modified after the
+// snapshot? The scan only stats — no content read, no allocation — so workers stay
+// pure and trivially thread-safe; the insert pass reads fresh content (sequentially,
+// one file at a time) for the rare stale ones.
 const LoadFreshness = struct {
-    content: ?[]u8 = null,
+    stale: bool = false,
 };
 
 // Freshness scan for one chunk of records: statFile each path (one syscall, no
-// open/close) and, only when its mtime is newer than the snapshot, re-read the
-// fresh content. Independent per file, so workers run this over disjoint chunks
+// open/close) and flag it stale when its mtime is newer than the snapshot. Pure
+// read-only and allocation-free, so workers run this over disjoint chunks
 // concurrently; each writes only its own slice of `out`.
 fn freshnessScan(io: std.Io, snap_mtime: i128, recs: []const LoadRecord, out: []LoadFreshness) void {
     for (recs, out) |record, *fr| {
         const ds = std.Io.Dir.cwd().statFile(io, record.path, .{}) catch continue;
         const ds_mtime: i128 = @intCast(ds.mtime.nanoseconds);
-        if (ds_mtime <= snap_mtime) continue;
-        fr.content = std.Io.Dir.cwd().readFileAlloc(io, record.path, std.heap.page_allocator, .limited(16 * 1024 * 1024)) catch continue;
+        if (ds_mtime > snap_mtime) fr.stale = true;
     }
 }
 
@@ -980,11 +979,11 @@ fn loadSnapshotFast(
     }
 
     // ── Pass B: freshness check (parallelized for large trees). ──
-    // statFile every record to detect edits made since the snapshot, re-reading
-    // fresh content for any that changed. These are independent per-file syscalls —
-    // the dominant load cost once the borrow/mmap work removed the copies — so fan
-    // them out across workers writing disjoint result slices. The mutating insert
-    // pass (Pass C) consumes the results single-threaded.
+    // statFile every record to detect edits made since the snapshot. These are
+    // independent, allocation-free per-file syscalls — the dominant load cost once
+    // the borrow/mmap work removed the copies — so fan them out across workers, each
+    // flagging its own disjoint slice. The insert pass (Pass C) reads fresh content
+    // for the flagged files and mutates Explorer/Store single-threaded.
     const fresh_results = allocator.alloc(LoadFreshness, records.items.len) catch return false;
     defer allocator.free(fresh_results);
     for (fresh_results) |*fr| fr.* = .{};
@@ -1040,11 +1039,16 @@ fn loadSnapshotFast(
     for (records.items, fresh_results) |record, fr| {
         const path = record.path;
         const content = record.content;
-        // Non-null fr.content => the file was edited after the snapshot (fresh disk
-        // bytes from the page allocator); free it once this record is consumed.
-        defer if (fr.content) |dc| std.heap.page_allocator.free(dc);
+        // A file flagged stale was edited after the snapshot: re-read its fresh
+        // content from disk and re-index it. Read here (not in the parallel scan) so
+        // peak memory is one file's content, not every changed file's at once.
+        var disk_content: ?[]u8 = null;
+        if (fr.stale) {
+            disk_content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024)) catch null;
+        }
+        defer if (disk_content) |dc| allocator.free(dc);
 
-        if (fr.content) |dc| {
+        if (disk_content) |dc| {
             word_index_can_load_from_disk = false;
             if (outline_states.fetchRemove(path)) |removed| {
                 allocator.free(removed.key);
