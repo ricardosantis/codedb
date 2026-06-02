@@ -1,6 +1,63 @@
 # Changelog
 
 
+## 0.2.5824 - 2026-06-02
+
+`0.2.5824` adds a deterministic, no-LLM **code-graph** layer. codedb now builds a
+resolved call graph from the indexed symbols and uses it to rank search results
+more precisely and to assemble richer first-touch context. The graph is computed
+locally with no model calls and persisted in the snapshot, so it costs nothing on
+the query hot path.
+
+### Graph-aware ranking (call-graph centrality)
+
+- **New `src/codegraph.zig` builds a resolved call graph.** For each function
+  body it extracts call sites (`extractCallees` — identifier-before-`(`, keyword
+  filtered, de-duped), resolves each callee name through the function/method
+  symbol table, and accumulates a weighted in-degree centrality per file
+  (ambiguous names split their weight 1/N across candidates).
+- **`searchContentRanked` folds centrality into the score.** Each candidate is
+  multiplied by `1 + 0.15·log(1 + centrality)` — purely additive, never a filter,
+  so recall is unchanged. Set `CODEDB_NO_CENTRALITY` to disable.
+- **MRR-gated on the codedb repo** (18 labelled multi-word queries):
+  MRR 0.819 → 0.944 (+15%), P@1 12 → 16, recall@5 unchanged, four queries' correct
+  file jumped to rank 1, none regressed.
+
+### Persisted call-graph centrality
+
+- **The centrality map is stored in the snapshot** (new `CALL_CENTRALITY` section)
+  and restored on load, instead of being rebuilt lazily on the first ranked query.
+  The index/scan path builds it once via `Explorer.buildCallCentrality` before
+  persisting; the loader restores it keyed off the stable outline paths, so
+  `ensureCallCentrality` short-circuits.
+- **Removes a large first-query stall.** On openclaw/openclaw (~39k files) the lazy
+  build measured ~960 ms; it is now paid once at index time, and restoring it at
+  load adds ~3 ms. Snapshots without the section fall back to the lazy build
+  (backward compatible).
+
+### Edge-aware codedb_context (callees)
+
+- **`codedb_context` now surfaces a "Calls" section** alongside the existing
+  callers section: for each key symbol it walks the symbol's call sites through
+  the call graph and lists where each callee is defined, so an agent sees both who
+  calls a symbol and what it calls without a follow-up `codedb_outline` /
+  `codedb_read`.
+- **High-precision by design.** Resolution is name-based (no type info), so a
+  callee is shown only when it resolves to exactly one non-test function/method,
+  and ubiquitous std/container method names (`init`, `get`, `append`, `lock`,
+  `next`, …) are filtered out — guessing would assert a false edge in an
+  LLM-facing block, so ambiguous calls are omitted rather than mis-resolved.
+
+### Validation
+
+- `zig build test` — all pass, including new codegraph unit tests, `resolveCallees`
+  resolution, and snapshot round-trip + centrality-persistence tests under the
+  DebugAllocator.
+- Graph ranking MRR-gated on the codedb query set (0.819 → 0.944, zero regressions).
+- `codedb_context` verified end-to-end through the MCP server on codedb itself
+  (e.g. `searchContentRanked` → `lockShared` / `posixGetenv` / `ensureCallCentrality`
+  / `normalizeChar` / `splitIdentifier`, all correctly resolved).
+
 ## 0.2.5823 - 2026-05-29
 
 `0.2.5823` is an MCP compatibility hotfix for direct `tools/call` requests.
