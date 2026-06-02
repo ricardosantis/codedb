@@ -798,6 +798,51 @@ fn insertRestoredFile(
     try rebuildDepsFromOutline(explorer, path, &restored_outline, allocator);
 }
 
+// Below this many files the per-file freshness stats run on the loading thread:
+// spawning workers for a small tree costs more than the stats they save. Setting
+// CODEDB_LOAD_WORKERS overrides the worker count (and forces parallelism below the
+// threshold) for A/B measurement. Public so a test can size a fixture that
+// deterministically exercises the multi-worker path.
+pub const FRESHNESS_PARALLEL_THRESHOLD: usize = 256;
+
+// Worker cap for the parallel freshness scan. statFile is dominated by kernel VFS
+// work, not CPU, so throughput saturates at low concurrency: a worker sweep over a
+// 16k-file tree (20 P-core M3 Ultra, files across 200 dirs) measured freshness
+// 14.1ms@1 -> 5.7ms@4 -> 9.5ms@8 -> 13.3ms@12 — a U-curve bottoming at ~4 regardless
+// of core count. More workers past that regress (syscall/cache contention), so cap
+// low rather than at the CPU count. CODEDB_LOAD_WORKERS overrides for re-tuning.
+const FRESHNESS_MAX_WORKERS: usize = 4;
+
+// One parsed CONTENT-section record. `path` and `content` are borrowed slices into
+// the mapped content section (alive for the whole load) — never owned here; the
+// insert pass copies whatever it keeps.
+const LoadRecord = struct {
+    path: []const u8,
+    content: []const u8,
+    stored_hash: ?u64,
+};
+
+// Outcome of one file's freshness check. `content` is non-null only when the file
+// on disk was modified after the snapshot: the fresh bytes, allocated from the page
+// allocator (the scan may run on a worker thread) and freed by the insert pass.
+// null = unchanged, or the stat/read failed (treated as unchanged).
+const LoadFreshness = struct {
+    content: ?[]u8 = null,
+};
+
+// Freshness scan for one chunk of records: statFile each path (one syscall, no
+// open/close) and, only when its mtime is newer than the snapshot, re-read the
+// fresh content. Independent per file, so workers run this over disjoint chunks
+// concurrently; each writes only its own slice of `out`.
+fn freshnessScan(io: std.Io, snap_mtime: i128, recs: []const LoadRecord, out: []LoadFreshness) void {
+    for (recs, out) |record, *fr| {
+        const ds = std.Io.Dir.cwd().statFile(io, record.path, .{}) catch continue;
+        const ds_mtime: i128 = @intCast(ds.mtime.nanoseconds);
+        if (ds_mtime <= snap_mtime) continue;
+        fr.content = std.Io.Dir.cwd().readFileAlloc(io, record.path, std.heap.page_allocator, .limited(16 * 1024 * 1024)) catch continue;
+    }
+}
+
 fn loadSnapshotFast(
     io: std.Io,
     snapshot_path: []const u8,
@@ -859,7 +904,6 @@ fn loadSnapshotFast(
     // (which would also fault in all content pages). Absent => recompute.
     const content_hashes_buf: ?[]u8 = readSectionBytes(io, snapshot_path, .content_hashes, allocator) catch null;
     defer if (content_hashes_buf) |b| allocator.free(b);
-    var rec: usize = 0; // 0-based content-record index, matches content_hashes order
 
     // Read the content section as one block, then parse records from memory.
     // This replaces ~4 readPositionalAll syscalls per file (path_len, path,
@@ -894,94 +938,136 @@ fn loadSnapshotFast(
         break :section_blk h;
     };
 
-    var sc: usize = 0; // cursor into `section`
-    while (sc < section.len) {
-        if (sc + 2 > section.len) break;
-        const path_len = std.mem.readInt(u16, section[sc..][0..2], .little);
-        sc += 2;
-        if (path_len == 0 or path_len > 4096) break;
-        if (sc + path_len > section.len) break;
+    // ── Pass A: parse the CONTENT section into records (borrowed slices). ──
+    // Pure slicing over the mapped section — no per-file allocation. The path and
+    // content of each record are slices into `section` (alive for the whole load).
+    // The insert pass (Pass C) copies whatever it retains — indexFile*/recordSnapshot
+    // dupe the path, the restored branch reuses the OUTLINE_STATE map key — so this
+    // drops the old per-record path_buf alloc+memcpy+free (one pair per file).
+    var records: std.ArrayList(LoadRecord) = .empty;
+    defer records.deinit(allocator);
+    if (expected_file_count) |fc| records.ensureTotalCapacity(allocator, fc) catch {};
+    {
+        var sc: usize = 0; // cursor into `section`
+        var rec_idx: usize = 0;
+        while (sc < section.len) {
+            if (sc + 2 > section.len) break;
+            const path_len = std.mem.readInt(u16, section[sc..][0..2], .little);
+            sc += 2;
+            if (path_len == 0 or path_len > 4096) break;
+            if (sc + path_len > section.len) break;
+            const path = section[sc..][0..path_len];
+            sc += path_len;
 
-        const path_buf = allocator.alloc(u8, path_len) catch return false;
-        @memcpy(path_buf, section[sc..][0..path_len]);
-        sc += path_len;
+            if (sc + 4 > section.len) break;
+            const content_len = std.mem.readInt(u32, section[sc..][0..4], .little);
+            sc += 4;
+            if (content_len > 64 * 1024 * 1024 or sc + content_len > section.len) break;
+            const content = section[sc..][0..content_len];
+            sc += content_len;
 
-        if (sc + 4 > section.len) {
-            allocator.free(path_buf);
-            break;
+            // Precomputed hash of this record's content, if the snapshot carries it
+            // (content order). Lets the restored/outline-only branches record a Store
+            // baseline without re-hashing + faulting every page; the changed-file
+            // branch re-hashes fresh disk content instead.
+            const stored_hash: ?u64 = if (content_hashes_buf) |hb| blk: {
+                const off = rec_idx * 8;
+                break :blk if (off + 8 <= hb.len) std.mem.readInt(u64, hb[off..][0..8], .little) else null;
+            } else null;
+            records.append(allocator, .{ .path = path, .content = content, .stored_hash = stored_hash }) catch break;
+            rec_idx += 1;
         }
-        const content_len = std.mem.readInt(u32, section[sc..][0..4], .little);
-        sc += 4;
-        if (content_len > 64 * 1024 * 1024 or sc + content_len > section.len) {
-            allocator.free(path_buf);
-            break;
-        }
+    }
 
-        // `content` borrows the mapped section directly — no transient copy.
-        // The consumers below (insertRestoredFile/indexFile*/recordSnapshot)
-        // only read it or dupe it into the content cache, and the mapping is
-        // alive for the whole loop, so the slice never outlives its backing.
-        const content = section[sc..][0..content_len];
-        sc += content_len;
-        const rec_idx = rec;
-        rec += 1;
-        // Precomputed hash of this record's content, if the snapshot carries it.
-        // Used for the restored/outline-only branches (content == snapshot content)
-        // so we don't re-hash + fault every page. The changed-file branch below
-        // re-hashes the fresh disk content instead.
-        const stored_hash: ?u64 = if (content_hashes_buf) |hb| blk: {
-            const off = rec_idx * 8;
-            break :blk if (off + 8 <= hb.len) std.mem.readInt(u64, hb[off..][0..8], .little) else null;
-        } else null;
-        var disk_content: ?[]u8 = null;
-        const t_fresh0: i128 = if (prof) cio.nanoTimestamp() else 0;
-        if (snap_mtime > 0) blk: {
-            // statFile (no open/close) — we only need the mtime to detect edits
-            // made since the snapshot. Saves 2 syscalls/file vs openFile+stat+close
-            // across the whole tree; the file is only opened (readFileAlloc below)
-            // when it's actually newer, which is the rare case.
-            const ds = std.Io.Dir.cwd().statFile(io, path_buf, .{}) catch break :blk;
-            const ds_mtime: i128 = @intCast(ds.mtime.nanoseconds);
-            if (ds_mtime <= snap_mtime) break :blk;
-            disk_content = std.Io.Dir.cwd().readFileAlloc(io, path_buf, allocator, .limited(16 * 1024 * 1024)) catch break :blk;
-        }
-        if (prof) fresh_ns += cio.nanoTimestamp() - t_fresh0;
-        defer if (disk_content) |dc| allocator.free(dc);
+    // ── Pass B: freshness check (parallelized for large trees). ──
+    // statFile every record to detect edits made since the snapshot, re-reading
+    // fresh content for any that changed. These are independent per-file syscalls —
+    // the dominant load cost once the borrow/mmap work removed the copies — so fan
+    // them out across workers writing disjoint result slices. The mutating insert
+    // pass (Pass C) consumes the results single-threaded.
+    const fresh_results = allocator.alloc(LoadFreshness, records.items.len) catch return false;
+    defer allocator.free(fresh_results);
+    for (fresh_results) |*fr| fr.* = .{};
 
-        if (disk_content) |dc| {
+    const t_fresh0: i128 = if (prof) cio.nanoTimestamp() else 0;
+    if (snap_mtime > 0 and records.items.len > 0) {
+        const want_workers = blk: {
+            if (cio.posixGetenv("CODEDB_LOAD_WORKERS")) |raw| {
+                const parsed = std.fmt.parseInt(usize, raw, 10) catch 0;
+                if (parsed > 0) break :blk parsed;
+            }
+            if (records.items.len < FRESHNESS_PARALLEL_THRESHOLD) break :blk 1;
+            const cpu_count = std.Thread.getCpuCount() catch 1;
+            break :blk @min(@as(usize, @intCast(cpu_count)), FRESHNESS_MAX_WORKERS);
+        };
+        const n_workers = @max(@as(usize, 1), @min(want_workers, records.items.len));
+        if (n_workers <= 1) {
+            freshnessScan(io, snap_mtime, records.items, fresh_results);
+        } else if (allocator.alloc(std.Thread, n_workers)) |threads| {
+            defer allocator.free(threads);
+            const chunk = records.items.len / n_workers;
+            const rem = records.items.len % n_workers;
+            var off: usize = 0;
+            var spawned: usize = 0;
+            var spawn_failed = false;
+            for (0..n_workers) |i| {
+                const extra: usize = if (i < rem) 1 else 0;
+                const start = off;
+                off += chunk + extra;
+                const recs = records.items[start..off];
+                const out = fresh_results[start..off];
+                if (spawn_failed) {
+                    freshnessScan(io, snap_mtime, recs, out);
+                    continue;
+                }
+                if (std.Thread.spawn(.{}, freshnessScan, .{ io, snap_mtime, recs, out })) |t| {
+                    threads[spawned] = t;
+                    spawned += 1;
+                } else |_| {
+                    // Out of threads: scan this chunk (and any remaining) inline.
+                    freshnessScan(io, snap_mtime, recs, out);
+                    spawn_failed = true;
+                }
+            }
+            for (threads[0..spawned]) |t| t.join();
+        } else |_| {
+            freshnessScan(io, snap_mtime, records.items, fresh_results);
+        }
+    }
+    if (prof) fresh_ns += cio.nanoTimestamp() - t_fresh0;
+
+    // ── Pass C: insert restored / changed / outline-only files (sequential). ──
+    for (records.items, fresh_results) |record, fr| {
+        const path = record.path;
+        const content = record.content;
+        // Non-null fr.content => the file was edited after the snapshot (fresh disk
+        // bytes from the page allocator); free it once this record is consumed.
+        defer if (fr.content) |dc| std.heap.page_allocator.free(dc);
+
+        if (fr.content) |dc| {
             word_index_can_load_from_disk = false;
-            if (outline_states.fetchRemove(path_buf)) |removed| {
+            if (outline_states.fetchRemove(path)) |removed| {
                 allocator.free(removed.key);
                 var stale_outline = removed.value;
                 stale_outline.deinit();
             }
-
-            explorer.indexFile(path_buf, dc) catch {
-                allocator.free(path_buf);
-                continue;
-            };
+            explorer.indexFile(path, dc) catch continue;
             const hash = std.hash.Wyhash.hash(0, dc);
-            _ = store.recordSnapshot(path_buf, dc.len, hash) catch {};
-            allocator.free(path_buf);
-        } else if (outline_states.fetchRemove(path_buf)) |removed| {
-            allocator.free(path_buf);
+            _ = store.recordSnapshot(path, dc.len, hash) catch {};
+        } else if (outline_states.fetchRemove(path)) |removed| {
             insertRestoredFile(explorer, removed.key, content, removed.value, allocator, content_borrowed) catch {
                 allocator.free(removed.key);
                 var bad_outline = removed.value;
                 bad_outline.deinit();
                 continue;
             };
-            const hash = stored_hash orelse std.hash.Wyhash.hash(0, content);
+            const hash = record.stored_hash orelse std.hash.Wyhash.hash(0, content);
             _ = store.recordSnapshot(removed.key, content.len, hash) catch {};
         } else {
             word_index_can_load_from_disk = false;
-            explorer.indexFileOutlineOnly(path_buf, content) catch {
-                allocator.free(path_buf);
-                continue;
-            };
-            const hash = stored_hash orelse std.hash.Wyhash.hash(0, content);
-            _ = store.recordSnapshot(path_buf, content.len, hash) catch {};
-            allocator.free(path_buf);
+            explorer.indexFileOutlineOnly(path, content) catch continue;
+            const hash = record.stored_hash orelse std.hash.Wyhash.hash(0, content);
+            _ = store.recordSnapshot(path, content.len, hash) catch {};
         }
 
         file_count += 1;

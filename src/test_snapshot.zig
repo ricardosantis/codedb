@@ -399,6 +399,71 @@ test "issue-220: snapshot fast load restores outlines and lazily rebuilds word i
     try testing.expect(exp2.wordIndexNeedsPersist());
 }
 
+test "snapshot: parallel freshness load re-indexes changed files, restores the rest" {
+    // Forces loadSnapshotFast's multi-worker freshness path with a fixture larger
+    // than FRESHNESS_PARALLEL_THRESHOLD: files edited after the snapshot must come
+    // back with fresh content (changed branch) while the rest restore unchanged.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const total = snapshot_mod.FRESHNESS_PARALLEL_THRESHOLD + 32;
+
+    // Build `total` files on disk, indexing each by ABSOLUTE path so the load's
+    // cwd-relative statFile resolves them regardless of the test's working dir.
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    const abs_paths = try aa.alloc([]const u8, total);
+    for (0..total) |i| {
+        const rel = try std.fmt.allocPrint(aa, "f{d}.zig", .{i});
+        const content = try std.fmt.allocPrint(aa, "pub fn oldfn_{d}() void {{}}\n", .{i});
+        try tmp.dir.writeFile(io, .{ .sub_path = rel, .data = content });
+        abs_paths[i] = try std.fmt.allocPrint(aa, "{s}/{s}", .{ dir_path, rel });
+        try exp.indexFileOutlineOnly(abs_paths[i], content);
+    }
+
+    const snap_path = try std.fmt.allocPrint(aa, "{s}/parallel.codedb", .{dir_path});
+    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, aa);
+
+    // Edit a spread of files AFTER the snapshot so their mtime is strictly newer.
+    cio.sleepMs(10);
+    const changed = [_]usize{ 1, total / 4, total / 2, (total * 3) / 4, total - 2 };
+    for (changed) |i| {
+        const rel = try std.fmt.allocPrint(aa, "f{d}.zig", .{i});
+        const content = try std.fmt.allocPrint(aa, "pub fn newfn_{d}() void {{}}\n", .{i});
+        try tmp.dir.writeFile(io, .{ .sub_path = rel, .data = content });
+    }
+
+    // Reload into a fresh explorer: the parallel scan must spot the edited files.
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    var exp2 = Explorer.init(arena2.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    try testing.expect(snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, arena2.allocator()));
+    try testing.expectEqual(total, exp2.outlines.count());
+
+    var is_changed = [_]bool{false} ** total;
+    for (changed) |i| is_changed[i] = true;
+
+    // Changed files carry fresh content (changed branch); the rest keep snapshot
+    // content (restored branch) — verified directly via the content cache.
+    for (0..total) |i| {
+        const cached = exp2.contents.get(abs_paths[i]) orelse return error.MissingContent;
+        const want = if (is_changed[i])
+            try std.fmt.allocPrint(aa, "pub fn newfn_{d}() void {{}}\n", .{i})
+        else
+            try std.fmt.allocPrint(aa, "pub fn oldfn_{d}() void {{}}\n", .{i});
+        try testing.expectEqualStrings(want, cached);
+    }
+}
+
 
 test "snapshot: writer streams uncached file contents for large repos" {
     var tmp = testing.tmpDir(.{});
