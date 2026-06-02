@@ -1,9 +1,13 @@
 const std = @import("std");
 
 /// Fixed-capacity CLOCK eviction cache for file contents.
-/// Keys are owned (duped on put, freed on eviction/remove/clear).
-/// Values are owned (duped on put, freed on eviction/remove/clear).
-/// Zero dynamic allocation past init.
+/// Keys are always owned (duped on put, freed on eviction/remove/clear/deinit).
+/// Values are owned by default (duped on put), but `putBorrowed` stores a value
+/// that aliases externally-owned memory (e.g. a retained mmap of the snapshot
+/// content section): `value_owned=false` so it is never freed by the cache —
+/// the borrowed bytes must outlive the cache (the Explorer munmaps at deinit).
+/// Zero dynamic allocation past init (for owned-value puts; borrowed puts don't
+/// allocate the value at all).
 pub const ContentCache = struct {
     slots: []Slot,
     capacity: u32,
@@ -22,6 +26,9 @@ pub const ContentCache = struct {
         value: []const u8,
         ref_bit: bool,
         present: bool,
+        /// When false, `value` aliases externally-owned memory and the cache
+        /// must not free it (the key is always cache-owned regardless).
+        value_owned: bool,
     };
 
     const empty_slot = Slot{
@@ -30,6 +37,7 @@ pub const ContentCache = struct {
         .value = &.{},
         .ref_bit = false,
         .present = false,
+        .value_owned = false,
     };
 
     pub const Stats = struct {
@@ -78,7 +86,7 @@ pub const ContentCache = struct {
         for (self.slots) |*slot| {
             if (slot.present) {
                 self.allocator.free(slot.key);
-                self.allocator.free(slot.value);
+                if (slot.value_owned) self.allocator.free(slot.value);
             }
         }
         self.allocator.free(self.slots);
@@ -102,9 +110,22 @@ pub const ContentCache = struct {
         return null;
     }
 
-    /// Insert key/value. Dups both into the cache allocator.
-    /// On collision past probe limit, evicts a cold slot via CLOCK sweep and frees its memory.
+    /// Insert key/value, duping both into the cache allocator. On collision past
+    /// the probe limit, evicts a cold slot via CLOCK sweep and frees its memory.
     pub fn put(self: *ContentCache, key: []const u8, value: []const u8) !void {
+        return self.putImpl(key, value, true);
+    }
+
+    /// Like `put`, but `value` aliases externally-owned memory that outlives the
+    /// cache (a retained mmap of the snapshot content section). The value is
+    /// stored as-is (no dupe) and is never freed by the cache; the key is still
+    /// duped/owned as usual. The caller guarantees `value`'s backing stays valid
+    /// for as long as the entry can live (until Explorer.deinit munmaps it).
+    pub fn putBorrowed(self: *ContentCache, key: []const u8, value: []const u8) !void {
+        return self.putImpl(key, value, false);
+    }
+
+    fn putImpl(self: *ContentCache, key: []const u8, value: []const u8, own: bool) !void {
         const h = hashKey(key);
         const base = @as(u32, @truncate(h)) % self.capacity;
 
@@ -113,19 +134,22 @@ pub const ContentCache = struct {
             const slot_idx = (base +% i) % self.capacity;
             const slot = &self.slots[slot_idx];
             if (slot.present and slot.key_hash == h and std.mem.eql(u8, slot.key, key)) {
-                const old_value = slot.value;
-                slot.value = try self.allocator.dupe(u8, value);
+                // Compute the new value first so a failed dupe leaves the slot intact.
+                const new_value = if (own) try self.allocator.dupe(u8, value) else value;
+                if (slot.value_owned) self.allocator.free(slot.value);
+                slot.value = new_value;
+                slot.value_owned = own;
                 slot.ref_bit = true;
-                self.allocator.free(old_value);
                 return;
             }
             if (!slot.present) {
                 const duped_key = try self.allocator.dupe(u8, key);
                 errdefer self.allocator.free(duped_key);
-                const duped_val = try self.allocator.dupe(u8, value);
+                const new_value = if (own) try self.allocator.dupe(u8, value) else value;
                 slot.key_hash = h;
                 slot.key = duped_key;
-                slot.value = duped_val;
+                slot.value = new_value;
+                slot.value_owned = own;
                 slot.ref_bit = true;
                 slot.present = true;
                 self.count_ += 1;
@@ -138,16 +162,17 @@ pub const ContentCache = struct {
         const slot = &self.slots[evict_idx];
         if (slot.present) {
             self.allocator.free(slot.key);
-            self.allocator.free(slot.value);
+            if (slot.value_owned) self.allocator.free(slot.value);
             self.count_ -= 1;
             _ = self.evictions_.fetchAdd(1, .monotonic);
         }
         const duped_key = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(duped_key);
-        const duped_val = try self.allocator.dupe(u8, value);
+        const new_value = if (own) try self.allocator.dupe(u8, value) else value;
         slot.key_hash = h;
         slot.key = duped_key;
-        slot.value = duped_val;
+        slot.value = new_value;
+        slot.value_owned = own;
         slot.ref_bit = true;
         slot.present = true;
         self.count_ += 1;
@@ -162,7 +187,7 @@ pub const ContentCache = struct {
             const slot = &self.slots[slot_idx];
             if (slot.present and slot.key_hash == h and std.mem.eql(u8, slot.key, key)) {
                 self.allocator.free(slot.key);
-                self.allocator.free(slot.value);
+                if (slot.value_owned) self.allocator.free(slot.value);
                 slot.* = empty_slot;
                 self.count_ -= 1;
                 return;
@@ -175,7 +200,7 @@ pub const ContentCache = struct {
         for (self.slots) |*slot| {
             if (slot.present) {
                 self.allocator.free(slot.key);
-                self.allocator.free(slot.value);
+                if (slot.value_owned) self.allocator.free(slot.value);
                 slot.* = empty_slot;
             }
         }
@@ -325,4 +350,50 @@ test "ContentCache: eviction fires under capacity pressure" {
     try std.testing.expect(cache.len() <= cap);
     const s = cache.stats();
     try std.testing.expect(s.evictions > 0);
+}
+
+test "ContentCache: putBorrowed is zero-copy and never frees the value" {
+    var cache = try ContentCache.initAlloc(std.testing.allocator, 64);
+    defer cache.deinit();
+
+    // A string literal lives in static memory — if the cache ever tried to free
+    // it, the DebugAllocator would detect a bad free / crash.
+    const borrowed: []const u8 = "borrowed content not owned by the cache";
+    try cache.putBorrowed("k", borrowed);
+    const got = cache.get("k").?;
+    try std.testing.expectEqual(borrowed.ptr, got.ptr); // aliases, not a copy
+    try std.testing.expectEqualStrings(borrowed, got);
+
+    // remove frees the owned key but must leave the borrowed value alone.
+    cache.remove("k");
+    try std.testing.expect(cache.get("k") == null);
+}
+
+test "ContentCache: mixed owned/borrowed — transitions and eviction free correctly" {
+    var cache = try ContentCache.initAlloc(std.testing.allocator, 8);
+    defer cache.deinit();
+
+    const lit: []const u8 = "literal-borrowed-value";
+    try cache.put("a", "heap-duped");       // owned
+    try cache.putBorrowed("b", lit);        // borrowed
+    try std.testing.expectEqualStrings("heap-duped", cache.get("a").?);
+    try std.testing.expectEqual(lit.ptr, cache.get("b").?.ptr);
+
+    // owned -> borrowed: the old heap value must be freed, new aliases lit.
+    try cache.putBorrowed("a", lit);
+    try std.testing.expectEqual(lit.ptr, cache.get("a").?.ptr);
+    // borrowed -> owned: the old borrowed (literal) must NOT be freed.
+    try cache.put("b", "now-owned");
+    try std.testing.expectEqualStrings("now-owned", cache.get("b").?);
+
+    // Capacity pressure with both kinds interleaved: evicting a borrowed slot
+    // must skip the free (would crash on the literal); evicting owned frees it.
+    var kb: [16]u8 = undefined;
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        const k = std.fmt.bufPrint(&kb, "f{d}", .{i}) catch unreachable;
+        if (i % 2 == 0) try cache.putBorrowed(k, lit) else try cache.put(k, "v");
+    }
+    try std.testing.expect(cache.len() <= 8);
+    // No leak (DebugAllocator) and no bad free => the owned/borrowed split holds.
 }

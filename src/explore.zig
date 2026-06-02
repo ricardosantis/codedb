@@ -63,6 +63,11 @@ pub const FileOutline = struct {
     imports: std.ArrayList([]const u8) = .empty,
     allocator: std.mem.Allocator,
     owns_path: bool = false,
+    /// When true, `imports` and each `symbols[].name`/`.detail` are borrowed
+    /// slices into an externally-owned buffer (the snapshot outline_state
+    /// section, retained by the Explorer) rather than individual allocations,
+    /// so deinit must not free them. The ArrayLists themselves are still owned.
+    borrows_strings: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) FileOutline {
         return .{
@@ -75,12 +80,14 @@ pub const FileOutline = struct {
     }
     pub fn deinit(self: *FileOutline) void {
         if (self.owns_path) self.allocator.free(self.path);
-        for (self.symbols.items) |sym| {
-            self.allocator.free(sym.name);
-            if (sym.detail) |d| self.allocator.free(d);
+        if (!self.borrows_strings) {
+            for (self.symbols.items) |sym| {
+                self.allocator.free(sym.name);
+                if (sym.detail) |d| self.allocator.free(d);
+            }
+            for (self.imports.items) |imp| self.allocator.free(imp);
         }
         self.symbols.deinit(self.allocator);
-        for (self.imports.items) |imp| self.allocator.free(imp);
         self.imports.deinit(self.allocator);
     }
 };
@@ -628,6 +635,15 @@ pub const Explorer = struct {
     /// Production code does not read this field.
     search_tier5_count: u64 = 0,
     last_search_breakdown: SearchBreakdown = .{},
+    /// Buffers adopted from snapshot loads (the raw outline_state section).
+    /// Restored FileOutlines borrow their import/symbol strings as slices into
+    /// these (see FileOutline.borrows_strings), so they must outlive every
+    /// restored outline; freed once here at Explorer.deinit.
+    outline_section_bufs: std.ArrayList([]const u8) = .empty,
+    /// mmap'd snapshot content sections adopted at load. The ContentCache stores
+    /// borrowed (value_owned=false) slices into these for restored files, so they
+    /// must outlive the cache; munmap'd once here at Explorer.deinit.
+    content_section_maps: std.ArrayList([]align(std.heap.page_size_min) const u8) = .empty,
 
     /// Default file-content cache capacity. Was 16384, but on typical
     /// projects (≤2000 files) the cache only ever holds a few hundred
@@ -677,9 +693,29 @@ pub const Explorer = struct {
         self.word_index.deinit();
         self.trigram_index.deinit();
         self.skip_trigram_files.deinit();
+        // Freed after outlines (above) since restored outlines borrow into these.
+        for (self.outline_section_bufs.items) |b| self.allocator.free(b);
+        self.outline_section_bufs.deinit(self.allocator);
+        // munmap'd after contents.deinit (above): the cache holds borrowed slices
+        // into these maps, but deinit skips freeing borrowed values, so the maps
+        // are still valid through it and only released here.
+        for (self.content_section_maps.items) |m| std.posix.munmap(m);
+        self.content_section_maps.deinit(self.allocator);
         if (self.root_dir) |d| {
             if (self.io) |io| d.close(io);
         }
+    }
+
+    /// Take ownership of a snapshot outline_state section buffer that restored
+    /// FileOutlines borrow their import/symbol strings from. Freed at deinit.
+    pub fn adoptOutlineSection(self: *Explorer, buf: []const u8) !void {
+        try self.outline_section_bufs.append(self.allocator, buf);
+    }
+
+    /// Take ownership of an mmap'd snapshot content section that the ContentCache
+    /// borrows (value_owned=false) slices from. munmap'd at deinit.
+    pub fn adoptContentSection(self: *Explorer, map: []align(std.heap.page_size_min) const u8) !void {
+        try self.content_section_maps.append(self.allocator, map);
     }
 
     /// Number of slots in the heap trigram index id_to_path array (benchmark helper).
@@ -1824,6 +1860,139 @@ pub const Explorer = struct {
         return result_list.toOwnedSlice(allocator);
     }
 
+    pub const CalleeRef = struct {
+        name: []const u8, // callee identifier (borrows the resolved body content)
+        path: []const u8, // file the callee is defined in (borrows a stable outlines key)
+        line: u32,
+        kind: SymbolKind,
+    };
+
+    /// Resolve the call sites inside the function defined at `path` spanning
+    /// [line_start, line_end] to their definitions — the dependency side of the
+    /// call-graph neighborhood, using the same extraction as centrality. Deduped
+    /// by callee name, capped at `max`, function/method targets only, and the
+    /// defining function itself is skipped. Best-effort. Everything is allocated
+    /// in / borrowed from `allocator` (intended to be a per-request arena); the
+    /// returned slice and each `.name` live as long as that allocator.
+    pub fn resolveCallees(
+        self: *Explorer,
+        path: []const u8,
+        line_start: u32,
+        line_end: u32,
+        allocator: std.mem.Allocator,
+        max: usize,
+    ) ![]CalleeRef {
+        if (max == 0 or line_end < line_start) return &.{};
+        const content = (self.getContent(path, allocator) catch return &.{}) orelse return &.{};
+        const body = sliceLineRange(content, line_start, line_end);
+        if (body.len == 0) return &.{};
+        const callees = codegraph.extractCallees(allocator, body) catch return &.{};
+
+        var refs: std.ArrayList(CalleeRef) = .empty;
+        // Resolve each callee straight off the symbol index: we only need to know
+        // whether exactly one non-test function/method defines the name, which is
+        // O(defs-of-that-name). findAllSymbols would instead run an O(all-symbols)
+        // safety scan over every outline and allocate a full result list per name —
+        // ~18 such scans per codedb_context made it ~20% slower on a multi-thousand-
+        // file repo (the #524 bench regression). The index is rebuilt on every
+        // commit, so for this high-precision/best-effort feature it is authoritative.
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        for (callees) |name| {
+            if (refs.items.len >= max) break;
+            // Skip ubiquitous std/container/builtin method names. They are almost
+            // always calls on some receiver (ArrayList.append, HashMap.get, ...),
+            // not the rare user-defined free function of the same name, so name-
+            // based resolution would assert a false edge even when there's a
+            // single user definition.
+            if (isUbiquitousName(name)) continue;
+            const locs = self.symbol_index.get(name) orelse continue;
+            // Only surface UNAMBIGUOUS edges: a callee is shown only if exactly one
+            // non-test function/method defines that name. Resolution is name-based
+            // (no type info), so common method names (init, lock, get, next, ...)
+            // resolve to many candidates — guessing one would assert a false edge.
+            // Skipping them keeps this high-precision; ambiguous names are omitted.
+            var cand: ?SymbolLocation = null;
+            var n_cand: usize = 0;
+            for (locs.items) |loc| {
+                if (loc.kind != .function and loc.kind != .method) continue;
+                if (isLikelyTestPath(loc.path)) continue;
+                // Skip the defining function itself (self-edge / recursion).
+                if (loc.line_start == line_start and std.mem.eql(u8, loc.path, path)) continue;
+                n_cand += 1;
+                if (n_cand > 1) break; // ambiguous — stop, will be skipped
+                cand = loc;
+            }
+            if (n_cand == 1) {
+                const loc = cand.?;
+                try refs.append(allocator, .{
+                    .name = name,
+                    .path = try allocator.dupe(u8, loc.path),
+                    .line = loc.line_start,
+                    .kind = loc.kind,
+                });
+            }
+        }
+        return refs.toOwnedSlice(allocator);
+    }
+
+    /// Heuristic: does this path look like a test/spec/fixture file? Mirrors the
+    /// filter used by the codedb_context callers section.
+    fn isLikelyTestPath(path: []const u8) bool {
+        return std.mem.startsWith(u8, path, "tests/") or
+            std.mem.startsWith(u8, path, "test/") or
+            std.mem.indexOf(u8, path, "/test") != null or
+            std.mem.indexOf(u8, path, "_test.") != null or
+            std.mem.indexOf(u8, path, ".test.") != null or
+            std.mem.indexOf(u8, path, ".spec.") != null or
+            std.mem.indexOf(u8, path, "/__tests__/") != null or
+            std.mem.indexOf(u8, path, "/spec/") != null or
+            std.mem.indexOf(u8, path, "/fixtures/") != null;
+    }
+
+    /// Names so commonly used as stdlib/container/builtin methods across
+    /// languages that a `name(` call site almost never refers to a user-defined
+    /// free function of that name. Used to suppress false callee edges from
+    /// name-only resolution. Conservative: only the highest-collision names.
+    fn isUbiquitousName(name: []const u8) bool {
+        const common = [_][]const u8{
+            "init",        "deinit",   "append",   "get",       "set",
+            "put",         "getOrPut", "remove",   "contains",  "has",
+            "count",       "len",      "items",    "alloc",     "free",
+            "create",      "destroy",  "lock",     "unlock",    "tryLock",
+            "next",        "iterator", "clone",    "dupe",      "slice",
+            "reset",       "clear",    "format",   "hash",      "eql",
+            "write",       "writeAll", "print",    "read",      "close",
+            "open",        "value",    "key",      "toOwnedSlice", "pop",
+            "push",        "find",     "add",      "new",       "build",
+            "run",         "deinit",   "toString", "valueOf",   "of",
+        };
+        for (common) |c| {
+            if (std.mem.eql(u8, name, c)) return true;
+        }
+        return false;
+    }
+
+    /// Return the slice of `content` covering source lines [line_start, line_end]
+    /// (1-based, inclusive), excluding the trailing newline. Empty if out of range.
+    fn sliceLineRange(content: []const u8, line_start: u32, line_end: u32) []const u8 {
+        if (line_start == 0 or line_end < line_start) return content[0..0];
+        var line: u32 = 1;
+        var i: usize = 0;
+        while (i < content.len and line < line_start) : (i += 1) {
+            if (content[i] == '\n') line += 1;
+        }
+        if (i >= content.len) return content[0..0];
+        const start = i;
+        var cur: u32 = line_start;
+        while (i < content.len) : (i += 1) {
+            if (content[i] == '\n') {
+                if (cur >= line_end) break;
+                cur += 1;
+            }
+        }
+        return content[start..i];
+    }
     pub fn renderSymbols(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !bool {
         self.mu.lockShared();
         defer self.mu.unlockShared();
@@ -2531,6 +2700,17 @@ pub const Explorer = struct {
         const c = cm.get(path) orelse return 1.0;
         const alpha: f32 = 0.15;
         return 1.0 + alpha * @log(1.0 + c);
+    }
+
+    /// Public, lock-acquiring entry point for single-threaded callers (the
+    /// index/scan path) to pre-build call_centrality before persisting a snapshot,
+    /// so a later load can restore it instead of paying the lazy first-query build.
+    /// ensureCallCentrality assumes the caller already holds a shared lock (it is
+    /// normally reached from searchContentRanked); this wrapper takes that lock.
+    pub fn buildCallCentrality(self: *Explorer, allocator: std.mem.Allocator) void {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        self.ensureCallCentrality(allocator);
     }
 
     /// Build `call_centrality` once (idempotent, mutex-guarded). Must be called
@@ -3309,7 +3489,7 @@ pub const Explorer = struct {
             }
         } else if (startsWith(line, "class ")) {
             if (extractIdent(line[6..])) |name| {
-                try appendOutlineSymbol(a, outline, name, .struct_def, line_num, line);
+                try appendOutlineSymbol(a, outline, name, .class_def, line_num, line);
             }
         } else if (startsWith(line, "import ") or startsWith(line, "from ")) {
             try appendOutlineSymbol(a, outline, line, .import, line_num, null);
@@ -4983,7 +5163,10 @@ fn extractIdent(s: []const u8) ?[]const u8 {
     var end: usize = 0;
     for (s) |ch| {
         if (end >= max_ident_len) break;
-        if (std.ascii.isAlphanumeric(ch) or ch == '_') {
+        // Accept ASCII identifier chars plus any non-ASCII UTF-8 byte (>= 0x80) so
+        // identifiers in non-Latin scripts (Korean, Japanese, accented Latin, ...)
+        // are captured rather than truncated to empty. See issue #518.
+        if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch >= 0x80) {
             end += 1;
         } else break;
     }
@@ -5474,7 +5657,10 @@ fn extractRubyMethodName(s: []const u8) ?[]const u8 {
     var end: usize = 0;
     for (s) |ch| {
         if (end >= max_len) break;
-        if (std.ascii.isAlphanumeric(ch) or ch == '_') {
+        // Accept ASCII identifier chars plus any non-ASCII UTF-8 byte (>= 0x80) so
+        // identifiers in non-Latin scripts (Korean, Japanese, accented Latin, ...)
+        // are captured rather than truncated to empty. See issue #518.
+        if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch >= 0x80) {
             end += 1;
         } else break;
     }
@@ -5652,6 +5838,30 @@ fn getFilename(path: []const u8) []const u8 {
     return path;
 }
 
+// Length of the longest common subsequence of two strings, case-insensitive.
+// Used as a fuzzy-match floor: how many of the query's characters actually align,
+// in order, somewhere in the path. See issue #518.
+fn lcsLenIgnoreCase(query: []const u8, path: []const u8) usize {
+    const MAXB = 512;
+    var row: [MAXB + 1]usize = undefined;
+    const pn = @min(path.len, MAXB);
+    for (0..pn + 1) |j| row[j] = 0;
+    for (query) |qc| {
+        const lq = toLowerByte(qc);
+        var prev_diag: usize = 0;
+        for (0..pn) |j| {
+            const tmp = row[j + 1];
+            if (lq == toLowerByte(path[j])) {
+                row[j + 1] = prev_diag + 1;
+            } else if (row[j] > row[j + 1]) {
+                row[j + 1] = row[j];
+            }
+            prev_diag = tmp;
+        }
+    }
+    return row[pn];
+}
+
 pub fn fuzzyScore(query: []const u8, path: []const u8) ?f32 {
     if (query.len == 0 or path.len == 0) return null;
     if (query.len > 128 or path.len > 512) return null;
@@ -5753,6 +5963,14 @@ pub fn fuzzyScore(query: []const u8, path: []const u8) ?f32 {
     // Minimum score threshold based on query length
     const min_threshold = @as(f32, @floatFromInt(query.len)) * MATCH_SCORE * 0.3;
     if (best_score < min_threshold) return null;
+
+    // Issue #518: a local alignment can clear the score floor on a handful of
+    // incidental matches even when most of the query never appears in the path
+    // (e.g. a 16-char query hitting 5 stray filename chars). Require the query and
+    // path to share a real in-order subsequence — at least 60% of the query's
+    // characters. Computed only for candidates past the score floor, so it adds
+    // no cost to the overwhelming majority of non-matching files.
+    if (lcsLenIgnoreCase(query, path) * 5 < query.len * 3) return null;
 
     // Special entry point bonus (like fff: main.go, index.ts, lib.rs rank higher)
     const fname = getFilename(path);

@@ -1,6 +1,98 @@
 # Changelog
 
 
+## 0.2.5824 - 2026-06-02
+
+`0.2.5824` adds a deterministic, no-LLM **code-graph** layer. codedb now builds a
+resolved call graph from the indexed symbols and uses it to rank search results
+more precisely and to assemble richer first-touch context. The graph is computed
+locally with no model calls and persisted in the snapshot, so it costs nothing on
+the query hot path.
+
+### Graph-aware ranking (call-graph centrality)
+
+- **New `src/codegraph.zig` builds a resolved call graph.** For each function
+  body it extracts call sites (`extractCallees` — identifier-before-`(`, keyword
+  filtered, de-duped), resolves each callee name through the function/method
+  symbol table, and accumulates a weighted in-degree centrality per file
+  (ambiguous names split their weight 1/N across candidates).
+- **`searchContentRanked` folds centrality into the score.** Each candidate is
+  multiplied by `1 + 0.15·log(1 + centrality)` — purely additive, never a filter,
+  so recall is unchanged. Set `CODEDB_NO_CENTRALITY` to disable.
+- **MRR-gated on the codedb repo** (18 labelled multi-word queries):
+  MRR 0.819 → 0.944 (+15%), P@1 12 → 16, recall@5 unchanged, four queries' correct
+  file jumped to rank 1, none regressed.
+
+### Persisted call-graph centrality
+
+- **The centrality map is stored in the snapshot** (new `CALL_CENTRALITY` section)
+  and restored on load, instead of being rebuilt lazily on the first ranked query.
+  The index/scan path builds it once via `Explorer.buildCallCentrality` before
+  persisting; the loader restores it keyed off the stable outline paths, so
+  `ensureCallCentrality` short-circuits.
+- **Removes a large first-query stall.** On openclaw/openclaw (~39k files) the lazy
+  build measured ~960 ms; it is now paid once at index time, and restoring it at
+  load adds ~3 ms. Snapshots without the section fall back to the lazy build
+  (backward compatible).
+
+### Edge-aware codedb_context (callees)
+
+- **`codedb_context` now surfaces a "Calls" section** alongside the existing
+  callers section: for each key symbol it walks the symbol's call sites through
+  the call graph and lists where each callee is defined, so an agent sees both who
+  calls a symbol and what it calls without a follow-up `codedb_outline` /
+  `codedb_read`.
+- **High-precision by design.** Resolution is name-based (no type info), so a
+  callee is shown only when it resolves to exactly one non-test function/method,
+  and ubiquitous std/container method names (`init`, `get`, `append`, `lock`,
+  `next`, …) are filtered out — guessing would assert a false edge in an
+  LLM-facing block, so ambiguous calls are omitted rather than mis-resolved.
+
+### Snapshot load performance (~3× faster load, ~338 MB lower RSS)
+
+A series of load-path changes, each A/B-measured on openclaw/openclaw (~39k
+files; interleaved warm loads, zero overlap between arms), found with a new gated
+`CODEDB_LOAD_PROFILE` phase profiler (near-zero cost when off). Cumulatively the
+load went from ~380 ms to ~125 ms and peak RSS from ~795 MB to ~457 MB.
+
+- **Borrow restored outline strings + pre-size the load maps.** Imports / symbol
+  names / details are now slices into the retained `OUTLINE_STATE` section instead
+  of ~170k (millions on a dense repo) per-string dupes, and the load's hashmaps are
+  pre-sized to the known file count. ~34% faster.
+- **`statFile` instead of `openFile` + `stat` + `close` in the freshness check.**
+  Only the mtime is needed, so one syscall per file instead of three. ~36% faster,
+  and far more resilient to machine load.
+- **mmap the content section.** Records are parsed from one memory mapping instead
+  of ~4 `readPositionalAll` syscalls per file (~156k on a 39k-file repo); file-
+  backed and demand-paged, with a heap bulk-read fallback. ~23% faster.
+- **Borrow content from the mmap.** Drops the transient per-file content copy — a
+  full pass over all content plus ~39k alloc/free pairs. ~8% faster.
+- **Zero-copy `ContentCache`.** Cache values are borrowed (`putBorrowed`,
+  `value_owned=false`) directly from the retained mmap instead of duped into owned
+  heap; the Explorer munmaps at deinit, and a later re-index safely replaces a
+  borrowed entry with an owned one. ~17% faster load and ~237 MB lower RSS — the
+  ~268 MB owned content dupe is gone; content lives in the reclaimable mmap.
+- **Stored content hashes (`CONTENT_HASHES` section).** Per-file content hashes are
+  computed once at write time and read back at load, so the loader no longer
+  re-hashes every file's content (which also faulted in every content page). ~14%
+  faster and ~100 MB lower RSS; an absent section makes the loader recompute
+  (backward compatible).
+
+### Validation
+
+- `zig build test` — all pass, including new codegraph unit tests, `resolveCallees`
+  resolution, and snapshot round-trip + centrality-persistence tests under the
+  DebugAllocator.
+- Graph ranking MRR-gated on the codedb query set (0.819 → 0.944, zero regressions).
+- `codedb_context` verified end-to-end through the MCP server on codedb itself
+  (e.g. `searchContentRanked` → `lockShared` / `posixGetenv` / `ensureCallCentrality`
+  / `normalizeChar` / `splitIdentifier`, all correctly resolved).
+- Snapshot load + RSS A/B'd on openclaw/openclaw (~39k files), two binaries on the
+  same snapshot, interleaved warm loads: load ~380 ms → ~125 ms, peak RSS
+  ~795 MB → ~457 MB, with no overlap between arms on any step. New ContentCache
+  borrow tests and a `CONTENT_HASHES` order-alignment test pass under the
+  DebugAllocator.
+
 ## 0.2.5823 - 2026-05-29
 
 `0.2.5823` is an MCP compatibility hotfix for direct `tools/call` requests.
