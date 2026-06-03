@@ -724,12 +724,14 @@ fn loadOutlineStateMap(io: std.Io, snapshot_path: []const u8, allocator: std.mem
         outline.byte_size = try readSectionInt(u64, bytes, &cursor);
 
         const import_count = try readSectionInt(u32, bytes, &cursor);
+        try outline.imports.ensureTotalCapacity(allocator, import_count);
         for (0..import_count) |_| {
             const imp = try readSectionStringBorrowed(bytes, &cursor, 4096);
-            try outline.imports.append(allocator, imp);
+            outline.imports.appendAssumeCapacity(imp);
         }
 
         const symbol_count = try readSectionInt(u32, bytes, &cursor);
+        try outline.symbols.ensureTotalCapacity(allocator, symbol_count);
         for (0..symbol_count) |_| {
             const name = try readSectionStringBorrowed(bytes, &cursor, std.math.maxInt(u16));
             if (name.len == 0) return error.InvalidData;
@@ -745,7 +747,7 @@ fn loadOutlineStateMap(io: std.Io, snapshot_path: []const u8, allocator: std.mem
                 else => return error.InvalidData,
             };
 
-            try outline.symbols.append(allocator, Symbol{
+            outline.symbols.appendAssumeCapacity(Symbol{
                 .name = name,
                 .kind = kind,
                 .line_start = line_start,
@@ -767,10 +769,11 @@ fn loadOutlineStateMap(io: std.Io, snapshot_path: []const u8, allocator: std.mem
 fn rebuildDepsFromOutline(explorer: *Explorer, path: []const u8, outline: *const FileOutline, allocator: std.mem.Allocator) !void {
     var deps: std.ArrayList([]const u8) = .empty;
     errdefer deps.deinit(allocator);
+    try deps.ensureTotalCapacity(allocator, outline.imports.items.len);
 
     for (outline.imports.items) |imp| {
         if (std.mem.indexOf(u8, imp, "..") != null) continue;
-        try deps.append(allocator, imp);
+        deps.appendAssumeCapacity(imp);
     }
 
     try explorer.dep_graph.setDeps(path, deps);
