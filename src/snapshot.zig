@@ -185,7 +185,8 @@ pub fn writeSnapshot(
             var import_count_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &import_count_buf, @intCast(outline.imports.items.len), .little);
             try writer.writeAll(&import_count_buf);
-            for (outline.imports.items) |imp| {
+            for (outline.imports.items) |imp_full| {
+                const imp = imp_full[0..@min(imp_full.len, std.math.maxInt(u16))];
                 var import_len_buf: [2]u8 = undefined;
                 std.mem.writeInt(u16, &import_len_buf, @intCast(imp.len), .little);
                 try writer.writeAll(&import_len_buf);
@@ -196,10 +197,13 @@ pub fn writeSnapshot(
             std.mem.writeInt(u32, &symbol_count_buf, @intCast(outline.symbols.items.len), .little);
             try writer.writeAll(&symbol_count_buf);
             for (outline.symbols.items) |sym| {
+                // Names from minified/generated files can exceed u16 (65535) —
+                // truncate the stored name instead of panicking on @intCast (P0).
+                const sym_name = sym.name[0..@min(sym.name.len, std.math.maxInt(u16))];
                 var name_len_buf: [2]u8 = undefined;
-                std.mem.writeInt(u16, &name_len_buf, @intCast(sym.name.len), .little);
+                std.mem.writeInt(u16, &name_len_buf, @intCast(sym_name.len), .little);
                 try writer.writeAll(&name_len_buf);
-                try writer.writeAll(sym.name);
+                try writer.writeAll(sym_name);
 
                 try writer.writeByte(@intFromEnum(sym.kind));
 
@@ -211,7 +215,8 @@ pub fn writeSnapshot(
                 std.mem.writeInt(u32, &line_end_buf, sym.line_end, .little);
                 try writer.writeAll(&line_end_buf);
 
-                if (sym.detail) |detail| {
+                if (sym.detail) |detail_full| {
+                    const detail = detail_full[0..@min(detail_full.len, std.math.maxInt(u16))];
                     try writer.writeByte(1);
                     var detail_len_buf: [2]u8 = undefined;
                     std.mem.writeInt(u16, &detail_len_buf, @intCast(detail.len), .little);
@@ -719,12 +724,14 @@ fn loadOutlineStateMap(io: std.Io, snapshot_path: []const u8, allocator: std.mem
         outline.byte_size = try readSectionInt(u64, bytes, &cursor);
 
         const import_count = try readSectionInt(u32, bytes, &cursor);
+        try outline.imports.ensureTotalCapacity(allocator, import_count);
         for (0..import_count) |_| {
             const imp = try readSectionStringBorrowed(bytes, &cursor, 4096);
-            try outline.imports.append(allocator, imp);
+            outline.imports.appendAssumeCapacity(imp);
         }
 
         const symbol_count = try readSectionInt(u32, bytes, &cursor);
+        try outline.symbols.ensureTotalCapacity(allocator, symbol_count);
         for (0..symbol_count) |_| {
             const name = try readSectionStringBorrowed(bytes, &cursor, std.math.maxInt(u16));
             if (name.len == 0) return error.InvalidData;
@@ -740,7 +747,7 @@ fn loadOutlineStateMap(io: std.Io, snapshot_path: []const u8, allocator: std.mem
                 else => return error.InvalidData,
             };
 
-            try outline.symbols.append(allocator, Symbol{
+            outline.symbols.appendAssumeCapacity(Symbol{
                 .name = name,
                 .kind = kind,
                 .line_start = line_start,
@@ -762,10 +769,11 @@ fn loadOutlineStateMap(io: std.Io, snapshot_path: []const u8, allocator: std.mem
 fn rebuildDepsFromOutline(explorer: *Explorer, path: []const u8, outline: *const FileOutline, allocator: std.mem.Allocator) !void {
     var deps: std.ArrayList([]const u8) = .empty;
     errdefer deps.deinit(allocator);
+    try deps.ensureTotalCapacity(allocator, outline.imports.items.len);
 
     for (outline.imports.items) |imp| {
         if (std.mem.indexOf(u8, imp, "..") != null) continue;
-        try deps.append(allocator, imp);
+        deps.appendAssumeCapacity(imp);
     }
 
     try explorer.dep_graph.setDeps(path, deps);
