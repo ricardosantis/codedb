@@ -11684,3 +11684,79 @@ test "issue-471b: codedb_find error message enumerates accepted aliases" {
     try testing.expect(std.mem.indexOf(u8, out.items, "path") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "pattern") != null);
 }
+
+test "cli-mcp-parity: runCliTool bridges navigation commands to MCP handlers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try exp.indexFile("src/store.zig", "pub const Store = struct {};\n");
+    try exp.indexFile("src/main.zig", "const Store = @import(\"store.zig\").Store;\npub fn main() void {}\n");
+
+    // glob: pattern -> matching indexed paths (reuses handleGlob)
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        const code = mcp_mod.runCliTool(io, aa, &exp, ".", "glob", &.{ "codedb", ".", "glob", "src/*.zig" }, 3, &out);
+        try testing.expectEqual(@as(?u8, 0), code);
+        try testing.expect(std.mem.indexOf(u8, out.items, "src/store.zig") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "src/main.zig") != null);
+    }
+
+    // symbol: name -> definition site (reuses handleSymbol)
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        const code = mcp_mod.runCliTool(io, aa, &exp, ".", "symbol", &.{ "codedb", ".", "symbol", "Store" }, 3, &out);
+        try testing.expectEqual(@as(?u8, 0), code);
+        try testing.expect(std.mem.indexOf(u8, out.items, "src/store.zig") != null);
+    }
+
+    // unknown command -> null so runQuery falls through to its own usage error
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        try testing.expectEqual(@as(?u8, null), mcp_mod.runCliTool(io, aa, &exp, ".", "bogus", &.{ "codedb", ".", "bogus" }, 3, &out));
+    }
+
+    // missing required arg -> usage line, exit 1
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        try testing.expectEqual(@as(?u8, 1), mcp_mod.runCliTool(io, aa, &exp, ".", "glob", &.{ "codedb", ".", "glob" }, 3, &out));
+        try testing.expect(std.mem.indexOf(u8, out.items, "usage") != null);
+    }
+}
+
+test "p0: writeSnapshot tolerates over-long symbol names (u16 length overflow)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    // An identifier longer than u16 max (65535) — minified/generated files produce
+    // these, and the old code paniced casting the length to u16 in writeSnapshot.
+    const long = try aa.alloc(u8, 70000);
+    @memset(long, 'a');
+    const content = try std.fmt.allocPrint(aa, "pub const {s} = 1;\n", .{long});
+    try exp.indexFile("src/min.zig", content);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = pb[0..try tmp.dir.realPathFile(io, ".", &pb)];
+    const snap = try std.fmt.allocPrint(testing.allocator, "{s}/min.codedb", .{dir});
+    defer testing.allocator.free(snap);
+
+    // Pre-fix: this paniced ("integer does not fit in destination type").
+    try snapshot_mod.writeSnapshot(io, &exp, dir, snap, testing.allocator);
+
+    // And the truncated record must round-trip back without crashing.
+    var exp2 = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer exp2.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    try testing.expect(snapshot_mod.loadSnapshot(io, snap, &exp2, &store, testing.allocator));
+    try testing.expectEqual(@as(usize, 1), exp2.outlines.count());
+}
