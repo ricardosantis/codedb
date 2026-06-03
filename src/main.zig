@@ -1855,7 +1855,7 @@ fn loadWordIndexFromDiskIfPresent(
         return;
     }
 
-    if (WordIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
+    if (WordIndex.mmapFromDisk(io, data_dir, allocator) orelse WordIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
         explorer.replaceWordIndex(loaded);
     } else {
         explorer.disableWordIndexDiskLoad();
