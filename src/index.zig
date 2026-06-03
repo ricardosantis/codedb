@@ -557,7 +557,7 @@ pub const WordIndex = struct {
 
         var file_paths = try allocator.alloc([]u8, file_count);
         defer allocator.free(file_paths);
-        var used_paths = try allocator.alloc(bool, file_count);
+        const used_paths = try allocator.alloc(bool, file_count);
         defer allocator.free(used_paths);
         @memset(used_paths, false);
         var parsed_files: u32 = 0;
@@ -585,14 +585,11 @@ pub const WordIndex = struct {
         var result = WordIndex.init(allocator);
         errdefer result.deinit();
 
-        // Temporary HashMap for accumulating file_words during load
-        // (compacted to slices below)
-        var tmp_file_words = std.StringHashMap(std.StringHashMap(void)).init(allocator);
-        defer {
-            var tfw_iter = tmp_file_words.iterator();
-            while (tfw_iter.next()) |entry| entry.value_ptr.deinit();
-            tmp_file_words.deinit();
-        }
+        // Pre-size the maps to the exact counts so they don't overshoot via
+        // incremental doubling while loading (saves tens of MB on big indexes).
+        try result.index.ensureTotalCapacity(word_count);
+        try result.path_to_id.ensureTotalCapacity(file_count);
+        try result.doc_lengths.ensureTotalCapacity(file_count);
 
         for (0..word_count) |_| {
             if (pos + 2 > data.len) return null;
@@ -611,7 +608,6 @@ pub const WordIndex = struct {
             errdefer hits.deinit(allocator);
             try hits.ensureTotalCapacity(allocator, hit_count);
 
-            var last_file_id: ?u32 = null;
             for (0..hit_count) |_| {
                 if (pos + 8 > data.len) return null;
                 const file_id = std.mem.readInt(u32, data[pos..][0..4], .little);
@@ -619,23 +615,7 @@ pub const WordIndex = struct {
                 if (file_id >= file_count) return null;
                 const line_num = std.mem.readInt(u32, data[pos..][0..4], .little);
                 pos += 4;
-
-                hits.appendAssumeCapacity(.{
-                    .doc_id = file_id,
-                    .line_num = line_num,
-                });
-
-                if (last_file_id == null or last_file_id.? != file_id) {
-                    const fw_gop = try tmp_file_words.getOrPut(file_paths[file_id]);
-                    if (!fw_gop.found_existing) {
-                        fw_gop.key_ptr.* = file_paths[file_id];
-                        fw_gop.value_ptr.* = std.StringHashMap(void).init(allocator);
-                        used_paths[file_id] = true;
-                    }
-                    const wgop = try fw_gop.value_ptr.getOrPut(word);
-                    if (!wgop.found_existing) wgop.key_ptr.* = word;
-                    last_file_id = file_id;
-                }
+                hits.appendAssumeCapacity(.{ .doc_id = file_id, .line_num = line_num });
             }
 
             const gop = try result.index.getOrPut(word);
@@ -672,17 +652,13 @@ pub const WordIndex = struct {
         }
         result.total_tokens = total_tokens_loaded;
 
-        // Compact tmp_file_words HashMaps into slices for result.file_words
-        var tfw_iter = tmp_file_words.iterator();
-        while (tfw_iter.next()) |entry| {
-            const compact = try allocator.alloc([]const u8, entry.value_ptr.count());
-            var ki2: usize = 0;
-            var wk_iter2 = entry.value_ptr.keyIterator();
-            while (wk_iter2.next()) |k| : (ki2 += 1) {
-                compact[ki2] = k.*;
-            }
-            try result.file_words.put(entry.key_ptr.*, compact);
-        }
+        // Loaded indexes skip file_words: only incremental removeFile needs it,
+        // and queries / BM25 never do. Same hundreds-of-MB save the bulk scan
+        // already takes (see main.zig). id_to_path owns the path strings now, so
+        // keep them out of the cleanup defer (used_paths=true) and free them via
+        // the skip_file_words deinit path.
+        @memset(used_paths, true);
+        result.skip_file_words = true;
 
         return result;
     }
