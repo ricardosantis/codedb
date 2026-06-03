@@ -3122,26 +3122,11 @@ pub const Explorer = struct {
         var iter = self.outlines.keyIterator();
         while (iter.next()) |key_ptr| {
             const path = key_ptr.*;
-
-            // Extension filter
             if (ext_filter) |ext| {
                 if (!std.mem.endsWith(u8, path, ext)) continue;
             }
-
-            // Multi-part scoring: all parts must match, scores sum
-            var total_score: f32 = 0;
-            var all_matched = true;
-            for (parts.items) |part| {
-                if (fuzzyScore(part, path)) |s| {
-                    total_score += s;
-                } else {
-                    all_matched = false;
-                    break;
-                }
-            }
-
-            if (all_matched and total_score > 0) {
-                try matches.append(allocator, .{ .path = path, .score = total_score });
+            if (scoreAllParts(parts.items, path)) |s| {
+                try matches.append(allocator, .{ .path = path, .score = s });
             }
         }
 
@@ -5862,10 +5847,39 @@ fn lcsLenIgnoreCase(query: []const u8, path: []const u8) usize {
     return row[pn];
 }
 
+// Score `path` against every space-separated query part (all must match, scores
+// sum) — the exhaustive per-file scoring shared by both fuzzyFindFiles passes.
+fn scoreAllParts(parts: []const []const u8, path: []const u8) ?f32 {
+    var total: f32 = 0;
+    for (parts) |part| {
+        if (fuzzyScore(part, path)) |s| {
+            total += s;
+        } else return null;
+    }
+    if (total > 0) return total;
+    return null;
+}
 pub fn fuzzyScore(query: []const u8, path: []const u8) ?f32 {
     if (query.len == 0 or path.len == 0) return null;
     if (query.len > 128 or path.len > 512) return null;
 
+    // Cheap presence pre-filter. The score floor below (issue #518) makes a
+    // >=60% in-order LCS between query and path a hard requirement. Unordered
+    // character presence is an upper bound on that LCS, so if fewer than 60% of
+    // the query's characters occur anywhere in the path, the Smith-Waterman DP
+    // cannot clear the floor and we can reject in O(path) instead of running the
+    // O(query*path) DP. This skips the DP for the vast majority of non-matching
+    // files (codedb_find on a 670-file repo: ~265ms -> a few ms) and changes no
+    // result: every file rejected here would also fail the LCS check at the end.
+    {
+        var present = [_]bool{false} ** 256;
+        for (path) |c| present[toLowerByte(c)] = true;
+        var hits: usize = 0;
+        for (query) |c| {
+            if (present[toLowerByte(c)]) hits += 1;
+        }
+        if (hits * 5 < query.len * 3) return null;
+    }
     const MATCH_SCORE: f32 = 16.0;
     const MISMATCH_PENALTY: f32 = -8.0;
     const GAP_OPEN: f32 = -3.0;
@@ -5885,14 +5899,33 @@ pub fn fuzzyScore(query: []const u8, path: []const u8) ?f32 {
         }
     }
 
-    // Smith-Waterman-style DP with affine gaps
-    // H[i][j] = best alignment score ending with query[0..i] aligned to path[0..j]
-    // We use two rows to save memory: prev and curr
+    // Smith-Waterman-style DP with affine gaps.
+    // H[i][j] = best alignment score ending with query[0..i] aligned to path[0..j].
+    // Two rows (prev/curr) swapped by pointer each iteration. The per-cell inputs
+    // that don't depend on j (lowercased query char, word-boundary flags) are
+    // hoisted/precomputed so the hot inner loop stays tight — this is a pure
+    // constant-factor speedup, the arithmetic and result are identical.
     const MAX_PATH = 512;
-    var prev_h: [MAX_PATH + 1]f32 = undefined;
-    var curr_h: [MAX_PATH + 1]f32 = undefined;
-    var prev_gap: [MAX_PATH + 1]f32 = undefined; // gap in query (deletion from path)
-    var curr_gap: [MAX_PATH + 1]f32 = undefined;
+    var ql_buf: [128]u8 = undefined;
+    var pl_buf: [MAX_PATH]u8 = undefined;
+    var wb_buf: [MAX_PATH]bool = undefined;
+    const ql = ql_buf[0..query.len];
+    const pl = pl_buf[0..path.len];
+    const wb = wb_buf[0..path.len];
+    for (query, 0..) |c, k| ql[k] = toLowerByte(c);
+    for (path, 0..) |c, k| {
+        pl[k] = toLowerByte(c);
+        wb[k] = isWordBoundary(path, k);
+    }
+
+    var h_a: [MAX_PATH + 1]f32 = undefined;
+    var h_b: [MAX_PATH + 1]f32 = undefined;
+    var g_a: [MAX_PATH + 1]f32 = undefined;
+    var g_b: [MAX_PATH + 1]f32 = undefined;
+    var prev_h: []f32 = h_a[0 .. path.len + 1];
+    var curr_h: []f32 = h_b[0 .. path.len + 1];
+    var prev_gap: []f32 = g_a[0 .. path.len + 1];
+    var curr_gap: []f32 = g_b[0 .. path.len + 1];
 
     // Init
     for (0..path.len + 1) |j| {
@@ -5902,30 +5935,26 @@ pub fn fuzzyScore(query: []const u8, path: []const u8) ?f32 {
 
     var best_score: f32 = 0;
     var matched_chars: usize = 0;
+    const last_i = query.len - 1;
 
     for (0..query.len) |i| {
+        const qc = ql[i];
+        const qchar = query[i];
         curr_h[0] = 0;
         curr_gap[0] = GAP_OPEN;
         var query_gap: f32 = GAP_OPEN; // gap in path (deletion from query)
+        var row_positive = false;
 
         for (0..path.len) |j| {
-            const qc = toLowerByte(query[i]);
-            const pc = toLowerByte(path[j]);
+            const is_match = qc == pl[j];
 
             // Match/mismatch score
-            var match_score: f32 = if (qc == pc) MATCH_SCORE else MISMATCH_PENALTY;
-
-            // Bonuses for matches
-            if (qc == pc) {
-                // Exact case bonus
-                if (query[i] == path[j]) match_score += CASE_BONUS;
-                // Word boundary bonus
-                if (isWordBoundary(path, j)) match_score += DELIMITER_BONUS;
-                // Filename bonus
+            var match_score: f32 = if (is_match) MATCH_SCORE else MISMATCH_PENALTY;
+            if (is_match) {
+                if (qchar == path[j]) match_score += CASE_BONUS;
+                if (wb[j]) match_score += DELIMITER_BONUS;
                 if (j >= fname_start) match_score += FILENAME_BONUS;
-                // Prefix bonus (match at start of path or filename)
                 if (j == 0 or j == fname_start) match_score += PREFIX_BONUS;
-                // Consecutive match bonus
                 if (i > 0 and j > 0 and prev_h[j] > prev_h[j + 1] * 0.5) {
                     match_score += CONSECUTIVE_BONUS;
                 }
@@ -5938,23 +5967,18 @@ pub fn fuzzyScore(query: []const u8, path: []const u8) ?f32 {
             query_gap = @max(curr_h[j] + GAP_OPEN, query_gap + GAP_EXTEND);
 
             // Smith-Waterman: take max of all options, floor at 0
-            curr_h[j + 1] = @max(0, @max(diag, @max(curr_gap[j + 1], query_gap)));
-
-            if (i == query.len - 1 and curr_h[j + 1] > best_score) {
-                best_score = curr_h[j + 1];
-            }
+            const v: f32 = @max(0, @max(diag, @max(curr_gap[j + 1], query_gap)));
+            curr_h[j + 1] = v;
+            if (v > 0) row_positive = true;
+            if (i == last_i and v > best_score) best_score = v;
         }
 
-        // Count matched chars (check if any cell in this row is positive)
-        for (1..path.len + 1) |j| {
-            if (curr_h[j] > 0) {
-                matched_chars = i + 1;
-                break;
-            }
-        }
+        // Count matched chars (any positive cell in this row)
+        if (row_positive) matched_chars = i + 1;
 
-        @memcpy(prev_h[0 .. path.len + 1], curr_h[0 .. path.len + 1]);
-        @memcpy(prev_gap[0 .. path.len + 1], curr_gap[0 .. path.len + 1]);
+        // Swap rows: curr becomes prev for the next query char (no copy).
+        std.mem.swap([]f32, &prev_h, &curr_h);
+        std.mem.swap([]f32, &prev_gap, &curr_gap);
     }
 
     // Require at least 60% of query chars to contribute to score
