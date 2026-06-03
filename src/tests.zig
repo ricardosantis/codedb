@@ -11890,3 +11890,40 @@ test "fuzzy SIMD batch scorer matches scalar fuzzyScore exactly" {
         }
     }
 }
+
+test "find: symbol fast-path classifier + lookup" {
+    const mcp = @import("mcp.zig");
+    // Classifier: compound identifiers (camelCase / snake_case) route to symbols;
+    // filenames, single words, ALL-CAPS, and multi-part queries do not.
+    try testing.expect(mcp.looksLikeCompoundIdentifier("getTokenProvider"));
+    try testing.expect(mcp.looksLikeCompoundIdentifier("TokenProvider"));
+    try testing.expect(mcp.looksLikeCompoundIdentifier("handle_request"));
+    try testing.expect(mcp.looksLikeCompoundIdentifier("abortChatRunById"));
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("auth")); // single lowercase word
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("config"));
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("README")); // ALL-CAPS
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("provider.ts")); // dot -> filename
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("src/main")); // path separator
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("auth provider")); // space -> multi-part
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("abc")); // too short
+
+    // renderSymbolDefsFast resolves a real symbol to its definition (def kinds
+    // ranked above import usages), and returns false WITHOUT writing for a miss.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try explorer.indexFile("src/auth.zig", "pub fn getTokenProvider() void {}\n");
+    try explorer.indexFile("src/use.zig", "const getTokenProvider = @import(\"auth.zig\").getTokenProvider;\n");
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try testing.expect(explorer.renderSymbolDefsFast("getTokenProvider", alloc, &out, 10));
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/auth.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "(function)") != null);
+
+    var miss: std.ArrayList(u8) = .empty;
+    defer miss.deinit(alloc);
+    try testing.expect(!explorer.renderSymbolDefsFast("nonexistentSymbolXyz", alloc, &miss, 10));
+    try testing.expectEqual(@as(usize, 0), miss.items.len);
+}
