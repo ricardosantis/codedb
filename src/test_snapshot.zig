@@ -922,3 +922,99 @@ test "issue-379: snapshot loader returns true with zero outlines for empty-explo
     }
 }
 
+
+test "issue-528: isSensitivePath parity between snapshot.zig and watcher.zig" {
+    // The secret/credential filter is duplicated (snapshot persistence vs live
+    // indexing). The #528 audit flagged a possible divergence; the two are
+    // verified equal today, and this test fails CI if they ever drift apart —
+    // which in this security filter would mean a secret silently leaking into
+    // one path but not the other.
+    const cases = [_][]const u8{
+        // secrets — both copies must block
+        ".env",                  ".env.local",          ".env.production",
+        ".env.development",      ".env.staging",        ".env.test",
+        ".dev.vars",             ".npmrc",              ".pypirc",
+        ".netrc",                "credentials.json",    "service-account.json",
+        "secrets.json",          "secrets.yaml",        "secrets.yml",
+        "id_rsa",                "id_ed25519",          "server.key",
+        "cert.pem",              "keystore.jks",        "identity.pfx",
+        "bundle.p12",            "config/.env.local",   "a/b/secrets.yaml",
+        "deep/nested/.ssh/known_hosts", ".gnupg/secring.gpg", "x/.aws/credentials",
+        // non-secrets — both copies must allow (esp. the .env-prefix edge cases)
+        ".envoy.json",           ".environment",        ".envrc",
+        ".envconfig.yaml",       "main.zig",            "src/server.zig",
+        "README.md",             "package.json",        "id_rsa.pub",
+        "envvars.ts",            "Makefile",            "Dockerfile",
+    };
+    for (cases) |p| {
+        try testing.expectEqual(watcher.isSensitivePath(p), snapshot_mod.isSensitivePath(p));
+    }
+    // Anchor the contract so parity can't be satisfied by both copies being
+    // wrong in the same direction.
+    try testing.expect(snapshot_mod.isSensitivePath(".env"));
+    try testing.expect(snapshot_mod.isSensitivePath("credentials.json"));
+    try testing.expect(snapshot_mod.isSensitivePath("deep/.ssh/id_rsa"));
+    try testing.expect(snapshot_mod.isSensitivePath("keystore.jks")); // fast-path ext
+    try testing.expect(!snapshot_mod.isSensitivePath(".envoy.json")); // issue-409
+    try testing.expect(!snapshot_mod.isSensitivePath(".environment"));
+    try testing.expect(!snapshot_mod.isSensitivePath("main.zig"));
+    try testing.expect(!snapshot_mod.isSensitivePath("package.json"));
+}
+
+test "issue-528: codedb_edit applies via a per-session agent id (not the first/__filesystem__ agent)" {
+    // Bug 2 wiring (runtime): handleEdit now uses Session.edit_agent_id — a
+    // per-connection agent registered AFTER __filesystem__, so its id != 1.
+    // applyEdit's advisory lock returns error.FileLocked if that id is not a
+    // live registered agent, so this proves an edit through a non-first session
+    // agent actually acquires the lock and writes the file.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/per-session-edit.zig", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    var file = try tmp.dir.createFile(io, "per-session-edit.zig", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "const foo = 1;\n");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try explorer.indexFile(rel_path, "const foo = 1;\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const fs = try agents.register("__filesystem__"); // startup agent (id 1)
+    const session = try agents.register("mcp-session"); // per-session owner (id 2)
+    try testing.expect(session != fs);
+
+    // Edit through the per-session id — must acquire the lock and apply.
+    const r1 = try edit_mod.applyEdit(io, testing.allocator, &store, &agents, &explorer, .{
+        .path = rel_path,
+        .agent_id = session,
+        .op = .replace,
+        .range = .{ 1, 1 },
+        .content = "const bar = 1;",
+    });
+    defer if (r1.health) |h| testing.allocator.free(h);
+    defer if (r1.preview) |p| testing.allocator.free(p);
+    try testing.expect(r1.changed);
+
+    // The lock was released on success, so another session can edit immediately.
+    const r2 = try edit_mod.applyEdit(io, testing.allocator, &store, &agents, &explorer, .{
+        .path = rel_path,
+        .agent_id = fs,
+        .op = .replace,
+        .range = .{ 1, 1 },
+        .content = "const baz = 1;",
+    });
+    defer if (r2.health) |h| testing.allocator.free(h);
+    defer if (r2.preview) |p| testing.allocator.free(p);
+
+    const content = try tmp.dir.readFileAlloc(io, "per-session-edit.zig", testing.allocator, .limited(64 * 1024));
+    defer testing.allocator.free(content);
+    try testing.expect(std.mem.indexOf(u8, content, "baz") != null);
+}
