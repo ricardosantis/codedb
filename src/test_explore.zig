@@ -2097,3 +2097,11 @@ test "resolveCallees: resolves call sites in a function body to their definition
     try testing.expect(saw_helper);
     try testing.expect(saw_other);
 }
+
+test "issue-528: searchContentRegex surfaces invalid regex as error" {
+    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer_inst.deinit();
+    try explorer_inst.indexFile("only.zig", "const x = 42;");
+    // #10: an unparseable pattern used to be swallowed and reported as "no results".
+    try testing.expectError(error.InvalidRegex, explorer_inst.searchContentRegex("[", testing.allocator, 50));
+}

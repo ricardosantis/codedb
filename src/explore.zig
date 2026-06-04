@@ -3042,6 +3042,14 @@ pub const Explorer = struct {
         var result_list: std.ArrayList(SearchResult) = .empty;
         errdefer result_list.deinit(allocator);
 
+        // Surface invalid patterns as error.InvalidRegex instead of silently
+        // returning zero results (#528 item 10). Compile once up front with the
+        // real matcher; the per-file scans below reuse the same engine.
+        {
+            var probe = nanoregex.Regex.compile(allocator, pattern) catch return error.InvalidRegex;
+            probe.deinit();
+        }
+
         var query = idx.decomposeRegex(pattern, self.allocator) catch {
             var iter = self.outlines.keyIterator();
             while (iter.next()) |key_ptr| {
@@ -4615,6 +4623,14 @@ pub const Explorer = struct {
                 if (r.scope_name) |n| allocator.free(n);
             }
             result_list.deinit(allocator);
+        }
+
+        // Surface invalid patterns as error.InvalidRegex instead of silently
+        // returning zero results (#528 item 10). Compile once up front with the
+        // real matcher; the per-file scans below reuse the same engine.
+        {
+            var probe = nanoregex.Regex.compile(allocator, pattern) catch return error.InvalidRegex;
+            probe.deinit();
         }
 
         var query = idx.decomposeRegex(pattern, self.allocator) catch {

@@ -253,32 +253,38 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
             });
         }
     } else if (std.mem.eql(u8, cmd, "search")) {
-        var use_regex = false;
-        var paths_only = false;
-        var query_arg_start = cmd_args_start;
-        while (args.len > query_arg_start) {
-            const a = args[query_arg_start];
-            if (std.mem.eql(u8, a, "--regex")) {
-                use_regex = true;
-                query_arg_start += 1;
-            } else if (std.mem.eql(u8, a, "--paths-only")) {
-                paths_only = true;
-                query_arg_start += 1;
-            } else {
-                break;
+        const sa = parseSearchArgs(args, cmd_args_start) catch |e| {
+            switch (e) {
+                error.UnknownFlag => out.p("{s}\xe2\x9c\x97{s} unknown flag for {s}search{s}  (valid: {s}--regex{s}, {s}--paths-only{s}, {s}--max-results N{s})\n", .{
+                    s.red, s.reset, s.bold, s.reset, s.cyan, s.reset, s.cyan, s.reset, s.cyan, s.reset,
+                }),
+                error.MissingMaxResults, error.BadMaxResults => out.p("{s}\xe2\x9c\x97{s} {s}--max-results{s} requires a positive integer\n", .{
+                    s.red, s.reset, s.cyan, s.reset,
+                }),
+                error.ExtraArg => out.p("{s}\xe2\x9c\x97{s} unexpected extra argument (quote multi-word queries: {s}search \"foo bar\"{s})\n", .{
+                    s.red, s.reset, s.cyan, s.reset,
+                }),
+                error.MissingQuery, error.EmptyQuery => out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] search [--regex] [--paths-only] [--max-results N] {s}<query>{s}\n", .{
+                    s.red, s.reset, s.cyan, s.reset,
+                }),
             }
-        }
-        const query = if (args.len > query_arg_start) args[query_arg_start] else {
-            out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] search [--regex] [--paths-only] {s}<query>{s}\n", .{
-                s.red, s.reset, s.cyan, s.reset,
-            });
             return 1;
         };
+        const query = sa.query;
+        const use_regex = sa.use_regex;
+        const paths_only = sa.paths_only;
         const t0 = cio.nanoTimestamp();
         const results = if (use_regex)
-            explorer.searchContentRegex(query, allocator, 50) catch return 1
+            explorer.searchContentRegex(query, allocator, sa.max_results) catch |e| {
+                if (e == error.InvalidRegex) {
+                    out.p("{s}\xe2\x9c\x97{s} invalid regex: {s}{s}{s}\n", .{ s.red, s.reset, s.bold, query, s.reset });
+                } else {
+                    out.p("{s}\xe2\x9c\x97{s} search failed\n", .{ s.red, s.reset });
+                }
+                return 1;
+            }
         else
-            explorer.searchContent(query, allocator, 50) catch return 1;
+            explorer.searchContent(query, allocator, sa.max_results) catch return 1;
         defer {
             for (results) |r| {
                 allocator.free(r.path);
@@ -364,29 +370,47 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
         var line_start: ?u32 = null;
         var line_end: ?u32 = null;
         var compact = false;
+        var path_opt: ?[]const u8 = null;
         var arg_idx = cmd_args_start;
-        while (args.len > arg_idx) {
+        // Flags (`-L FROM-TO`, `--compact`) may appear before or after the path
+        // (#528 item 8). Unknown flags and a second positional are rejected so
+        // typos surface instead of silently dumping the whole file.
+        while (args.len > arg_idx) : (arg_idx += 1) {
             const a = args[arg_idx];
             if (std.mem.eql(u8, a, "--compact") or std.mem.eql(u8, a, "-c")) {
                 compact = true;
-                arg_idx += 1;
             } else if (std.mem.eql(u8, a, "-L") or std.mem.eql(u8, a, "--lines")) {
-                if (arg_idx + 1 >= args.len) break;
-                const range = args[arg_idx + 1];
-                const dash = std.mem.indexOfScalar(u8, range, '-') orelse break;
-                line_start = std.fmt.parseInt(u32, range[0..dash], 10) catch null;
-                const end_str = range[dash + 1 ..];
-                if (std.mem.eql(u8, end_str, "$") or std.mem.eql(u8, end_str, "end")) {
-                    line_end = std.math.maxInt(u32);
-                } else {
-                    line_end = std.fmt.parseInt(u32, end_str, 10) catch null;
+                if (arg_idx + 1 >= args.len) {
+                    out.p("{s}\xe2\x9c\x97{s} {s}-L{s} requires a {s}FROM-TO{s} range\n", .{
+                        s.red, s.reset, s.cyan, s.reset, s.cyan, s.reset,
+                    });
+                    return 1;
                 }
-                arg_idx += 2;
+                const range = args[arg_idx + 1];
+                arg_idx += 1;
+                const lr = parseLineRange(range) catch {
+                    out.p("{s}\xe2\x9c\x97{s} invalid line range: {s}{s}{s}  (expected {s}FROM-TO{s}, 1-based, FROM \xe2\x89\xa4 TO; TO may be {s}${s})\n", .{
+                        s.red, s.reset, s.bold, range, s.reset, s.cyan, s.reset, s.cyan, s.reset,
+                    });
+                    return 1;
+                };
+                line_start = lr.start;
+                line_end = lr.end;
+            } else if (a.len > 0 and a[0] == '-') {
+                out.p("{s}\xe2\x9c\x97{s} unknown flag for {s}read{s}: {s}{s}{s}  (valid: {s}-L FROM-TO{s}, {s}--compact{s})\n", .{
+                    s.red, s.reset, s.bold, s.reset, s.bold, a, s.reset, s.cyan, s.reset, s.cyan, s.reset,
+                });
+                return 1;
+            } else if (path_opt == null) {
+                path_opt = a;
             } else {
-                break;
+                out.p("{s}\xe2\x9c\x97{s} unexpected extra argument: {s}{s}{s}\n", .{
+                    s.red, s.reset, s.bold, a, s.reset,
+                });
+                return 1;
             }
         }
-        const path = if (args.len > arg_idx) args[arg_idx] else {
+        const path = path_opt orelse {
             out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] read [-L FROM-TO] [--compact] {s}<path>{s}\n", .{
                 s.red, s.reset, s.cyan, s.reset,
             });
@@ -508,6 +532,37 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
                 s.cyan, path, s.reset,
             });
         }
+    } else if (std.mem.eql(u8, cmd, "status")) {
+        // #528 item 1: read-only CLI status mirroring codedb_status, so
+        // `codedb status` works without going through the MCP surface.
+        const t0 = cio.nanoTimestamp();
+        store.mu.lock();
+        const file_count = store.files.count();
+        const seq = store.seq;
+        store.mu.unlock();
+        explorer.mu.lockShared();
+        const outline_count = explorer.outlines.count();
+        const trigram_files = explorer.trigram_index.fileCount();
+        const trigram_type: []const u8 = switch (explorer.trigram_index) {
+            .heap => "heap",
+            .mmap => "mmap",
+            .mmap_overlay => "mmap+overlay",
+        };
+        explorer.mu.unlockShared();
+        const index_kb = telemetry.approxIndexSizeBytes(explorer) / 1024;
+        const elapsed = cio.nanoTimestamp() - t0;
+        var dur_buf: [64]u8 = undefined;
+        out.p("{s}\xe2\x9c\x93{s} {s}codedb {s}{s}  {s}{s}{s}\n", .{
+            s.green,                               s.reset,
+            s.bold,                                release_info.semver,
+            s.reset,                               sty.durationColor(s, elapsed),
+            sty.formatDuration(&dur_buf, elapsed), s.reset,
+        });
+        out.p("  {s}root{s}      {s}{s}{s}\n", .{ s.dim, s.reset, s.cyan, root, s.reset });
+        out.p("  {s}files{s}     {s}{d}{s} indexed\n", .{ s.dim, s.reset, s.bold, file_count, s.reset });
+        out.p("  {s}seq{s}       {s}{d}{s}\n", .{ s.dim, s.reset, s.bold, seq, s.reset });
+        out.p("  {s}outlines{s}  {s}{d}{s}\n", .{ s.dim, s.reset, s.bold, outline_count, s.reset });
+        out.p("  {s}index{s}     {s}{s}{s}  {d} files, {d}KB\n", .{ s.dim, s.reset, s.cyan, trigram_type, s.reset, trigram_files, index_kb });
     } else {
         // Not a natively-rendered command — bridge to the MCP navigation
         // handlers (symbol/callers/deps/glob/ls/file/context) so the CLI can
@@ -848,6 +903,7 @@ fn mainImpl() !void {
     // arg parsing so a leading `--config-file=X` isn't misread as the root.
     // See #101, #102.
     var explicit_config: ?[]const u8 = null;
+    var no_telemetry = false;
     const args = blk: {
         var filtered: std.ArrayList([]const u8) = .empty;
         errdefer filtered.deinit(allocator);
@@ -861,6 +917,13 @@ fn mainImpl() !void {
             } else if (std.mem.eql(u8, a, "--config-file") and i + 1 < raw_args.len) {
                 explicit_config = raw_args[i + 1];
                 i += 1;
+                continue;
+            } else if (std.mem.eql(u8, a, "--no-telemetry")) {
+                // #528 item 12: --no-telemetry is documented as a global option,
+                // so strip it before positional parsing (like --config-file)
+                // instead of only honoring it after `mcp`. Telemetry.init also
+                // honors CODEDB_NO_TELEMETRY.
+                no_telemetry = true;
                 continue;
             }
             try filtered.append(allocator, a);
@@ -1243,7 +1306,8 @@ fn mainImpl() !void {
         std.mem.eql(u8, cmd, "search") or std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "read") or
         std.mem.eql(u8, cmd, "hot") or std.mem.eql(u8, cmd, "symbol") or std.mem.eql(u8, cmd, "callers") or
         std.mem.eql(u8, cmd, "deps") or std.mem.eql(u8, cmd, "glob") or std.mem.eql(u8, cmd, "ls") or
-        std.mem.eql(u8, cmd, "file") or std.mem.eql(u8, cmd, "context"))
+        std.mem.eql(u8, cmd, "file") or std.mem.eql(u8, cmd, "context") or
+        std.mem.eql(u8, cmd, "status"))
     {
         const code = runQuery(io, allocator, &explorer, &store, abs_root, cmd, args, cmd_args_start, &out, s);
         out.flush();
@@ -1532,13 +1596,9 @@ fn mainImpl() !void {
         if (query_log) |ql| mcp_server.setQueryLogPath(ql);
 
         const startup_t0 = cio.milliTimestamp();
-        var telemetry_disabled = false;
-        for (args[cmd_args_start..]) |arg| {
-            if (std.mem.eql(u8, arg, "--no-telemetry")) {
-                telemetry_disabled = true;
-                break;
-            }
-        }
+        // --no-telemetry is stripped globally above (#528 item 12); honor it
+        // here alongside CODEDB_NO_TELEMETRY (checked inside Telemetry.init).
+        const telemetry_disabled = no_telemetry;
 
         var telem = telemetry.Telemetry.init(io, data_dir, allocator, telemetry_disabled);
         defer telem.deinit();
@@ -1682,6 +1742,82 @@ pub fn parsePositional(args: []const []const u8) ParsedPositional {
     return .{ .root = "", .cmd = "", .cmd_args_start = 0, .root_is_explicit = false, .usage_exit = true };
 }
 
+/// A 1-based inclusive line range as accepted by `read -L FROM-TO`. `end` is
+/// `std.math.maxInt(u32)` when the spec used `$`/`end` (read to end-of-file).
+pub const LineRange = struct { start: u32, end: u32 };
+
+pub const LineRangeError = error{ MissingDash, BadStart, BadEnd, ZeroLine, Reversed };
+
+/// Parse a `FROM-TO` line-range spec (the argument to `read -L`). `TO` may be
+/// `$` or `end` for end-of-file. Rejects malformed, non-numeric, zero-based,
+/// and reversed ranges so the CLI surfaces a clear error instead of silently
+/// defaulting (`abc-10` → 1) or printing empty output (`20-1`). Mirrors the
+/// MCP read validation. See issue #528 (items 3, 4, 7).
+pub fn parseLineRange(spec: []const u8) LineRangeError!LineRange {
+    const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return error.MissingDash;
+    const start = std.fmt.parseInt(u32, spec[0..dash], 10) catch return error.BadStart;
+    if (start < 1) return error.ZeroLine;
+    const end_str = spec[dash + 1 ..];
+    const end: u32 = if (std.mem.eql(u8, end_str, "$") or std.mem.eql(u8, end_str, "end"))
+        std.math.maxInt(u32)
+    else blk: {
+        const e = std.fmt.parseInt(u32, end_str, 10) catch return error.BadEnd;
+        if (e < 1) return error.ZeroLine;
+        break :blk e;
+    };
+    if (end != std.math.maxInt(u32) and start > end) return error.Reversed;
+    return .{ .start = start, .end = end };
+}
+
+/// Parsed `search` invocation. `max_results` defaults to 50 (the prior
+/// hard-coded cap) and is clamped to 1..200.
+pub const SearchArgs = struct {
+    query: []const u8,
+    use_regex: bool = false,
+    paths_only: bool = false,
+    max_results: usize = 50,
+};
+
+pub const SearchArgError = error{ UnknownFlag, MissingMaxResults, BadMaxResults, MissingQuery, EmptyQuery, ExtraArg };
+
+/// Parse `search` args. Flags (`--regex`, `--paths-only`, `--max-results N`)
+/// may appear before or after the query, in any order. Unknown `--flags` are
+/// rejected rather than silently treated as the query text (`--max-results 1
+/// foo` used to search for the literal "--max-results"), and an empty/missing
+/// query is a usage error. A bare `--` ends flag parsing so a literal
+/// `--`-prefixed string can still be searched. See issue #528 (item 9).
+pub fn parseSearchArgs(args: []const []const u8, start: usize) SearchArgError!SearchArgs {
+    var result: SearchArgs = .{ .query = "" };
+    var query: ?[]const u8 = null;
+    var flags_done = false;
+    var i = start;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (!flags_done and std.mem.eql(u8, a, "--")) {
+            flags_done = true;
+        } else if (!flags_done and std.mem.eql(u8, a, "--regex")) {
+            result.use_regex = true;
+        } else if (!flags_done and std.mem.eql(u8, a, "--paths-only")) {
+            result.paths_only = true;
+        } else if (!flags_done and std.mem.eql(u8, a, "--max-results")) {
+            if (i + 1 >= args.len) return error.MissingMaxResults;
+            i += 1;
+            const n = std.fmt.parseInt(usize, args[i], 10) catch return error.BadMaxResults;
+            if (n < 1) return error.BadMaxResults;
+            result.max_results = @min(n, 200);
+        } else if (!flags_done and a.len > 1 and a[0] == '-' and a[1] == '-') {
+            return error.UnknownFlag;
+        } else if (query == null) {
+            query = a;
+        } else {
+            return error.ExtraArg;
+        }
+    }
+    result.query = query orelse return error.MissingQuery;
+    if (result.query.len == 0) return error.EmptyQuery;
+    return result;
+}
+
 /// Walk up from cwd looking for a `.git` directory or file (git worktree).
 /// Returns a slice into `buf` containing the absolute path, or null if no
 /// repo root is found before reaching the filesystem root. Used to make
@@ -1726,7 +1862,7 @@ pub fn isValidMcpFlag(arg: []const u8) bool {
 }
 
 fn isCommand(arg: []const u8) bool {
-    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "symbol", "callers", "deps", "glob", "ls", "file", "context", "snapshot", "serve", "mcp", "update", "nuke", "cli-daemon" };
+    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "status", "symbol", "callers", "deps", "glob", "ls", "file", "context", "snapshot", "serve", "mcp", "update", "nuke", "cli-daemon" };
     for (commands) |c| {
         if (std.mem.eql(u8, arg, c)) return true;
     }
@@ -2011,6 +2147,7 @@ fn printUsage(out: *Out, s: sty.Style) void {
     });
     out.p(
         \\    {s}hot{s}                       recently modified files
+        \\    {s}status{s}                    index size, store seq, and index state
         \\    {s}symbol{s}  <name>            where a symbol is defined (all matches; --body for source)
         \\    {s}callers{s}  <name>           every call site of a symbol
         \\    {s}deps{s}  <path>              dependency graph (--depends-on, --transitive, --max-depth N)
@@ -2036,6 +2173,7 @@ fn printUsage(out: *Out, s: sty.Style) void {
         s.cyan, s.reset,
         s.cyan, s.reset,
         s.cyan, s.reset,
+        s.cyan, s.reset,
     });
     out.p(
         \\  {s}options:{s}
@@ -2044,6 +2182,9 @@ fn printUsage(out: *Out, s: sty.Style) void {
         \\
         \\  If root is omitted, uses current working directory.
         \\  Data stored in {s}~/.codedb/projects/<hash>/{s}
+        \\
+        \\  exit codes: 0 = success (incl. a valid query that finds nothing),
+        \\              1 = usage error, invalid input, or operational failure.
         \\
         \\
     , .{
