@@ -256,6 +256,31 @@ test "issue-411: tryLock grants new locks to a crashed agent" {
     try testing.expect(got == false);
 }
 
+test "issue-528: each MCP session registers a distinct edit-lock owner (not shared agent 1)" {
+    // Bug 2 from the #528 audit: codedb_edit hardcoded agent_id=1, so concurrent
+    // edits from separate connections all shared the startup __filesystem__ agent
+    // and re-entrantly "won" the same-file lock. The MCP server now registers a
+    // distinct agent per session and threads it into handleEdit. This guards that
+    // registration yields distinct, non-1 owners that mutually exclude on a path.
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+
+    const fs = try agents.register("__filesystem__"); // startup agent (id 1)
+    const session_a = try agents.register("mcp-session");
+    const session_b = try agents.register("mcp-session");
+
+    try testing.expect(session_a != fs);
+    try testing.expect(session_b != fs);
+    try testing.expect(session_a != session_b);
+
+    // Distinct session owners serialize same-file edits (vs the old shared-id
+    // re-entrant grant that let two connections clobber each other).
+    try testing.expect(try agents.tryLock(session_a, "x.zig", 60_000));
+    try testing.expect(!(try agents.tryLock(session_b, "x.zig", 60_000)));
+    agents.releaseLock(session_a, "x.zig");
+    try testing.expect(try agents.tryLock(session_b, "x.zig", 60_000));
+}
+
 
 test "issue-401: insert with after=null is a no-op but consumes seq and writes file" {
     var tmp = testing.tmpDir(.{});

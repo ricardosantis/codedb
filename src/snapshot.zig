@@ -1218,9 +1218,11 @@ fn parseJsonU64(json: []const u8, key: []const u8) ?u64 {
     return null;
 }
 
-/// Returns true if a file path looks like it may contain secrets.
-/// These files are excluded from snapshots to prevent accidental exposure.
-fn isSensitivePath(path: []const u8) bool {
+/// Returns true for secret/credential paths that must never be persisted to a
+/// snapshot or live-indexed. Kept in lockstep with `watcher.isSensitivePath`;
+/// the two are parity-tested in test_snapshot.zig ("issue-528: isSensitivePath
+/// parity") so any future drift in this security filter fails CI.
+pub fn isSensitivePath(path: []const u8) bool {
     const sensitive_names = [_][]const u8{
         ".env",
         ".env.local",
@@ -1267,7 +1269,6 @@ fn isSensitivePath(path: []const u8) bool {
 
     return false;
 }
-
 fn endsWith(s: []const u8, suffix: []const u8) bool {
     if (s.len < suffix.len) return false;
     return std.mem.eql(u8, s[s.len - suffix.len ..], suffix);
