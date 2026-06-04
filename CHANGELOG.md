@@ -1,13 +1,17 @@
 # Changelog
 
 
-## 0.2.5824 - 2026-06-02
+## 0.2.5824 - 2026-06-05
 
 `0.2.5824` adds a deterministic, no-LLM **code-graph** layer. codedb now builds a
 resolved call graph from the indexed symbols and uses it to rank search results
 more precisely and to assemble richer first-touch context. The graph is computed
 locally with no model calls and persisted in the snapshot, so it costs nothing on
 the query hot path.
+
+Beyond the graph, this cut also lands a **warm CLI daemon** (near-MCP latency
+from the plain `codedb` CLI), a **faster fuzzy `find`**, **hardened CLI** parsing
+and exit codes (#529), and **ReScript** `.res`/`.resi` support (#532).
 
 ### Graph-aware ranking (call-graph centrality)
 
@@ -77,6 +81,56 @@ load went from ~380 ms to ~125 ms and peak RSS from ~795 MB to ~457 MB.
   re-hashes every file's content (which also faulted in every content page). ~14%
   faster and ~100 MB lower RSS; an absent section makes the loader recompute
   (backward compatible).
+
+### Warm CLI daemon — near-MCP latency from the plain CLI
+
+- **`codedb <root> <query>` auto-spawns then reuses a per-project warm daemon.**
+  A cold query starts a background daemon that binds a per-project Unix socket
+  (`/tmp/codedb-<uid>-<hash>.sock`); later CLI calls proxy to it and stream the
+  rendered output back, skipping the cold snapshot reload. On any failure (no
+  daemon, refused connect, short read) the client falls back to the cold
+  in-process path, so the proxy is never a correctness risk.
+- **Full navigation coverage.** The daemon serves the read-only query commands —
+  `tree`, `outline`, `find`, `search`, `word`, `read`, `hot`, `symbol`,
+  `callers`, `deps`, `glob`, `ls`, `file`, `context` — bridged to the same warm
+  handlers the MCP server uses, so a proxied call pays roughly the MCP dispatch
+  cost instead of a per-call cold index (**13–114× faster per call** in
+  head-to-head runs).
+- **Lean warm RSS.** The daemon mmaps the word index zero-copy and skips
+  `file_words` on load so a long-lived warm daemon doesn't balloon; a u16
+  name-length overflow that could panic the snapshot writer on very long
+  identifiers is fixed.
+
+### Faster fuzzy `find`
+
+- **SIMD Smith-Waterman with a soundness prefilter (~1.8×, retrieval-identical).**
+  Fuzzy filename ranking gained a presence prefilter and a SIMD-across-files
+  inner loop; results are byte-for-byte identical to the scalar path.
+- **Compound-identifier fast path (~22×).** A query that is itself a known
+  compound symbol id is routed straight to the symbol index and returns the
+  definition instead of scoring every file.
+
+### CLI hardening (#529)
+
+- **Robust argument parsing, validation, and exit codes** for every command:
+  clear errors, correct non-zero exit on failure, a new `codedb status`, and a
+  globally-honored `--no-telemetry`, so subagents and scripts can trust the exit
+  code.
+
+### ReScript (.res / .resi) support (#532)
+
+- **ReScript is now a first-class indexed language.** A line-based parser
+  extracts `let`/`and` bindings (function when the body has a `=>` arrow,
+  constant otherwise), `type` → type alias, `module` → struct (`module type` →
+  interface), `external` → function, and `open`/`include` as imports; leading
+  `@decorators` are stripped so a decorated `@val external` / `@react.component`
+  binding still resolves.
+
+### Audit fixes (#530)
+
+- **Secret-filter drift guard + per-session edit locks** from the #528 capability
+  audit, with a runtime test proving an edit through a non-first session acquires
+  the lock and applies.
 
 ### Validation
 
