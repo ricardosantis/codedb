@@ -4,6 +4,8 @@ const AgentRegistry = @import("agent.zig").AgentRegistry;
 const AgentId = @import("agent.zig").AgentId;
 const Explorer = @import("explore.zig").Explorer;
 const Op = @import("version.zig").Op;
+const Language = @import("explore.zig").Language;
+const detectLanguage = @import("explore.zig").detectLanguage;
 
 pub const EditRequest = struct {
     path: []const u8,
@@ -12,8 +14,18 @@ pub const EditRequest = struct {
     range: ?[2]usize = null,
     after: ?usize = null,
     content: ?[]const u8 = null,
+    /// Anchor-based replace (P2, trial/graph-based-codedb): when set, the unique
+    /// occurrence of old_string in the file is replaced with new_string by exact
+    /// byte splice. Takes precedence over the range/after line ops, and cannot
+    /// mis-target surrounding lines the way a whole-block range replace can.
+    old_string: ?[]const u8 = null,
+    new_string: ?[]const u8 = null,
     if_hash: ?[]const u8 = null,
     dry_run: bool = false,
+    /// Create a NEW file at `path` with `content`. codedb_edit otherwise only
+    /// edits existing files; with create=true a missing path is authored rather
+    /// than erroring, and an existing path returns error.FileExists.
+    create: bool = false,
 };
 
 pub const EditResult = struct {
@@ -24,6 +36,10 @@ pub const EditResult = struct {
     /// Unified-diff-style preview of the change. Only populated when
     /// `dry_run = true`. Caller owns the slice and must free it.
     preview: ?[]u8 = null,
+    /// Advisory post-edit syntax warning (e.g. unbalanced delimiter) or null
+    /// when the edited content looks structurally clean. Caller owns the slice
+    /// and must free it. (trial/graph-based-codedb)
+    health: ?[]u8 = null,
 };
 
 pub fn applyEdit(
@@ -38,14 +54,35 @@ pub fn applyEdit(
     if (!has_lock) return error.FileLocked;
     errdefer agents.releaseLock(req.agent_id, req.path);
 
-    // Validate required op-specific args BEFORE doing any work that
-    // mutates Store.seq or rewrites the file (#401).
-    switch (req.op) {
-        .replace, .delete => if (req.range == null) return error.InvalidRange,
-        .insert => if (req.after == null) return error.InvalidRange,
-        else => {},
-    }
     const edit_dir = if (explorer) |exp| exp.root_dir orelse std.Io.Dir.cwd() else std.Io.Dir.cwd();
+
+    // Create op (trial/graph-based-codedb): author a NEW file. The write path in
+    // finalizeEdit already handles a nonexistent path, so create just skips the
+    // read and feeds an empty source. Refuse to clobber an existing file.
+    if (req.create) {
+        const new_content = req.content orelse return error.MissingContent;
+        if (edit_dir.readFileAlloc(io, req.path, allocator, .limited(10 * 1024 * 1024))) |existing| {
+            allocator.free(existing);
+            return error.FileExists;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+        return try finalizeEdit(io, allocator, edit_dir, store, agents, explorer, req, "", new_content);
+    }
+
+    // Validate required op-specific args BEFORE doing any work that
+    // mutates Store.seq or rewrites the file (#401). Anchor-based str_replace
+    // (old_string set) uses neither range nor after.
+    if (req.old_string == null) {
+        switch (req.op) {
+            .replace, .delete => if (req.range == null) return error.InvalidRange,
+            .insert => if (req.after == null) return error.InvalidRange,
+            else => {},
+        }
+    } else if (req.old_string.?.len == 0) {
+        return error.MissingContent;
+    }
 
     const source = try edit_dir.readFileAlloc(io, req.path, allocator, .limited(10 * 1024 * 1024));
     defer allocator.free(source);
@@ -57,6 +94,25 @@ pub fn applyEdit(
         if (!std.mem.eql(u8, expected_hex, actual_hex)) return error.HashMismatch;
     }
 
+    // Anchor-based replace (P2): splice the unique occurrence of old_string.
+    // Byte-exact, so it cannot mis-target surrounding lines the way a range
+    // replace can. old_string must occur exactly once. finalizeEdit handles the
+    // no-op (unchanged) case.
+    if (req.old_string) |old| {
+        const new = req.new_string orelse "";
+        const first = std.mem.indexOf(u8, source, old) orelse return error.PatternNotFound;
+        if (std.mem.indexOfPos(u8, source, first + old.len, old) != null) return error.PatternNotUnique;
+        var b: std.ArrayList(u8) = .empty;
+        defer b.deinit(allocator);
+        try b.appendSlice(allocator, source[0..first]);
+        try b.appendSlice(allocator, new);
+        try b.appendSlice(allocator, source[first + old.len ..]);
+        const result = try b.toOwnedSlice(allocator);
+        defer allocator.free(result);
+        return try finalizeEdit(io, allocator, edit_dir, store, agents, explorer, req, source, result);
+    }
+
+    // Fast path #1 (origin/main): a full-file replace with identical content is a no-op.
     if (!req.dry_run and req.op == .replace) {
         const range = req.range.?;
         const new_content = req.content orelse return error.MissingContent;
@@ -73,50 +129,28 @@ pub fn applyEdit(
         }
     }
 
+    // Fast path #2 (origin/main): in-place builder for line-range replaces. The
+    // actual write goes through finalizeEdit so the syntax-health check runs on
+    // replace edits too.
     if (!req.dry_run and req.op == .replace) {
         const range = req.range.?;
         const new_content = req.content orelse return error.MissingContent;
         if (new_content.len > 0) {
             const fast_result = try buildReplaceResultFast(allocator, source, range, new_content);
             defer allocator.free(fast_result);
-            const hash = std.hash.Wyhash.hash(0, fast_result);
 
             if (std.mem.eql(u8, source, fast_result)) {
                 const seq = store.currentSeq();
                 agents.releaseLock(req.agent_id, req.path);
                 return .{
                     .seq = seq,
-                    .new_hash = hash,
+                    .new_hash = std.hash.Wyhash.hash(0, fast_result),
                     .new_size = fast_result.len,
                     .changed = false,
                 };
             }
 
-            const tmp_path = try std.fmt.allocPrint(allocator, "{s}.codedb_tmp", .{req.path});
-            defer allocator.free(tmp_path);
-
-            {
-                const tmp_file = try edit_dir.createFile(io, tmp_path, .{});
-                defer tmp_file.close(io);
-                try tmp_file.writeStreamingAll(io, fast_result);
-            }
-
-            std.Io.Dir.rename(edit_dir, tmp_path, edit_dir, req.path, io) catch |err| {
-                edit_dir.deleteFile(io, tmp_path) catch {};
-                return err;
-            };
-
-            const seq = try store.recordEdit(req.path, req.agent_id, req.op, hash, fast_result.len, req.content);
-            if (explorer) |exp| {
-                try exp.indexFile(req.path, fast_result);
-            }
-
-            agents.releaseLock(req.agent_id, req.path);
-            return .{
-                .seq = seq,
-                .new_hash = hash,
-                .new_size = fast_result.len,
-            };
+            return try finalizeEdit(io, allocator, edit_dir, store, agents, explorer, req, source, fast_result);
         }
     }
 
@@ -186,8 +220,27 @@ pub fn applyEdit(
         try std.mem.join(allocator, sep, lines.items);
     defer allocator.free(result);
 
+    return try finalizeEdit(io, allocator, edit_dir, store, agents, explorer, req, source, result);
+}
+
+/// Common tail for applyEdit: hash + post-edit health, then either a dry-run
+/// preview or an atomic write + store record + re-index. Releases the file lock
+/// on its own return paths; on error the caller's errdefer releases it.
+fn finalizeEdit(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    edit_dir: std.Io.Dir,
+    store: *Store,
+    agents: *AgentRegistry,
+    explorer: ?*Explorer,
+    req: EditRequest,
+    source: []const u8,
+    result: []const u8,
+) !EditResult {
     const hash: u64 = std.hash.Wyhash.hash(0, result);
 
+    // No-op short-circuit (origin/main): the edit produced identical content,
+    // so nothing is written and there is nothing to syntax-check.
     if (!req.dry_run and std.mem.eql(u8, source, result)) {
         const seq = store.currentSeq();
         agents.releaseLock(req.agent_id, req.path);
@@ -199,16 +252,22 @@ pub fn applyEdit(
         };
     }
 
+    // Post-edit syntax health (trial/graph-based-codedb): advisory delimiter +
+    // dropped-import scan so a mis-spliced edit surfaces to the agent.
+    const health_msg = try describeHealth(allocator, source, result, detectLanguage(req.path));
+    errdefer if (health_msg) |h| allocator.free(h);
+
     if (req.dry_run) {
-        // Preview-only: build a compact diff and skip disk write, store record,
-        // and explorer indexing. Caller releases the lock via errdefer/return.
-        const preview = try buildPreview(allocator, source, result, req);
+        // Preview-only: skip disk write, store record, and explorer indexing.
+        // Range/insert/delete ops get a unified-diff preview; anchor edits skip it.
+        const preview = if (req.old_string == null) try buildPreview(allocator, source, result, req) else null;
         agents.releaseLock(req.agent_id, req.path);
         return .{
             .seq = 0,
             .new_hash = hash,
             .new_size = result.len,
             .preview = preview,
+            .health = health_msg,
         };
     }
 
@@ -242,6 +301,7 @@ pub fn applyEdit(
         .seq = seq,
         .new_hash = hash,
         .new_size = result.len,
+        .health = health_msg,
     };
 }
 
@@ -432,4 +492,343 @@ fn buildPreview(
     }
 
     return buf.toOwnedSlice(allocator);
+}
+
+// ── Post-edit syntax health check (trial/graph-based-codedb) ──────────────
+//
+// codedb_edit is a blind line-splice: historically it never checked whether
+// the resulting file still parsed. The deep-SWE benchmark showed Sonnet-4.6
+// routinely regenerates a multi-line bracketed region (a parenthesized import
+// block or a function signature + body) and mis-splices the hunk boundaries,
+// leaving an orphaned/duplicated delimiter — shipping a file that does not
+// even import. The scan below is a cheap, dependency-free, language-aware
+// delimiter-balance pass that surfaces such breaks back to the agent.
+
+const Imbalance = struct {
+    line: usize,
+    open_char: u8,
+    found_char: u8,
+    kind: enum { unmatched_close, unclosed_open, mismatched },
+};
+
+/// Languages where a ()/[]/{} balance scan is meaningful and low-noise.
+/// Deliberately excludes shell (case-pattern `)`), ruby (%w[] / heredocs),
+/// sql, css and markup, where false positives would be common.
+fn isCheckableCode(lang: Language) bool {
+    return switch (lang) {
+        .python, .javascript, .typescript, .zig, .c, .cpp, .rust, .go_lang, .java, .kotlin, .swift, .dart, .php => true,
+        else => false,
+    };
+}
+
+/// Scan `content` for the first unbalanced ()/[]/{} delimiter, skipping
+/// language-appropriate comments and string / char literals. Advisory only:
+/// returns null (stay silent) for unsupported languages or anything it cannot
+/// analyse confidently (nesting deeper than the fixed stack).
+fn scanDelimiterBalance(content: []const u8, language: Language) ?Imbalance {
+    if (!isCheckableCode(language)) return null;
+
+    const py = language == .python;
+    const php = language == .php;
+    const hash_comments = py or php;
+    const slash_comments = !py; // // line + /* */ block for every c-like lang here
+    const sq_is_string = py or php or language == .javascript or language == .typescript;
+    const backtick = language == .javascript or language == .typescript;
+    const zig_lang = language == .zig;
+
+    var stack: [512]struct { ch: u8, line: usize } = undefined;
+    var sp: usize = 0;
+    var line: usize = 1;
+    var i: usize = 0;
+    const n = content.len;
+
+    while (i < n) {
+        const ch = content[i];
+        if (ch == '\n') {
+            line += 1;
+            i += 1;
+            continue;
+        }
+
+        // Zig multi-line string: a `\\`-prefixed line runs to EOL with no closer.
+        if (zig_lang and ch == '\\' and i + 1 < n and content[i + 1] == '\\') {
+            while (i < n and content[i] != '\n') i += 1;
+            continue;
+        }
+
+        // Line comments.
+        if (hash_comments and ch == '#') {
+            while (i < n and content[i] != '\n') i += 1;
+            continue;
+        }
+        if (slash_comments and ch == '/' and i + 1 < n and content[i + 1] == '/') {
+            while (i < n and content[i] != '\n') i += 1;
+            continue;
+        }
+        // Block comment /* ... */
+        if (slash_comments and ch == '/' and i + 1 < n and content[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < n and !(content[i] == '*' and content[i + 1] == '/')) {
+                if (content[i] == '\n') line += 1;
+                i += 1;
+            }
+            i = @min(i + 2, n);
+            continue;
+        }
+
+        // Triple-quoted Python string.
+        if (py and (ch == '"' or ch == '\'') and i + 2 < n and content[i + 1] == ch and content[i + 2] == ch) {
+            const q = ch;
+            i += 3;
+            while (i + 2 < n and !(content[i] == q and content[i + 1] == q and content[i + 2] == q)) {
+                if (content[i] == '\n') line += 1;
+                if (content[i] == '\\') i += 1;
+                i += 1;
+            }
+            i = @min(i + 3, n);
+            continue;
+        }
+
+        // Backtick template literal (JS/TS): may span newlines; skip wholesale.
+        if (backtick and ch == '`') {
+            i += 1;
+            while (i < n and content[i] != '`') {
+                if (content[i] == '\\') {
+                    i += 2;
+                    continue;
+                }
+                if (content[i] == '\n') line += 1;
+                i += 1;
+            }
+            i = @min(i + 1, n);
+            continue;
+        }
+
+        // Double-quoted string (single line).
+        if (ch == '"') {
+            i += 1;
+            while (i < n and content[i] != '"') {
+                if (content[i] == '\\') {
+                    i += 2;
+                    continue;
+                }
+                if (content[i] == '\n') break; // unterminated; bail conservatively
+                i += 1;
+            }
+            if (i < n and content[i] == '"') i += 1;
+            continue;
+        }
+
+        // Single quote: a string (py/php/js/ts) or a char literal (c-family).
+        if (ch == '\'') {
+            if (sq_is_string) {
+                i += 1;
+                while (i < n and content[i] != '\'') {
+                    if (content[i] == '\\') {
+                        i += 2;
+                        continue;
+                    }
+                    if (content[i] == '\n') break;
+                    i += 1;
+                }
+                if (i < n and content[i] == '\'') i += 1;
+                continue;
+            }
+            // Char literal: only consume as a literal if a closing ' is near
+            // (<= 12 bytes). Otherwise it is a Rust lifetime (&'a) or a label —
+            // leave it as plain punctuation so we do not eat real delimiters.
+            var j = i + 1;
+            const cap = @min(n, i + 13);
+            var closed = false;
+            while (j < cap) {
+                if (content[j] == '\\') {
+                    j += 2;
+                    continue;
+                }
+                if (content[j] == '\'') {
+                    closed = true;
+                    break;
+                }
+                if (content[j] == '\n') break;
+                j += 1;
+            }
+            if (closed) {
+                i = j + 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        switch (ch) {
+            '(', '[', '{' => {
+                if (sp == stack.len) return null; // too deep to analyse; stay silent
+                stack[sp] = .{ .ch = ch, .line = line };
+                sp += 1;
+            },
+            ')', ']', '}' => {
+                const want: u8 = switch (ch) {
+                    ')' => '(',
+                    ']' => '[',
+                    '}' => '{',
+                    else => 0,
+                };
+                if (sp == 0) return .{ .line = line, .open_char = 0, .found_char = ch, .kind = .unmatched_close };
+                if (stack[sp - 1].ch != want) return .{ .line = line, .open_char = stack[sp - 1].ch, .found_char = ch, .kind = .mismatched };
+                sp -= 1;
+            },
+            else => {},
+        }
+        i += 1;
+    }
+
+    if (sp > 0) return .{ .line = stack[sp - 1].line, .open_char = stack[sp - 1].ch, .found_char = 0, .kind = .unclosed_open };
+    return null;
+}
+
+fn formatImbalance(allocator: std.mem.Allocator, imb: Imbalance) ![]u8 {
+    return switch (imb.kind) {
+        .unmatched_close => try std.fmt.allocPrint(allocator, "\n⚠ syntax check: unmatched '{c}' at line {d} — this edit may have broken the file; re-read and verify before continuing.", .{ imb.found_char, imb.line }),
+        .mismatched => try std.fmt.allocPrint(allocator, "\n⚠ syntax check: '{c}' at line {d} closes the wrong delimiter (open '{c}') — possible broken edit; re-read and verify.", .{ imb.found_char, imb.line, imb.open_char }),
+        .unclosed_open => try std.fmt.allocPrint(allocator, "\n⚠ syntax check: '{c}' opened at line {d} is never closed — possible broken edit; re-read and verify.", .{ imb.open_char, imb.line }),
+    };
+}
+
+// ── Dropped-import scan (P0b, trial/graph-based-codedb) ────────────────────
+//
+// The other half of the benchmark breakage: an edit that regenerates an import
+// block and drops a name that is still referenced — e.g. codedb's narwhals
+// patch removed `unstable` / `ExprNode` from a `from ... import (...)` while the
+// names were still used, a NameError at import (syntactically valid, so the
+// delimiter scan above cannot see it). Compare imports before vs after the edit
+// and flag any binding that was removed yet is still used in the file.
+
+const DroppedName = struct { name: []const u8, line: usize };
+
+fn isIdentByte(c: u8, first: bool) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or (!first and c >= '0' and c <= '9');
+}
+
+fn leadingIdent(s: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < s.len and isIdentByte(s[i], i == 0)) i += 1;
+    return s[0..i];
+}
+
+/// Add the names a Python import statement binds (handling `as` aliases and
+/// dotted modules) into `set`. `seg` is the text after `import`.
+fn addBoundNames(set: *std.StringHashMap(void), seg_in: []const u8, dotted: bool) !void {
+    var seg = seg_in;
+    if (std.mem.indexOfScalar(u8, seg, '#')) |h| seg = seg[0..h];
+    if (std.mem.indexOfScalar(u8, seg, ')')) |p| seg = seg[0..p];
+    var parts = std.mem.splitScalar(u8, seg, ',');
+    while (parts.next()) |part| {
+        const t = std.mem.trim(u8, part, " \t\r()");
+        if (t.len == 0) continue;
+        if (std.mem.indexOf(u8, t, " as ")) |ai| {
+            const id = leadingIdent(std.mem.trimStart(u8, t[ai + 4 ..], " \t\r"));
+            if (id.len > 0) try set.put(id, {});
+        } else if (dotted) {
+            // `import a.b.c` binds `a`; leadingIdent stops at '.'.
+            const id = leadingIdent(t);
+            if (id.len > 0) try set.put(id, {});
+        } else {
+            const id = leadingIdent(t);
+            if (id.len > 0) try set.put(id, {});
+        }
+    }
+}
+
+fn collectImportNames(content: []const u8, set: *std.StringHashMap(void)) !void {
+    var in_paren = false;
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (in_paren) {
+            try addBoundNames(set, line, false);
+            if (std.mem.indexOfScalar(u8, line, ')') != null) in_paren = false;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "from ")) {
+            const idx = std.mem.indexOf(u8, line, " import ") orelse continue;
+            const rest = line[idx + 8 ..];
+            const rest_trimmed = std.mem.trimStart(u8, rest, " \t\r");
+            if (std.mem.startsWith(u8, rest_trimmed, "*")) continue; // star import: untrackable
+            if (std.mem.indexOfScalar(u8, rest, '(') != null) {
+                try addBoundNames(set, rest, false);
+                if (std.mem.indexOfScalar(u8, rest, ')') == null) in_paren = true;
+            } else {
+                try addBoundNames(set, rest, false);
+            }
+        } else if (std.mem.startsWith(u8, line, "import ")) {
+            try addBoundNames(set, line[7..], true);
+        }
+    }
+}
+
+/// First line (1-based) where `name` is used as a whole word in `content`,
+/// ignoring comment lines and import lines. null if unused.
+fn firstUsageLine(content: []const u8, name: []const u8) ?usize {
+    var line: usize = 0;
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |raw| {
+        line += 1;
+        const st = std.mem.trim(u8, raw, " \t\r");
+        if (st.len > 0 and st[0] == '#') continue;
+        if (std.mem.startsWith(u8, st, "from ") or std.mem.startsWith(u8, st, "import ")) continue;
+        var idx: usize = 0;
+        while (std.mem.indexOfPos(u8, raw, idx, name)) |p| {
+            const before_ok = p == 0 or !isIdentByte(raw[p - 1], false);
+            const after_pos = p + name.len;
+            const after_ok = after_pos >= raw.len or !isIdentByte(raw[after_pos], false);
+            if (before_ok and after_ok) return line;
+            idx = p + 1;
+        }
+    }
+    return null;
+}
+
+/// Find an import binding removed by the edit that is still referenced in the
+/// new file. Python-only for now. The returned name slices into `after_src`.
+fn findDroppedImport(allocator: std.mem.Allocator, before: []const u8, after: []const u8, language: Language) !?DroppedName {
+    if (language != .python) return null;
+    var before_names = std.StringHashMap(void).init(allocator);
+    defer before_names.deinit();
+    var after_names = std.StringHashMap(void).init(allocator);
+    defer after_names.deinit();
+    try collectImportNames(before, &before_names);
+    try collectImportNames(after, &after_names);
+
+    var it = before_names.keyIterator();
+    while (it.next()) |k| {
+        const name = k.*;
+        if (after_names.contains(name)) continue; // re-imported elsewhere
+        if (firstUsageLine(after, name)) |ln| return .{ .name = name, .line = ln };
+    }
+    return null;
+}
+
+/// Returns an owned advisory message describing any post-edit health problem
+/// (unbalanced delimiter and/or a dropped-but-used import), or null when the
+/// edit looks structurally clean. Caller frees. Exposed for tests.
+pub fn describeHealth(allocator: std.mem.Allocator, before: []const u8, after: []const u8, language: Language) !?[]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    if (scanDelimiterBalance(after, language)) |imb| {
+        const m = try formatImbalance(allocator, imb);
+        defer allocator.free(m);
+        try buf.appendSlice(allocator, m);
+    }
+    if (findDroppedImport(allocator, before, after, language) catch null) |dropped| {
+        const m = try std.fmt.allocPrint(allocator, "\n⚠ import check: '{s}' was removed from the imports but is still used at line {d} — this edit likely breaks the module (NameError); re-add the import or revert.", .{ dropped.name, dropped.line });
+        defer allocator.free(m);
+        try buf.appendSlice(allocator, m);
+    }
+
+    if (buf.items.len == 0) {
+        buf.deinit(allocator);
+        return null;
+    }
+    return try buf.toOwnedSlice(allocator);
 }

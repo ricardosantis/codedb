@@ -12,6 +12,70 @@ const WordTokenizer = @import("index.zig").WordTokenizer;
 const splitIdentifier = @import("index.zig").splitIdentifier;
 const explore = @import("explore.zig");
 const extractLines = explore.extractLines;
+const codegraph = @import("codegraph.zig");
+
+test "codegraph: extractCallees finds calls, filters keywords" {
+    const body =
+        \\    if (cond) return helper();
+        \\    const x = compute(a, b);
+        \\    obj.method(x);
+        \\    while (y) doThing();
+        \\    return compute(x);
+    ;
+    const callees = try codegraph.extractCallees(testing.allocator, body);
+    defer testing.allocator.free(callees);
+
+    // Present: helper, compute (deduped), method, doThing. Absent: if, while, return.
+    var found_helper = false;
+    var found_compute = false;
+    var found_method = false;
+    var found_dothing = false;
+    for (callees) |c| {
+        if (std.mem.eql(u8, c, "helper")) found_helper = true;
+        if (std.mem.eql(u8, c, "compute")) found_compute = true;
+        if (std.mem.eql(u8, c, "method")) found_method = true;
+        if (std.mem.eql(u8, c, "doThing")) found_dothing = true;
+        try testing.expect(!std.mem.eql(u8, c, "if"));
+        try testing.expect(!std.mem.eql(u8, c, "while"));
+        try testing.expect(!std.mem.eql(u8, c, "return"));
+    }
+    try testing.expect(found_helper and found_compute and found_method and found_dothing);
+    // compute appears twice but is deduped.
+    var compute_count: usize = 0;
+    for (callees) |c| if (std.mem.eql(u8, c, "compute")) {
+        compute_count += 1;
+    };
+    try testing.expectEqual(@as(usize, 1), compute_count);
+}
+
+test "codegraph: buildEdges resolves callees + inDegree centrality" {
+    // A(0) calls B and helper; helper(2) calls B; B(1) calls nothing real.
+    const funcs = [_]codegraph.FuncInput{
+        .{ .id = 0, .body = "B(); helper();" },
+        .{ .id = 1, .body = "if (x) return;" },
+        .{ .id = 2, .body = "return B();" },
+    };
+    var resolve = std.StringHashMap([]const codegraph.NodeId).init(testing.allocator);
+    defer resolve.deinit();
+    const b_ids = [_]codegraph.NodeId{1};
+    const helper_ids = [_]codegraph.NodeId{2};
+    try resolve.put("B", &b_ids);
+    try resolve.put("helper", &helper_ids);
+
+    var edges = try codegraph.buildEdges(testing.allocator, &funcs, &resolve, false);
+    defer edges.deinit(testing.allocator);
+
+    // Expect A→B, A→helper, helper→B (3 edges); B calls nothing resolvable.
+    try testing.expectEqual(@as(usize, 3), edges.items.len);
+
+    const cent = try codegraph.inDegreeCentrality(testing.allocator, edges.items, 3);
+    defer testing.allocator.free(cent);
+    // B (id 1) is called by A and helper → highest centrality; A (id 0) by none.
+    try testing.expect(cent[1] > cent[2]);
+    try testing.expect(cent[2] > cent[0]);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), cent[0], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), cent[1], 0.001);
+}
 const isCommentOrBlank = explore.isCommentOrBlank;
 const Language = explore.Language;
 const SymbolKind = explore.SymbolKind;
@@ -1110,6 +1174,11 @@ test "issue-215: detectLanguage handles .r and .R" {
     try testing.expectEqual(Language.r, explore.detectLanguage("analysis.R"));
 }
 
+test "issue-532: detectLanguage handles .res and .resi" {
+    try testing.expectEqualStrings("rescript", @tagName(explore.detectLanguage("src/User.res")));
+    try testing.expectEqualStrings("rescript", @tagName(explore.detectLanguage("src/User.resi")));
+}
+
 
 test "dep-graph: reverse index gives O(1) imported_by lookup" {
     var graph = DependencyGraph.init(testing.allocator);
@@ -1941,3 +2010,103 @@ test "issue-208: content cache evicts cold entries under pressure" {
     try testing.expect(s.evictions > 0);
 }
 
+
+
+test "explorer: renderSkeleton elides bodies, keeps signatures" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    try explorer.indexFile("sk.zig",
+        \\const std = @import("std");
+        \\pub fn parseConfig(path: []const u8) !void {
+        \\    const a = 1;
+        \\    const b = 2;
+        \\    _ = a;
+        \\    _ = b;
+        \\}
+        \\pub const MAX = 100;
+    );
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    const found = try explorer.renderSkeleton("sk.zig", testing.allocator, &out);
+    try testing.expect(found);
+
+    const s = out.items;
+    // Declaration line is shown, with the body collapsed to a line-count stub.
+    try testing.expect(std.mem.indexOf(u8, s, "pub fn parseConfig(path: []const u8) !void {") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "lines }") != null);
+    // Body lines are elided — the whole point.
+    try testing.expect(std.mem.indexOf(u8, s, "const a = 1") == null);
+    // Single-line declarations stay verbatim.
+    try testing.expect(std.mem.indexOf(u8, s, "pub const MAX = 100;") != null);
+    // Escalation footer points the model to the fallback tools when skeleton isn't enough.
+    try testing.expect(std.mem.indexOf(u8, s, "codedb_read sk.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "codedb_outline sk.zig") != null);
+}
+
+
+test "explorer: multi-line signature gets correct line_end (findBraceEnd paren-awareness)" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    try explorer.indexFile("mlsig.ts",
+        \\export function f(
+        \\  opts: { a?: number } = {},
+        \\): string {
+        \\  const x = 1;
+        \\  return String(x);
+        \\}
+        \\export const Z = 2;
+    );
+
+    var outline = (try explorer.getOutline("mlsig.ts", testing.allocator)).?;
+    defer outline.deinit();
+    var f_end: u32 = 0;
+    for (outline.symbols.items) |s| {
+        if (std.mem.eql(u8, s.name, "f")) f_end = s.line_end;
+    }
+    // Body close brace is line 6. Pre-fix, the inline object-type param `{ a?: number }`
+    // on line 2 ended the scope early (line_end ~2); paren-awareness fixes it.
+    try testing.expect(f_end >= 6);
+}
+
+test "resolveCallees: resolves call sites in a function body to their definitions" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var exp = Explorer.init(a, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try exp.indexFile("util.zig", "pub fn helper() void {}\npub fn other() void {}\n");
+    try exp.indexFile("main.zig",
+        \\pub fn run() void {
+        \\    helper();
+        \\    other();
+        \\}
+        \\
+    );
+
+    // run() spans lines 1-4; both calls resolve to definitions in util.zig.
+    const callees = try exp.resolveCallees("main.zig", 1, 4, a, 8);
+    var saw_helper = false;
+    var saw_other = false;
+    for (callees) |c| {
+        if (std.mem.eql(u8, c.name, "helper")) {
+            saw_helper = true;
+            try testing.expectEqualStrings("util.zig", c.path);
+            try testing.expect(c.kind == .function);
+        }
+        if (std.mem.eql(u8, c.name, "other")) saw_other = true;
+        // The defining function must not appear as its own callee.
+        try testing.expect(!std.mem.eql(u8, c.name, "run"));
+    }
+    try testing.expect(saw_helper);
+    try testing.expect(saw_other);
+}
+
+test "issue-528: searchContentRegex surfaces invalid regex as error" {
+    var explorer_inst = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer_inst.deinit();
+    try explorer_inst.indexFile("only.zig", "const x = 42;");
+    // #10: an unparseable pattern used to be swallowed and reported as "no results".
+    try testing.expectError(error.InvalidRegex, explorer_inst.searchContentRegex("[", testing.allocator, 50));
+}

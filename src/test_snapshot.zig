@@ -203,6 +203,151 @@ test "issue-46: empty-repo snapshot rejected on load" {
     try testing.expect(exp2.outlines.count() == 0);
 }
 
+// Restored FileOutlines borrow their import/symbol strings as slices into a
+// section buffer the Explorer retains (FileOutline.borrows_strings). This test
+// pins two things the borrow optimization must preserve:
+//   1. the strings survive the round-trip intact (slices point at the right bytes)
+//   2. explorer.deinit() frees the adopted section buffer exactly once and does
+//      NOT double-free the borrowed strings (DebugAllocator flags either).
+test "snapshot: restored outlines borrow strings (round-trip intact + clean deinit)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var exp = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    // A path that does not exist on disk, so the load takes the restore path
+    // (the freshness check can't find a newer file) rather than re-indexing.
+    try exp.indexFile("borrow_test_pkg/main.zig",
+        \\const std = @import("std");
+        \\const helper = @import("helper.zig");
+        \\pub fn alphaFn() void {}
+        \\pub fn betaFn(x: u32) u32 {
+        \\    return x + 1;
+        \\}
+        \\
+    );
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/borrow.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
+
+    // Fresh Explorer, loaded with the same allocator and explicitly deinit'd —
+    // the production pattern. This verifies explorer.deinit() cleanly frees the
+    // adopted section backing AND that the borrowed import/symbol strings are
+    // not double-freed (DebugAllocator would flag either).
+    var exp2 = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer exp2.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const loaded = snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, testing.allocator);
+    try testing.expect(loaded);
+
+    const outline = exp2.outlines.get("borrow_test_pkg/main.zig") orelse return error.MissingOutline;
+    try testing.expect(outline.borrows_strings);
+    try testing.expect(outline.imports.items.len >= 1);
+
+    var saw_alpha = false;
+    var saw_beta = false;
+    for (outline.symbols.items) |s| {
+        if (std.mem.eql(u8, s.name, "alphaFn")) saw_alpha = true;
+        if (std.mem.eql(u8, s.name, "betaFn")) saw_beta = true;
+    }
+    try testing.expect(saw_alpha);
+    try testing.expect(saw_beta);
+}
+
+// Call-graph centrality (the ranking boost) is persisted in a snapshot section
+// and restored on load, so the first ranked search skips the lazy rebuild. This
+// pins: (1) the value round-trips exactly, and (2) restore happens at load time
+// with no search having run, keyed off the restored outlines.
+test "snapshot: call-graph centrality persists and restores (no lazy rebuild)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var exp = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    // util.zig defines helper(); main.zig calls it twice -> util.zig has in-degree.
+    // Paths don't exist on disk, so the load takes the restore path.
+    try exp.indexFile("cc_pkg/util.zig",
+        \\pub fn helper() void {}
+        \\
+    );
+    try exp.indexFile("cc_pkg/main.zig",
+        \\const util = @import("util.zig");
+        \\pub fn run() void {
+        \\    helper();
+        \\    helper();
+        \\}
+        \\
+    );
+
+    exp.buildCallCentrality(testing.allocator);
+    try testing.expect(exp.call_centrality != null);
+    const want = exp.call_centrality.?.get("cc_pkg/util.zig") orelse 0.0;
+    try testing.expect(want > 0.0);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/cc.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
+
+    var exp2 = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer exp2.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const loaded = snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, testing.allocator);
+    try testing.expect(loaded);
+
+    // Restored at load time — no ranked search ran to build it.
+    try testing.expect(exp2.call_centrality != null);
+    const got = exp2.call_centrality.?.get("cc_pkg/util.zig") orelse 0.0;
+    try testing.expectEqual(want, got);
+}
+
+// The CONTENT_HASHES section lets the loader record Store baselines without
+// re-hashing content. This pins that the stored hash equals Wyhash of the
+// content for each file — i.e. the section is read in the correct (content)
+// order, so hashes are not misaligned across files.
+test "snapshot: CONTENT_HASHES records the correct per-file hash (order-aligned)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var exp = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    const Pair = struct { p: []const u8, c: []const u8 };
+    const files = [_]Pair{
+        .{ .p = "ch_pkg/alpha.zig", .c = "pub fn alpha() void { beta(); }\n" },
+        .{ .p = "ch_pkg/beta.zig", .c = "pub fn beta() void {}\npub fn extra() void {}\n" },
+        .{ .p = "ch_pkg/gamma.zig", .c = "const value = 123456;\n" },
+    };
+    for (files) |f| try exp.indexFile(f.p, f.c);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/ch.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
+
+    var exp2 = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer exp2.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    try testing.expect(snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, testing.allocator));
+
+    for (files) |f| {
+        const v = store.getLatest(f.p) orelse return error.MissingVersion;
+        try testing.expectEqual(std.hash.Wyhash.hash(0, f.c), v.hash);
+    }
+}
+
 
 test "issue-220: snapshot fast load restores outlines and lazily rebuilds word index" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -252,6 +397,71 @@ test "issue-220: snapshot fast load restores outlines and lazily rebuilds word i
     try testing.expect(exp2.word_index.index.count() > 0);
     try testing.expect(exp2.wordIndexIsComplete());
     try testing.expect(exp2.wordIndexNeedsPersist());
+}
+
+test "snapshot: parallel freshness load re-indexes changed files, restores the rest" {
+    // Forces loadSnapshotFast's multi-worker freshness path with a fixture larger
+    // than FRESHNESS_PARALLEL_THRESHOLD: files edited after the snapshot must come
+    // back with fresh content (changed branch) while the rest restore unchanged.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const total = snapshot_mod.FRESHNESS_PARALLEL_THRESHOLD + 32;
+
+    // Build `total` files on disk, indexing each by ABSOLUTE path so the load's
+    // cwd-relative statFile resolves them regardless of the test's working dir.
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    const abs_paths = try aa.alloc([]const u8, total);
+    for (0..total) |i| {
+        const rel = try std.fmt.allocPrint(aa, "f{d}.zig", .{i});
+        const content = try std.fmt.allocPrint(aa, "pub fn oldfn_{d}() void {{}}\n", .{i});
+        try tmp.dir.writeFile(io, .{ .sub_path = rel, .data = content });
+        abs_paths[i] = try std.fmt.allocPrint(aa, "{s}/{s}", .{ dir_path, rel });
+        try exp.indexFileOutlineOnly(abs_paths[i], content);
+    }
+
+    const snap_path = try std.fmt.allocPrint(aa, "{s}/parallel.codedb", .{dir_path});
+    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, aa);
+
+    // Edit a spread of files AFTER the snapshot so their mtime is strictly newer.
+    cio.sleepMs(10);
+    const changed = [_]usize{ 1, total / 4, total / 2, (total * 3) / 4, total - 2 };
+    for (changed) |i| {
+        const rel = try std.fmt.allocPrint(aa, "f{d}.zig", .{i});
+        const content = try std.fmt.allocPrint(aa, "pub fn newfn_{d}() void {{}}\n", .{i});
+        try tmp.dir.writeFile(io, .{ .sub_path = rel, .data = content });
+    }
+
+    // Reload into a fresh explorer: the parallel scan must spot the edited files.
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    var exp2 = Explorer.init(arena2.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    try testing.expect(snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, arena2.allocator()));
+    try testing.expectEqual(total, exp2.outlines.count());
+
+    var is_changed = [_]bool{false} ** total;
+    for (changed) |i| is_changed[i] = true;
+
+    // Changed files carry fresh content (changed branch); the rest keep snapshot
+    // content (restored branch) — verified directly via the content cache.
+    for (0..total) |i| {
+        const cached = exp2.contents.get(abs_paths[i]) orelse return error.MissingContent;
+        const want = if (is_changed[i])
+            try std.fmt.allocPrint(aa, "pub fn newfn_{d}() void {{}}\n", .{i})
+        else
+            try std.fmt.allocPrint(aa, "pub fn oldfn_{d}() void {{}}\n", .{i});
+        try testing.expectEqualStrings(want, cached);
+    }
 }
 
 
@@ -712,3 +922,99 @@ test "issue-379: snapshot loader returns true with zero outlines for empty-explo
     }
 }
 
+
+test "issue-528: isSensitivePath parity between snapshot.zig and watcher.zig" {
+    // The secret/credential filter is duplicated (snapshot persistence vs live
+    // indexing). The #528 audit flagged a possible divergence; the two are
+    // verified equal today, and this test fails CI if they ever drift apart —
+    // which in this security filter would mean a secret silently leaking into
+    // one path but not the other.
+    const cases = [_][]const u8{
+        // secrets — both copies must block
+        ".env",                  ".env.local",          ".env.production",
+        ".env.development",      ".env.staging",        ".env.test",
+        ".dev.vars",             ".npmrc",              ".pypirc",
+        ".netrc",                "credentials.json",    "service-account.json",
+        "secrets.json",          "secrets.yaml",        "secrets.yml",
+        "id_rsa",                "id_ed25519",          "server.key",
+        "cert.pem",              "keystore.jks",        "identity.pfx",
+        "bundle.p12",            "config/.env.local",   "a/b/secrets.yaml",
+        "deep/nested/.ssh/known_hosts", ".gnupg/secring.gpg", "x/.aws/credentials",
+        // non-secrets — both copies must allow (esp. the .env-prefix edge cases)
+        ".envoy.json",           ".environment",        ".envrc",
+        ".envconfig.yaml",       "main.zig",            "src/server.zig",
+        "README.md",             "package.json",        "id_rsa.pub",
+        "envvars.ts",            "Makefile",            "Dockerfile",
+    };
+    for (cases) |p| {
+        try testing.expectEqual(watcher.isSensitivePath(p), snapshot_mod.isSensitivePath(p));
+    }
+    // Anchor the contract so parity can't be satisfied by both copies being
+    // wrong in the same direction.
+    try testing.expect(snapshot_mod.isSensitivePath(".env"));
+    try testing.expect(snapshot_mod.isSensitivePath("credentials.json"));
+    try testing.expect(snapshot_mod.isSensitivePath("deep/.ssh/id_rsa"));
+    try testing.expect(snapshot_mod.isSensitivePath("keystore.jks")); // fast-path ext
+    try testing.expect(!snapshot_mod.isSensitivePath(".envoy.json")); // issue-409
+    try testing.expect(!snapshot_mod.isSensitivePath(".environment"));
+    try testing.expect(!snapshot_mod.isSensitivePath("main.zig"));
+    try testing.expect(!snapshot_mod.isSensitivePath("package.json"));
+}
+
+test "issue-528: codedb_edit applies via a per-session agent id (not the first/__filesystem__ agent)" {
+    // Bug 2 wiring (runtime): handleEdit now uses Session.edit_agent_id — a
+    // per-connection agent registered AFTER __filesystem__, so its id != 1.
+    // applyEdit's advisory lock returns error.FileLocked if that id is not a
+    // live registered agent, so this proves an edit through a non-first session
+    // agent actually acquires the lock and writes the file.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/per-session-edit.zig", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    var file = try tmp.dir.createFile(io, "per-session-edit.zig", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "const foo = 1;\n");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try explorer.indexFile(rel_path, "const foo = 1;\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const fs = try agents.register("__filesystem__"); // startup agent (id 1)
+    const session = try agents.register("mcp-session"); // per-session owner (id 2)
+    try testing.expect(session != fs);
+
+    // Edit through the per-session id — must acquire the lock and apply.
+    const r1 = try edit_mod.applyEdit(io, testing.allocator, &store, &agents, &explorer, .{
+        .path = rel_path,
+        .agent_id = session,
+        .op = .replace,
+        .range = .{ 1, 1 },
+        .content = "const bar = 1;",
+    });
+    defer if (r1.health) |h| testing.allocator.free(h);
+    defer if (r1.preview) |p| testing.allocator.free(p);
+    try testing.expect(r1.changed);
+
+    // The lock was released on success, so another session can edit immediately.
+    const r2 = try edit_mod.applyEdit(io, testing.allocator, &store, &agents, &explorer, .{
+        .path = rel_path,
+        .agent_id = fs,
+        .op = .replace,
+        .range = .{ 1, 1 },
+        .content = "const baz = 1;",
+    });
+    defer if (r2.health) |h| testing.allocator.free(h);
+    defer if (r2.preview) |p| testing.allocator.free(p);
+
+    const content = try tmp.dir.readFileAlloc(io, "per-session-edit.zig", testing.allocator, .limited(64 * 1024));
+    defer testing.allocator.free(content);
+    try testing.expect(std.mem.indexOf(u8, content, "baz") != null);
+}

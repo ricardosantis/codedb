@@ -9,6 +9,23 @@ const TrigramIndex = idx.TrigramIndex;
 const MmapTrigramIndex = idx.MmapTrigramIndex;
 const AnyTrigramIndex = idx.AnyTrigramIndex;
 const SparseNgramIndex = idx.SparseNgramIndex;
+const codegraph = @import("codegraph.zig");
+
+/// Fast hash context for u32-keyed maps on hot paths (ranked search aggregation).
+/// Zig's AutoHashMap runs the 4 key bytes through Wyhash even for an integer key;
+/// std.hash.int is a couple of multiply/shift/xor ops with full avalanche. Pure
+/// Context swap — identical map semantics, behavior-preserving. (FxHash precedent.)
+const U32Context = struct {
+    pub fn hash(_: U32Context, k: u32) u64 {
+        return std.hash.int(@as(u64, k));
+    }
+    pub fn eql(_: U32Context, a: u32, b: u32) bool {
+        return a == b;
+    }
+};
+fn U32HashMap(comptime V: type) type {
+    return std.HashMap(u32, V, U32Context, std.hash_map.default_max_load_percentage);
+}
 
 pub const SymbolKind = enum(u8) {
     function,
@@ -46,6 +63,11 @@ pub const FileOutline = struct {
     imports: std.ArrayList([]const u8) = .empty,
     allocator: std.mem.Allocator,
     owns_path: bool = false,
+    /// When true, `imports` and each `symbols[].name`/`.detail` are borrowed
+    /// slices into an externally-owned buffer (the snapshot outline_state
+    /// section, retained by the Explorer) rather than individual allocations,
+    /// so deinit must not free them. The ArrayLists themselves are still owned.
+    borrows_strings: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) FileOutline {
         return .{
@@ -58,12 +80,14 @@ pub const FileOutline = struct {
     }
     pub fn deinit(self: *FileOutline) void {
         if (self.owns_path) self.allocator.free(self.path);
-        for (self.symbols.items) |sym| {
-            self.allocator.free(sym.name);
-            if (sym.detail) |d| self.allocator.free(d);
+        if (!self.borrows_strings) {
+            for (self.symbols.items) |sym| {
+                self.allocator.free(sym.name);
+                if (sym.detail) |d| self.allocator.free(d);
+            }
+            for (self.imports.items) |imp| self.allocator.free(imp);
         }
         self.symbols.deinit(self.allocator);
-        for (self.imports.items) |imp| self.allocator.free(imp);
         self.imports.deinit(self.allocator);
     }
 };
@@ -117,6 +141,7 @@ pub const Language = enum(u8) {
     llvm_ir,
     mlir,
     tablegen,
+    rescript,
 };
 
 pub fn detectLanguage(path: []const u8) Language {
@@ -155,6 +180,7 @@ pub fn detectLanguage(path: []const u8) Language {
     if (std.mem.endsWith(u8, path, ".ll")) return .llvm_ir;
     if (std.mem.endsWith(u8, path, ".mlir")) return .mlir;
     if (std.mem.endsWith(u8, path, ".td")) return .tablegen;
+    if (std.mem.endsWith(u8, path, ".res") or std.mem.endsWith(u8, path, ".resi")) return .rescript;
     return .unknown;
 }
 
@@ -588,7 +614,17 @@ pub const Explorer = struct {
     word_index_can_load_from_disk: bool = false,
     word_index_generation: u64 = 0,
     word_index_persisted_generation: u64 = 0,
+    /// When true, commitParsedFileOwnedOutline skips word_index.indexFile — the
+    /// caller is building the word index in parallel per-worker shards and will
+    /// merge them after the commit loop (see watcher.initialScanWithWorkerCount).
+    defer_word_index: bool = false,
     mu: cio.RwLock = .{},
+    /// Per-file "call centrality" (summed weighted in-degree of the file's
+    /// functions in the resolved call graph). Built lazily, used as an additive
+    /// ranking boost in searchContentRanked. Null until built; guarded by
+    /// centrality_build_mu. Keys are borrowed `outlines` keys (stable).
+    call_centrality: ?std.StringHashMap(f32) = null,
+    centrality_build_mu: cio.Mutex = .{},
     root_dir: ?std.Io.Dir = null,
     io: ?std.Io = null,
     /// When non-null, append one JSON line per searchContent invocation
@@ -601,6 +637,15 @@ pub const Explorer = struct {
     /// Production code does not read this field.
     search_tier5_count: u64 = 0,
     last_search_breakdown: SearchBreakdown = .{},
+    /// Buffers adopted from snapshot loads (the raw outline_state section).
+    /// Restored FileOutlines borrow their import/symbol strings as slices into
+    /// these (see FileOutline.borrows_strings), so they must outlive every
+    /// restored outline; freed once here at Explorer.deinit.
+    outline_section_bufs: std.ArrayList([]const u8) = .empty,
+    /// mmap'd snapshot content sections adopted at load. The ContentCache stores
+    /// borrowed (value_owned=false) slices into these for restored files, so they
+    /// must outlive the cache; munmap'd once here at Explorer.deinit.
+    content_section_maps: std.ArrayList([]align(std.heap.page_size_min) const u8) = .empty,
 
     /// Default file-content cache capacity. Was 16384, but on typical
     /// projects (≤2000 files) the cache only ever holds a few hundred
@@ -645,13 +690,34 @@ pub const Explorer = struct {
         self.symbol_index.deinit();
 
         self.contents.deinit();
+        if (self.call_centrality) |*c| c.deinit();
 
         self.word_index.deinit();
         self.trigram_index.deinit();
         self.skip_trigram_files.deinit();
+        // Freed after outlines (above) since restored outlines borrow into these.
+        for (self.outline_section_bufs.items) |b| self.allocator.free(b);
+        self.outline_section_bufs.deinit(self.allocator);
+        // munmap'd after contents.deinit (above): the cache holds borrowed slices
+        // into these maps, but deinit skips freeing borrowed values, so the maps
+        // are still valid through it and only released here.
+        for (self.content_section_maps.items) |m| std.posix.munmap(m);
+        self.content_section_maps.deinit(self.allocator);
         if (self.root_dir) |d| {
             if (self.io) |io| d.close(io);
         }
+    }
+
+    /// Take ownership of a snapshot outline_state section buffer that restored
+    /// FileOutlines borrow their import/symbol strings from. Freed at deinit.
+    pub fn adoptOutlineSection(self: *Explorer, buf: []const u8) !void {
+        try self.outline_section_bufs.append(self.allocator, buf);
+    }
+
+    /// Take ownership of an mmap'd snapshot content section that the ContentCache
+    /// borrows (value_owned=false) slices from. munmap'd at deinit.
+    pub fn adoptContentSection(self: *Explorer, map: []align(std.heap.page_size_min) const u8) !void {
+        try self.content_section_maps.append(self.allocator, map);
     }
 
     /// Number of slots in the heap trigram index id_to_path array (benchmark helper).
@@ -735,7 +801,7 @@ pub const Explorer = struct {
             if (!self.word_index_complete) {
                 self.word_index_can_load_from_disk = false;
             }
-            try self.word_index.indexFile(stable_path, content);
+            if (!self.defer_word_index) try self.word_index.indexFile(stable_path, content);
             // If trigram indexing fails below, restore word_index to its previous state
             // to prevent word_index and trigram_index from diverging.
             errdefer if (prior_content) |old| {
@@ -774,7 +840,7 @@ pub const Explorer = struct {
         }
 
         try self.rebuildDepsFor(stable_path, &persistent_outline);
-        self.rebuildSymbolIndexFor(stable_path, &persistent_outline);
+        self.rebuildSymbolIndexFor(stable_path, &persistent_outline, !is_new);
 
         outline_gop.value_ptr.* = persistent_outline;
         if (prior_outline) |*old_outline| old_outline.deinit();
@@ -831,6 +897,7 @@ pub const Explorer = struct {
         var in_string: u8 = 0; // 0=none, '"', '\''
         var in_triple_quote: u8 = 0; // 0=none, '"', '\''
         var interp_depth: i32 = 0;
+        var paren_depth: i32 = 0; // params/types before the body brace
         var in_line_comment = false;
         var in_block_comment = false;
         var i = start_idx;
@@ -843,7 +910,7 @@ pub const Explorer = struct {
                 current_line += 1;
                 in_line_comment = false;
                 // Bail out if no opening brace found within 10 lines
-                if (!found_open and current_line > line_start + 10) return line_start;
+                if (!found_open and current_line > line_start + 24) return line_start;
                 continue;
             }
 
@@ -913,13 +980,24 @@ pub const Explorer = struct {
                 continue;
             }
 
-            if (c == '{') {
-                depth += 1;
-                found_open = true;
+            if (c == '(') {
+                if (!found_open) paren_depth += 1;
+            } else if (c == ')') {
+                if (!found_open and paren_depth > 0) paren_depth -= 1;
+            } else if (c == '{') {
+                // Before the body opens, only a brace at paren-depth 0 is the
+                // body brace; braces inside the parameter list (inline object
+                // types, default values) must be ignored, or a multi-line
+                // signature gets a wrongly-short line_end. Once found_open, count
+                // every brace so the body balances correctly.
+                if (found_open or paren_depth == 0) {
+                    depth += 1;
+                    found_open = true;
+                }
             } else if (c == '}') {
-                depth -= 1;
-                if (found_open and depth == 0) {
-                    return @min(current_line, total_lines);
+                if (found_open) {
+                    depth -= 1;
+                    if (depth == 0) return @min(current_line, total_lines);
                 }
             }
         }
@@ -1065,7 +1143,7 @@ pub const Explorer = struct {
                 outline.language == .vue or outline.language == .astro or
                 outline.language == .css or outline.language == .scss or
                 outline.language == .protobuf or outline.language == .mlir or
-                outline.language == .tablegen)
+                outline.language == .tablegen or outline.language == .rescript)
             {
                 if (in_block_comment) {
                     if (std.mem.indexOf(u8, trimmed, "*/")) |close_pos| {
@@ -1144,6 +1222,8 @@ pub const Explorer = struct {
                 try parser.parseMlirLine(trimmed, line_num, &outline);
             } else if (outline.language == .tablegen) {
                 try parser.parseTableGenLine(trimmed, line_num, &outline);
+            } else if (outline.language == .rescript) {
+                try parser.parseRescriptLine(trimmed, line_num, &outline);
             }
 
             prev_line_trimmed = trimmed;
@@ -1379,6 +1459,96 @@ pub const Explorer = struct {
         return true;
     }
 
+    /// Signature-only "skeleton" view: each symbol's declaration line with its
+    /// body elided as "{ … N lines }". A large file collapses to ~one line per
+    /// symbol — lossless at the API surface, so an agent can grasp a file's
+    /// shape cheaply and codedb_read a range to expand a body. Mirrors
+    /// renderOutline's locking and header. Returns false when not indexed.
+    pub fn renderSkeleton(
+        self: *Explorer,
+        path: []const u8,
+        alloc: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+    ) !bool {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        const outline = self.outlines.getPtr(path) orelse return false;
+        const ref_opt = self.readContentForSearch(path, alloc);
+        defer if (ref_opt) |r| r.deinit();
+        const content: []const u8 = if (ref_opt) |r| r.data else "";
+
+        // One pass to record the byte offset of each line start (line 1 → offsets[0]).
+        var offsets: std.ArrayList(usize) = .empty;
+        defer offsets.deinit(alloc);
+        try offsets.append(alloc, 0);
+        for (content, 0..) |ch, i| {
+            if (ch == '\n') try offsets.append(alloc, i + 1);
+        }
+
+        try out.ensureUnusedCapacity(alloc, 128 + outline.symbols.items.len * 96);
+        const w = cio.listWriter(out, alloc);
+        w.print("{s} ({s}, {d} lines, {d} bytes)\n", .{
+            outline.path, @tagName(outline.language), outline.line_count, outline.byte_size,
+        }) catch {};
+
+        const body_start = out.items.len;
+        var covered_until: u32 = 0;
+        var elided: u32 = 0;
+        for (outline.symbols.items) |sym| {
+            // Skip symbols nested inside an already-emitted symbol's body — a
+            // skeleton shows the file's top-level shape, with bodies (and the
+            // local declarations inside them) elided.
+            if (sym.line_start <= covered_until) continue;
+            covered_until = @max(covered_until, sym.line_end);
+            const first = lineSlice(content, offsets.items, sym.line_start);
+            const sig = std.mem.trim(u8, first, " \t\r");
+            // Single-line symbol (imports, consts, one-liners) or no source: keep verbatim.
+            if (sym.line_end <= sym.line_start or sig.len == 0) {
+                if (sig.len == 0) {
+                    w.print("  L{d}: {s} {s}\n", .{ sym.line_start, @tagName(sym.kind), sym.name }) catch {};
+                } else {
+                    w.print("  L{d}: {s}\n", .{ sym.line_start, sig }) catch {};
+                }
+                continue;
+            }
+            const hidden = sym.line_end - sym.line_start;
+            elided += 1;
+            if (std.mem.indexOfScalar(u8, sig, '{')) |bpos| {
+                // Brace body opens on the declaration line: keep up to and including '{', stub the rest.
+                w.print("  L{d}: {s} … {d} lines }}\n", .{ sym.line_start, sig[0 .. bpos + 1], hidden }) catch {};
+            } else {
+                // No brace on the first line (Python ':' / multi-line signature).
+                w.print("  L{d}: {s} … {d} lines\n", .{ sym.line_start, sig, hidden }) catch {};
+            }
+        }
+        // Escalation footer — skeleton fails safe by eliding bodies, so tell
+        // the model exactly how to recover when it isn't enough.
+        const skel_bytes = out.items.len - body_start;
+        const full_bytes: usize = @intCast(outline.byte_size);
+        if (elided == 0) {
+            w.print("— skeleton: all symbols shown inline · codedb_read {s} for source · codedb_outline {s} for members\n", .{ outline.path, outline.path }) catch {};
+        } else if (full_bytes == 0 or skel_bytes * 2 >= full_bytes) {
+            w.print("— skeleton: {d} bodies elided; small file ({d}B) · codedb_read {s} for full source · codedb_outline {s} for members\n", .{ elided, full_bytes, outline.path, outline.path }) catch {};
+        } else {
+            const saved = 100 - (skel_bytes * 100 / full_bytes);
+            w.print("— skeleton: {d} bodies elided (~{d}% smaller than {d}B) · expand a body: codedb_read {s} -L <start>-<end> · members: codedb_outline {s}\n", .{ elided, saved, full_bytes, outline.path, outline.path }) catch {};
+        }
+        return true;
+    }
+
+    /// Byte slice of 1-indexed `line` from `content`, given precomputed line
+    /// start offsets. Returns empty when out of range.
+    fn lineSlice(content: []const u8, offsets: []const usize, line: u32) []const u8 {
+        if (line == 0 or line > offsets.len) return "";
+        const start = offsets[line - 1];
+        if (start > content.len) return "";
+        const end = if (line < offsets.len) offsets[line] -| 1 else content.len;
+        const e = @min(end, content.len);
+        if (e < start) return "";
+        return content[start..e];
+    }
+
     /// Return a caller-owned copy of cached file content.
     pub fn getContent(self: *Explorer, path: []const u8, allocator: std.mem.Allocator) !?[]u8 {
         self.mu.lockShared();
@@ -1475,7 +1645,7 @@ pub const Explorer = struct {
         }
     }
 
-    fn cloneOutline(src: *const FileOutline, allocator: std.mem.Allocator) !FileOutline {
+    pub fn cloneOutline(src: *const FileOutline, allocator: std.mem.Allocator) !FileOutline {
         const copied_path = try allocator.dupe(u8, src.path);
         // No errdefer here: dst.deinit() below handles freeing copied_path via owns_path.
 
@@ -1694,6 +1864,181 @@ pub const Explorer = struct {
         return result_list.toOwnedSlice(allocator);
     }
 
+    // Resolve an exact symbol name to its definition sites for codedb_find's
+    // symbol fast-path. Uses findAllSymbols — the COMPLETE lookup including the
+    // outline safety scan, because symbol_index alone is incomplete for some
+    // languages (e.g. it indexes ~no TypeScript functions). That costs about what
+    // codedb_symbol does (~2ms) but resolves real symbols reliably and far below
+    // the fuzzy file scan. Definition kinds rank above import/comment usages, and
+    // when no real definition exists the usages are shown as a fallback. Returns
+    // false WITHOUT writing anything when there's no such symbol, so the caller
+    // falls back to fuzzy file search.
+    pub fn renderSymbolDefsFast(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8), max_results: usize) bool {
+        const results = self.findAllSymbols(name, allocator) catch return false;
+        defer {
+            for (results) |r| {
+                allocator.free(r.path);
+                allocator.free(r.symbol.name);
+                if (r.symbol.detail) |d| allocator.free(d);
+            }
+            allocator.free(results);
+        }
+        if (results.len == 0) return false;
+        var has_def = false;
+        for (results) |r| {
+            if (r.symbol.kind != .import and r.symbol.kind != .comment_block) {
+                has_def = true;
+                break;
+            }
+        }
+        out.appendSlice(allocator, "exact symbol matches (codedb_symbol shows bodies):\n") catch return false;
+        var n: usize = 0;
+        for (results) |r| {
+            if (n >= max_results) break;
+            const is_def = r.symbol.kind != .import and r.symbol.kind != .comment_block;
+            if (has_def and !is_def) continue;
+            var nb: [16]u8 = undefined;
+            out.appendSlice(allocator, std.fmt.bufPrint(&nb, "{d}. ", .{n + 1}) catch continue) catch {};
+            out.appendSlice(allocator, r.path) catch {};
+            var lb: [64]u8 = undefined;
+            out.appendSlice(allocator, std.fmt.bufPrint(&lb, ":{d} ({s})\n", .{ r.symbol.line_start, @tagName(r.symbol.kind) }) catch continue) catch {};
+            n += 1;
+        }
+        return n > 0;
+    }
+    pub const CalleeRef = struct {
+        name: []const u8, // callee identifier (borrows the resolved body content)
+        path: []const u8, // file the callee is defined in (borrows a stable outlines key)
+        line: u32,
+        kind: SymbolKind,
+    };
+
+    /// Resolve the call sites inside the function defined at `path` spanning
+    /// [line_start, line_end] to their definitions — the dependency side of the
+    /// call-graph neighborhood, using the same extraction as centrality. Deduped
+    /// by callee name, capped at `max`, function/method targets only, and the
+    /// defining function itself is skipped. Best-effort. Everything is allocated
+    /// in / borrowed from `allocator` (intended to be a per-request arena); the
+    /// returned slice and each `.name` live as long as that allocator.
+    pub fn resolveCallees(
+        self: *Explorer,
+        path: []const u8,
+        line_start: u32,
+        line_end: u32,
+        allocator: std.mem.Allocator,
+        max: usize,
+    ) ![]CalleeRef {
+        if (max == 0 or line_end < line_start) return &.{};
+        const content = (self.getContent(path, allocator) catch return &.{}) orelse return &.{};
+        const body = sliceLineRange(content, line_start, line_end);
+        if (body.len == 0) return &.{};
+        const callees = codegraph.extractCallees(allocator, body) catch return &.{};
+
+        var refs: std.ArrayList(CalleeRef) = .empty;
+        // Resolve each callee straight off the symbol index: we only need to know
+        // whether exactly one non-test function/method defines the name, which is
+        // O(defs-of-that-name). findAllSymbols would instead run an O(all-symbols)
+        // safety scan over every outline and allocate a full result list per name —
+        // ~18 such scans per codedb_context made it ~20% slower on a multi-thousand-
+        // file repo (the #524 bench regression). The index is rebuilt on every
+        // commit, so for this high-precision/best-effort feature it is authoritative.
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        for (callees) |name| {
+            if (refs.items.len >= max) break;
+            // Skip ubiquitous std/container/builtin method names. They are almost
+            // always calls on some receiver (ArrayList.append, HashMap.get, ...),
+            // not the rare user-defined free function of the same name, so name-
+            // based resolution would assert a false edge even when there's a
+            // single user definition.
+            if (isUbiquitousName(name)) continue;
+            const locs = self.symbol_index.get(name) orelse continue;
+            // Only surface UNAMBIGUOUS edges: a callee is shown only if exactly one
+            // non-test function/method defines that name. Resolution is name-based
+            // (no type info), so common method names (init, lock, get, next, ...)
+            // resolve to many candidates — guessing one would assert a false edge.
+            // Skipping them keeps this high-precision; ambiguous names are omitted.
+            var cand: ?SymbolLocation = null;
+            var n_cand: usize = 0;
+            for (locs.items) |loc| {
+                if (loc.kind != .function and loc.kind != .method) continue;
+                if (isLikelyTestPath(loc.path)) continue;
+                // Skip the defining function itself (self-edge / recursion).
+                if (loc.line_start == line_start and std.mem.eql(u8, loc.path, path)) continue;
+                n_cand += 1;
+                if (n_cand > 1) break; // ambiguous — stop, will be skipped
+                cand = loc;
+            }
+            if (n_cand == 1) {
+                const loc = cand.?;
+                try refs.append(allocator, .{
+                    .name = name,
+                    .path = try allocator.dupe(u8, loc.path),
+                    .line = loc.line_start,
+                    .kind = loc.kind,
+                });
+            }
+        }
+        return refs.toOwnedSlice(allocator);
+    }
+
+    /// Heuristic: does this path look like a test/spec/fixture file? Mirrors the
+    /// filter used by the codedb_context callers section.
+    fn isLikelyTestPath(path: []const u8) bool {
+        return std.mem.startsWith(u8, path, "tests/") or
+            std.mem.startsWith(u8, path, "test/") or
+            std.mem.indexOf(u8, path, "/test") != null or
+            std.mem.indexOf(u8, path, "_test.") != null or
+            std.mem.indexOf(u8, path, ".test.") != null or
+            std.mem.indexOf(u8, path, ".spec.") != null or
+            std.mem.indexOf(u8, path, "/__tests__/") != null or
+            std.mem.indexOf(u8, path, "/spec/") != null or
+            std.mem.indexOf(u8, path, "/fixtures/") != null;
+    }
+
+    /// Names so commonly used as stdlib/container/builtin methods across
+    /// languages that a `name(` call site almost never refers to a user-defined
+    /// free function of that name. Used to suppress false callee edges from
+    /// name-only resolution. Conservative: only the highest-collision names.
+    fn isUbiquitousName(name: []const u8) bool {
+        const common = [_][]const u8{
+            "init",        "deinit",   "append",   "get",       "set",
+            "put",         "getOrPut", "remove",   "contains",  "has",
+            "count",       "len",      "items",    "alloc",     "free",
+            "create",      "destroy",  "lock",     "unlock",    "tryLock",
+            "next",        "iterator", "clone",    "dupe",      "slice",
+            "reset",       "clear",    "format",   "hash",      "eql",
+            "write",       "writeAll", "print",    "read",      "close",
+            "open",        "value",    "key",      "toOwnedSlice", "pop",
+            "push",        "find",     "add",      "new",       "build",
+            "run",         "deinit",   "toString", "valueOf",   "of",
+        };
+        for (common) |c| {
+            if (std.mem.eql(u8, name, c)) return true;
+        }
+        return false;
+    }
+
+    /// Return the slice of `content` covering source lines [line_start, line_end]
+    /// (1-based, inclusive), excluding the trailing newline. Empty if out of range.
+    fn sliceLineRange(content: []const u8, line_start: u32, line_end: u32) []const u8 {
+        if (line_start == 0 or line_end < line_start) return content[0..0];
+        var line: u32 = 1;
+        var i: usize = 0;
+        while (i < content.len and line < line_start) : (i += 1) {
+            if (content[i] == '\n') line += 1;
+        }
+        if (i >= content.len) return content[0..0];
+        const start = i;
+        var cur: u32 = line_start;
+        while (i < content.len) : (i += 1) {
+            if (content[i] == '\n') {
+                if (cur >= line_end) break;
+                cur += 1;
+            }
+        }
+        return content[start..i];
+    }
     pub fn renderSymbols(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !bool {
         self.mu.lockShared();
         defer self.mu.unlockShared();
@@ -2364,11 +2709,143 @@ pub const Explorer = struct {
     /// (k1=1.2, b=0.75), and emits one SearchResult per top-N document with
     /// the best-tf line for any query term in that doc. Existing scan-order
     /// `searchContent` is unaffected.
+    /// Relevance multiplier on BM25 scores for code-intelligence search: boost
+    /// files whose name/path matches a query term, and down-weight tests, docs,
+    /// and vendored copies (they still surface if strongly relevant).
+    fn pathRelevanceMultiplier(path: []const u8, terms: *const std.StringHashMap(void)) f32 {
+        var mult: f32 = 1.0;
+        const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |s| path[s + 1 ..] else path;
+        var lb: [256]u8 = undefined;
+        if (base.len <= lb.len) {
+            for (base, 0..) |c, i| lb[i] = std.ascii.toLower(c);
+            var it = terms.keyIterator();
+            while (it.next()) |t| {
+                if (t.*.len >= 3 and std.mem.indexOf(u8, lb[0..base.len], t.*) != null) {
+                    mult *= 1.6;
+                    break;
+                }
+            }
+        }
+        const is_test = std.mem.startsWith(u8, base, "test") or
+            std.mem.indexOf(u8, base, "_test") != null or
+            std.mem.indexOf(u8, path, "/test") != null;
+        if (is_test) mult *= 0.6;
+        if (std.mem.endsWith(u8, path, ".md") or std.mem.indexOf(u8, path, "/docs/") != null) mult *= 0.6;
+        if (std.mem.indexOf(u8, path, "node_modules") != null or
+            std.mem.indexOf(u8, path, "/vendor/") != null or
+            std.mem.indexOf(u8, path, "zig-pkg") != null) mult *= 0.4;
+        return mult;
+    }
+
+    /// Additive ranking boost from a file's call-graph centrality. Returns 1.0
+    /// when centrality isn't built (so ranking is unchanged) — it is ALWAYS a
+    /// multiplier ≥ 1, never a filter, so a misresolved edge can only nudge a
+    /// central file up, never drop a real result. alpha tuned via MRR.
+    fn centralityBoost(self: *Explorer, path: []const u8) f32 {
+        const cm = self.call_centrality orelse return 1.0;
+        const c = cm.get(path) orelse return 1.0;
+        const alpha: f32 = 0.15;
+        return 1.0 + alpha * @log(1.0 + c);
+    }
+
+    /// Public, lock-acquiring entry point for single-threaded callers (the
+    /// index/scan path) to pre-build call_centrality before persisting a snapshot,
+    /// so a later load can restore it instead of paying the lazy first-query build.
+    /// ensureCallCentrality assumes the caller already holds a shared lock (it is
+    /// normally reached from searchContentRanked); this wrapper takes that lock.
+    pub fn buildCallCentrality(self: *Explorer, allocator: std.mem.Allocator) void {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+        self.ensureCallCentrality(allocator);
+    }
+
+    /// Build `call_centrality` once (idempotent, mutex-guarded). Must be called
+    /// while holding at least a shared lock on `mu` (it reads outlines/contents
+    /// via readContentForSearch, which assumes the lock is held). The resolved
+    /// call graph: for each function body, extract call sites (codegraph), resolve
+    /// each callee name through the function symbol table, and accumulate weighted
+    /// in-degree per callee; aggregate to per-file scores.
+    fn ensureCallCentrality(self: *Explorer, allocator: std.mem.Allocator) void {
+        if (self.call_centrality != null) return;
+        self.centrality_build_mu.lock();
+        defer self.centrality_build_mu.unlock();
+        if (self.call_centrality != null) return; // built while we waited
+
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+
+        // Pass 1: node id per function/method symbol + name -> [node ids] resolver.
+        var node_path: std.ArrayList([]const u8) = .empty;
+        var name_to_ids = std.StringHashMap(std.ArrayList(codegraph.NodeId)).init(a);
+        var it = self.outlines.iterator();
+        while (it.next()) |entry| {
+            const path = entry.key_ptr.*;
+            for (entry.value_ptr.symbols.items) |sym| {
+                if (sym.kind != .function and sym.kind != .method) continue;
+                const id: codegraph.NodeId = @intCast(node_path.items.len);
+                node_path.append(a, path) catch return;
+                const gop = name_to_ids.getOrPut(sym.name) catch return;
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                gop.value_ptr.append(a, id) catch return;
+            }
+        }
+        if (node_path.items.len == 0) return;
+
+        const in_degree = a.alloc(f32, node_path.items.len) catch return;
+        @memset(in_degree, 0);
+
+        // Pass 2: per file, slice each function body, extract + resolve call sites.
+        var it2 = self.outlines.iterator();
+        while (it2.next()) |entry| {
+            const ref = self.readContentForSearch(entry.key_ptr.*, a) orelse continue;
+            defer ref.deinit();
+            const content = ref.data;
+            var offs: std.ArrayList(usize) = .empty;
+            offs.append(a, 0) catch continue;
+            for (content, 0..) |ch, i| {
+                if (ch == '\n') offs.append(a, i + 1) catch break;
+            }
+            const nlines = offs.items.len;
+            for (entry.value_ptr.symbols.items) |sym| {
+                if (sym.kind != .function and sym.kind != .method) continue;
+                if (sym.line_start == 0 or sym.line_start > nlines) continue;
+                const start = offs.items[sym.line_start - 1];
+                const end_line = @min(sym.line_end, nlines);
+                const end = if (end_line < nlines) offs.items[end_line] else content.len;
+                if (end <= start) continue;
+                const callees = codegraph.extractCallees(a, content[start..end]) catch continue;
+                for (callees) |nm| {
+                    const ids = name_to_ids.get(nm) orelse continue;
+                    if (ids.items.len == 0) continue;
+                    const w: f32 = 1.0 / @as(f32, @floatFromInt(ids.items.len));
+                    for (ids.items) |cid| in_degree[cid] += w;
+                }
+            }
+        }
+
+        // Aggregate weighted in-degree per file. Keys borrow stable outlines keys.
+        var cmap = std.StringHashMap(f32).init(self.allocator);
+        for (node_path.items, in_degree) |path, deg| {
+            if (deg == 0) continue;
+            const gop = cmap.getOrPut(path) catch continue;
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += deg;
+        }
+        self.call_centrality = cmap;
+    }
+
     pub fn searchContentRanked(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
         if (max_results == 0) return try allocator.alloc(SearchResult, 0);
+
+        // Graph-aware ranking: build the resolved call graph's per-file centrality
+        // once and fold it in as an additive boost. On by default (MRR-validated
+        // on the codedb set: 0.819 -> 0.944, +4 P@1, no recall loss); set
+        // CODEDB_NO_CENTRALITY to disable.
+        if (cio.posixGetenv("CODEDB_NO_CENTRALITY") == null) self.ensureCallCentrality(allocator);
 
         // Tokenize the query the same way WordIndex tokenizes documents:
         // lowercase + identifier-split. Dedupe terms so repeated query words
@@ -2409,7 +2886,17 @@ pub const Explorer = struct {
         // BM25 constants.
         const k1: f32 = 1.2;
         const b: f32 = 0.75;
-        const N = self.word_index.rankedDocCount();
+        // BM25+ (Lv & Zhai 2011) lower-bound on the TF term: every matching term
+        // contributes at least idf*delta regardless of length normalization, so
+        // long source files that genuinely match aren't penalized toward zero
+        // (a known BM25 weakness). delta=0.5 matches bm25s's BM25+/BM25L default.
+        const bm25_plus_delta: f32 = 0.5;
+        // Fall back to the total indexed-doc count when the per-doc length
+        // table is empty (the bulk `codedb index` path writes the disk word
+        // index without doc lengths) so ranked search still returns idf-weighted
+        // results instead of nothing. avgDocLength() already returns a safe 1.0.
+        const ranked_n = self.word_index.rankedDocCount();
+        const N: u32 = if (ranked_n > 0) ranked_n else @intCast(self.word_index.id_to_path.items.len);
         if (N == 0) return try allocator.alloc(SearchResult, 0);
         const avgdl = self.word_index.avgDocLength();
 
@@ -2420,7 +2907,7 @@ pub const Explorer = struct {
             best_line: u32,
             best_line_hits: u32,
         };
-        var per_doc = std.AutoHashMap(u32, DocAgg).init(ta);
+        var per_doc = U32HashMap(DocAgg).init(ta);
 
         // For each unique query term, look up its posting list once,
         // compute df and per-doc tf in a single pass.
@@ -2433,8 +2920,8 @@ pub const Explorer = struct {
             // df: distinct doc_ids in this posting list. tf: count of (term,doc)
             // entries (each entry is a distinct line per indexFile dedup).
             // line_hits: per-doc map of line_num → count for best-line picking.
-            var doc_tf = std.AutoHashMap(u32, u32).init(ta);
-            var doc_best_line = std.AutoHashMap(u32, struct { line: u32, count: u32 }).init(ta);
+            var doc_tf = U32HashMap(u32).init(ta);
+            var doc_best_line = U32HashMap(struct { line: u32, count: u32 }).init(ta);
             for (hits) |h| {
                 const tf_gop = try doc_tf.getOrPut(h.doc_id);
                 if (!tf_gop.found_existing) tf_gop.value_ptr.* = 0;
@@ -2465,7 +2952,8 @@ pub const Explorer = struct {
                 const dl_raw = self.word_index.docLength(doc_id);
                 const dl: f32 = if (dl_raw == 0) 1.0 else @floatFromInt(dl_raw);
                 const norm = 1.0 - b + b * (dl / avgdl);
-                const term_score = idf * (tf * (k1 + 1.0)) / (tf + k1 * norm);
+                const tf_sat = (tf * (k1 + 1.0)) / (tf + k1 * norm);
+                const term_score = idf * (tf_sat + bm25_plus_delta);
 
                 const ln_info = doc_best_line.get(doc_id) orelse continue;
                 const agg_gop = try per_doc.getOrPut(doc_id);
@@ -2494,18 +2982,27 @@ pub const Explorer = struct {
         try cands.ensureTotalCapacity(ta, per_doc.count());
         var pd_iter = per_doc.iterator();
         while (pd_iter.next()) |entry| {
+            const cand_doc_id = entry.key_ptr.*;
+            const cand_path = if (cand_doc_id < self.word_index.id_to_path.items.len) self.word_index.id_to_path.items[cand_doc_id] else "";
             cands.appendAssumeCapacity(.{
-                .doc_id = entry.key_ptr.*,
-                .score = entry.value_ptr.score,
+                .doc_id = cand_doc_id,
+                .score = entry.value_ptr.score * pathRelevanceMultiplier(cand_path, &terms_set) * self.centralityBoost(cand_path),
                 .best_line = entry.value_ptr.best_line,
             });
         }
-        std.sort.block(Cand, cands.items, {}, struct {
-            pub fn lt(_: void, a: Cand, b_: Cand) bool {
-                if (a.score != b_.score) return a.score > b_.score;
-                return a.doc_id < b_.doc_id;
+        // Lazy top-k via a max-heap: pop candidates in (score desc, doc_id asc)
+        // order and materialize until max_results survive. Same ordering and
+        // skip-and-continue semantics as a full sort over all candidates, but only
+        // pops ~max_results of them — O(C + (k+skips)·log C) instead of O(C·log C)
+        // for the common case k ≪ C (bm25s-style top-k retrieval).
+        const candLess = struct {
+            fn order(_: void, a: Cand, b_: Cand) std.math.Order {
+                if (a.score != b_.score) return if (a.score > b_.score) .lt else .gt;
+                return std.math.order(a.doc_id, b_.doc_id);
             }
-        }.lt);
+        }.order;
+        var heap = std.PriorityQueue(Cand, void, candLess).fromOwnedSlice(try cands.toOwnedSlice(ta), {});
+        defer heap.deinit(ta);
 
         var result_list: std.ArrayList(SearchResult) = .empty;
         errdefer {
@@ -2515,10 +3012,10 @@ pub const Explorer = struct {
             }
             result_list.deinit(allocator);
         }
-        try result_list.ensureTotalCapacity(allocator, @min(max_results, cands.items.len));
+        try result_list.ensureTotalCapacity(allocator, @min(max_results, heap.count()));
 
-        for (cands.items) |c| {
-            if (result_list.items.len >= max_results) break;
+        while (result_list.items.len < max_results) {
+            const c = heap.pop() orelse break;
             const path = self.word_index.id_to_path.items[c.doc_id];
             if (path.len == 0) continue;
             const ref = self.readContentForSearch(path, allocator) orelse continue;
@@ -2548,6 +3045,14 @@ pub const Explorer = struct {
 
         var result_list: std.ArrayList(SearchResult) = .empty;
         errdefer result_list.deinit(allocator);
+
+        // Surface invalid patterns as error.InvalidRegex instead of silently
+        // returning zero results (#528 item 10). Compile once up front with the
+        // real matcher; the per-file scans below reuse the same engine.
+        {
+            var probe = nanoregex.Regex.compile(allocator, pattern) catch return error.InvalidRegex;
+            probe.deinit();
+        }
 
         var query = idx.decomposeRegex(pattern, self.allocator) catch {
             var iter = self.outlines.keyIterator();
@@ -2668,29 +3173,46 @@ pub const Explorer = struct {
         var matches: std.ArrayList(FuzzyMatch) = .empty;
         errdefer matches.deinit(allocator);
 
-        var iter = self.outlines.keyIterator();
-        while (iter.next()) |key_ptr| {
-            const path = key_ptr.*;
-
-            // Extension filter
-            if (ext_filter) |ext| {
-                if (!std.mem.endsWith(u8, path, ext)) continue;
+        if (parts.items.len == 1 and parts.items[0].len <= FUZZY_MAX_QUERY) {
+            // Single-part (the common case): score files in SIMD batches of
+            // FZ_LANES via fuzzyScoreBatch, which yields the same per-file
+            // best_score/matched_chars as the scalar fuzzyDP; fuzzyFinalize is the
+            // shared tail, so results are identical — just scored 8 files at once.
+            const q = parts.items[0];
+            var cands: std.ArrayList([]const u8) = .empty;
+            defer cands.deinit(allocator);
+            var iter = self.outlines.keyIterator();
+            while (iter.next()) |key_ptr| {
+                const path = key_ptr.*;
+                if (ext_filter) |ext| {
+                    if (!std.mem.endsWith(u8, path, ext)) continue;
+                }
+                if (path.len == 0 or path.len > FUZZY_MAX_PATH) continue;
+                if (fuzzyPresenceReject(q, path)) continue;
+                try cands.append(allocator, path);
             }
-
-            // Multi-part scoring: all parts must match, scores sum
-            var total_score: f32 = 0;
-            var all_matched = true;
-            for (parts.items) |part| {
-                if (fuzzyScore(part, path)) |s| {
-                    total_score += s;
-                } else {
-                    all_matched = false;
-                    break;
+            var off: usize = 0;
+            while (off < cands.items.len) : (off += FZ_LANES) {
+                const slab = cands.items[off..@min(off + FZ_LANES, cands.items.len)];
+                var best: [FZ_LANES]f32 = undefined;
+                var matched: [FZ_LANES]u32 = undefined;
+                fuzzyScoreBatch(q, slab, &best, &matched);
+                for (slab, 0..) |path, l| {
+                    if (fuzzyFinalize(q, path, best[l], matched[l])) |s| {
+                        try matches.append(allocator, .{ .path = path, .score = s });
+                    }
                 }
             }
-
-            if (all_matched and total_score > 0) {
-                try matches.append(allocator, .{ .path = path, .score = total_score });
+        } else {
+            var iter = self.outlines.keyIterator();
+            while (iter.next()) |key_ptr| {
+                const path = key_ptr.*;
+                if (ext_filter) |ext| {
+                    if (!std.mem.endsWith(u8, path, ext)) continue;
+                }
+                if (scoreAllParts(parts.items, path)) |s| {
+                    try matches.append(allocator, .{ .path = path, .score = s });
+                }
             }
         }
 
@@ -3038,7 +3560,7 @@ pub const Explorer = struct {
             }
         } else if (startsWith(line, "class ")) {
             if (extractIdent(line[6..])) |name| {
-                try appendOutlineSymbol(a, outline, name, .struct_def, line_num, line);
+                try appendOutlineSymbol(a, outline, name, .class_def, line_num, line);
             }
         } else if (startsWith(line, "import ") or startsWith(line, "from ")) {
             try appendOutlineSymbol(a, outline, line, .import, line_num, null);
@@ -3911,6 +4433,68 @@ pub const Explorer = struct {
         }
     }
 
+    /// ReScript (.res/.resi). `let`/`and` bindings become functions when the RHS has an
+    /// arrow (`=>`) and constants otherwise; `type` → type_alias; `module` → struct_def
+    /// (`module type` → interface_def); `external` → function; `open`/`include` → import.
+    /// Leading @decorators are stripped first. Line-based like the sibling parsers, so
+    /// nested module members are flattened into the top-level outline.
+    fn parseRescriptLine(self: *Explorer, line: []const u8, line_num: u32, outline: *FileOutline) !void {
+        const a = self.allocator;
+        const code = stripLeadingResDecorators(line);
+        if (code.len == 0 or startsWith(code, "//")) return;
+
+        if (startsWith(code, "open ")) {
+            const name = resModulePath(std.mem.trimStart(u8, code[5..], " \t"));
+            if (name.len > 0) {
+                try appendImportPath(a, outline, name);
+                try appendOutlineSymbol(a, outline, name, .import, line_num, null);
+            }
+            return;
+        }
+        if (startsWith(code, "include ")) {
+            const name = resModulePath(std.mem.trimStart(u8, code[8..], " \t"));
+            if (name.len > 0) {
+                try appendImportPath(a, outline, name);
+                try appendOutlineSymbol(a, outline, name, .import, line_num, null);
+            }
+            return;
+        }
+        if (startsWith(code, "module ")) {
+            var rest = std.mem.trimStart(u8, code[7..], " \t");
+            var kind: SymbolKind = .struct_def;
+            if (startsWith(rest, "type ")) {
+                kind = .interface_def;
+                rest = std.mem.trimStart(u8, rest[5..], " \t");
+            }
+            const name = resIdent(rest);
+            if (name.len > 0) try appendOutlineSymbol(a, outline, name, kind, line_num, line);
+            return;
+        }
+        if (startsWith(code, "type ")) {
+            var rest = std.mem.trimStart(u8, code[5..], " \t");
+            if (startsWith(rest, "rec ")) rest = std.mem.trimStart(u8, rest[4..], " \t");
+            const name = resIdent(rest);
+            if (name.len > 0) try appendOutlineSymbol(a, outline, name, .type_alias, line_num, line);
+            return;
+        }
+        if (startsWith(code, "external ")) {
+            const name = resIdent(std.mem.trimStart(u8, code[9..], " \t"));
+            if (name.len > 0) try appendOutlineSymbol(a, outline, name, .function, line_num, line);
+            return;
+        }
+        var rest: []const u8 = undefined;
+        if (startsWith(code, "let ")) {
+            rest = std.mem.trimStart(u8, code[4..], " \t");
+            if (startsWith(rest, "rec ")) rest = std.mem.trimStart(u8, rest[4..], " \t");
+        } else if (startsWith(code, "and ")) {
+            rest = std.mem.trimStart(u8, code[4..], " \t");
+        } else return;
+        const name = resIdent(rest);
+        if (name.len == 0) return; // destructuring binding (let (a, b) = …) — skip
+        const kind: SymbolKind = if (std.mem.indexOf(u8, code, "=>") != null) .function else .constant;
+        try appendOutlineSymbol(a, outline, name, kind, line_num, line);
+    }
+
     fn rebuildDepsFor(self: *Explorer, path: []const u8, outline: *FileOutline) !void {
         var deps: std.ArrayList([]const u8) = .empty;
         errdefer deps.deinit(self.allocator);
@@ -3932,8 +4516,12 @@ pub const Explorer = struct {
         try self.dep_graph.setDeps(path, deps);
     }
 
-    fn rebuildSymbolIndexFor(self: *Explorer, path: []const u8, outline: *FileOutline) void {
-        self.removeSymbolIndexFor(path);
+    fn rebuildSymbolIndexFor(self: *Explorer, path: []const u8, outline: *FileOutline, had_prior: bool) void {
+        // removeSymbolIndexFor scans the entire global symbol index, so calling
+        // it per file makes a cold scan O(files * total_symbols). A brand-new
+        // path has no prior entries to evict, so skip the scan entirely — only
+        // re-indexed (already-present) files need the removal.
+        if (had_prior) self.removeSymbolIndexFor(path);
         for (outline.symbols.items) |sym| {
             const gop = self.symbol_index.getOrPut(sym.name) catch continue;
             if (!gop.found_existing) {
@@ -4101,6 +4689,14 @@ pub const Explorer = struct {
                 if (r.scope_name) |n| allocator.free(n);
             }
             result_list.deinit(allocator);
+        }
+
+        // Surface invalid patterns as error.InvalidRegex instead of silently
+        // returning zero results (#528 item 10). Compile once up front with the
+        // real matcher; the per-file scans below reuse the same engine.
+        {
+            var probe = nanoregex.Regex.compile(allocator, pattern) catch return error.InvalidRegex;
+            probe.deinit();
         }
 
         var query = idx.decomposeRegex(pattern, self.allocator) catch {
@@ -4301,6 +4897,7 @@ pub fn isCommentOrBlank(line: []const u8, language: Language) bool {
         .sql => std.mem.startsWith(u8, trimmed, "--") or std.mem.startsWith(u8, trimmed, "/*") or std.mem.startsWith(u8, trimmed, "*"),
         .fortran => std.mem.startsWith(u8, trimmed, "!"),
         .llvm_ir => std.mem.startsWith(u8, trimmed, ";"),
+        .rescript => std.mem.startsWith(u8, trimmed, "//") or std.mem.startsWith(u8, trimmed, "/*") or std.mem.startsWith(u8, trimmed, "*"),
         else => false,
     };
 }
@@ -4682,6 +5279,54 @@ fn appendOutlineSymbol(
     });
 }
 
+inline fn resIsIdentStart(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
+}
+inline fn resIsIdentChar(c: u8) bool {
+    return resIsIdentStart(c) or (c >= '0' and c <= '9') or c == '\'';
+}
+/// Leading ReScript identifier (letter/_/digit/prime), or "" if none.
+fn resIdent(s: []const u8) []const u8 {
+    if (s.len == 0 or !resIsIdentStart(s[0])) return "";
+    var i: usize = 1;
+    while (i < s.len and resIsIdentChar(s[i])) i += 1;
+    return s[0..i];
+}
+/// Leading dotted module path (Foo.Bar.Baz), trailing dots trimmed, or "".
+fn resModulePath(s: []const u8) []const u8 {
+    if (s.len == 0 or !resIsIdentStart(s[0])) return "";
+    var i: usize = 1;
+    while (i < s.len and (resIsIdentChar(s[i]) or s[i] == '.')) i += 1;
+    var end = i;
+    while (end > 0 and s[end - 1] == '.') end -= 1;
+    return s[0..end];
+}
+/// Strip leading `@decorator` / `@decorator(args)` tokens (and trailing space) so a
+/// decorated `external`/`let` on the same line still parses. Returns the remainder.
+fn stripLeadingResDecorators(line: []const u8) []const u8 {
+    var s = std.mem.trimStart(u8, line, " \t");
+    while (s.len > 0 and s[0] == '@') {
+        var i: usize = 1;
+        while (i < s.len and (resIsIdentChar(s[i]) or s[i] == '.')) i += 1;
+        if (i < s.len and s[i] == '(') {
+            var depth: usize = 0;
+            while (i < s.len) : (i += 1) {
+                if (s[i] == '(') {
+                    depth += 1;
+                } else if (s[i] == ')') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        s = std.mem.trimStart(u8, s[i..], " \t");
+    }
+    return s;
+}
+
 fn appendImportSymbol(
     allocator: std.mem.Allocator,
     outline: *FileOutline,
@@ -4708,7 +5353,10 @@ fn extractIdent(s: []const u8) ?[]const u8 {
     var end: usize = 0;
     for (s) |ch| {
         if (end >= max_ident_len) break;
-        if (std.ascii.isAlphanumeric(ch) or ch == '_') {
+        // Accept ASCII identifier chars plus any non-ASCII UTF-8 byte (>= 0x80) so
+        // identifiers in non-Latin scripts (Korean, Japanese, accented Latin, ...)
+        // are captured rather than truncated to empty. See issue #518.
+        if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch >= 0x80) {
             end += 1;
         } else break;
     }
@@ -5199,7 +5847,10 @@ fn extractRubyMethodName(s: []const u8) ?[]const u8 {
     var end: usize = 0;
     for (s) |ch| {
         if (end >= max_len) break;
-        if (std.ascii.isAlphanumeric(ch) or ch == '_') {
+        // Accept ASCII identifier chars plus any non-ASCII UTF-8 byte (>= 0x80) so
+        // identifiers in non-Latin scripts (Korean, Japanese, accented Latin, ...)
+        // are captured rather than truncated to empty. See issue #518.
+        if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch >= 0x80) {
             end += 1;
         } else break;
     }
@@ -5377,21 +6028,59 @@ fn getFilename(path: []const u8) []const u8 {
     return path;
 }
 
-pub fn fuzzyScore(query: []const u8, path: []const u8) ?f32 {
-    if (query.len == 0 or path.len == 0) return null;
-    if (query.len > 128 or path.len > 512) return null;
+// Length of the longest common subsequence of two strings, case-insensitive.
+// Used as a fuzzy-match floor: how many of the query's characters actually align,
+// in order, somewhere in the path. See issue #518.
+fn lcsLenIgnoreCase(query: []const u8, path: []const u8) usize {
+    const MAXB = 512;
+    var row: [MAXB + 1]usize = undefined;
+    const pn = @min(path.len, MAXB);
+    for (0..pn + 1) |j| row[j] = 0;
+    for (query) |qc| {
+        const lq = toLowerByte(qc);
+        var prev_diag: usize = 0;
+        for (0..pn) |j| {
+            const tmp = row[j + 1];
+            if (lq == toLowerByte(path[j])) {
+                row[j + 1] = prev_diag + 1;
+            } else if (row[j] > row[j + 1]) {
+                row[j + 1] = row[j];
+            }
+            prev_diag = tmp;
+        }
+    }
+    return row[pn];
+}
 
-    const MATCH_SCORE: f32 = 16.0;
-    const MISMATCH_PENALTY: f32 = -8.0;
-    const GAP_OPEN: f32 = -3.0;
-    const GAP_EXTEND: f32 = -1.0;
-    const DELIMITER_BONUS: f32 = 8.0;
-    const FILENAME_BONUS: f32 = 6.0;
-    const CONSECUTIVE_BONUS: f32 = 4.0;
-    const CASE_BONUS: f32 = 2.0;
-    const PREFIX_BONUS: f32 = 6.0;
+// Score `path` against every space-separated query part (all must match, scores
+// sum) — the exhaustive per-file scoring shared by both fuzzyFindFiles passes.
+fn scoreAllParts(parts: []const []const u8, path: []const u8) ?f32 {
+    var total: f32 = 0;
+    for (parts) |part| {
+        if (fuzzyScore(part, path)) |s| {
+            total += s;
+        } else return null;
+    }
+    if (total > 0) return total;
+    return null;
+}
+// Fuzzy file-scoring constants, shared by the scalar (fuzzyScore/fuzzyDP) and the
+// SIMD-across-files (fuzzyScoreBatch) scorers so both stay bit-identical.
+const FUZZY_MAX_QUERY = 128;
+const FUZZY_MAX_PATH = 512;
+const FZ_MATCH: f32 = 16.0;
+const FZ_MISMATCH: f32 = -8.0;
+const FZ_GAP_OPEN: f32 = -3.0;
+const FZ_GAP_EXTEND: f32 = -1.0;
+const FZ_DELIM: f32 = 8.0;
+const FZ_FILENAME: f32 = 6.0;
+const FZ_CONSEC: f32 = 4.0;
+const FZ_CASE: f32 = 2.0;
+const FZ_PREFIX: f32 = 6.0;
 
-    // Find filename start
+const FuzzyDPResult = struct { best_score: f32, matched_chars: usize };
+
+fn fuzzyFilenameStart(path: []const u8) usize {
     var fname_start: usize = 0;
     for (0..path.len) |i| {
         if (path[path.len - 1 - i] == '/') {
@@ -5399,100 +6088,253 @@ pub fn fuzzyScore(query: []const u8, path: []const u8) ?f32 {
             break;
         }
     }
+    return fname_start;
+}
 
-    // Smith-Waterman-style DP with affine gaps
-    // H[i][j] = best alignment score ending with query[0..i] aligned to path[0..j]
-    // We use two rows to save memory: prev and curr
-    const MAX_PATH = 512;
-    var prev_h: [MAX_PATH + 1]f32 = undefined;
-    var curr_h: [MAX_PATH + 1]f32 = undefined;
-    var prev_gap: [MAX_PATH + 1]f32 = undefined; // gap in query (deletion from path)
-    var curr_gap: [MAX_PATH + 1]f32 = undefined;
+// Presence pre-filter shared by the scalar + batch scorers. The score floor below
+// (issue #518) makes a >=60% in-order LCS a hard requirement; unordered character
+// presence is an upper bound on that LCS, so a path missing >40% of the query's
+// chars can be rejected in O(path) without the DP — and would fail the LCS check
+// anyway, so no result changes.
+pub fn fuzzyPresenceReject(query: []const u8, path: []const u8) bool {
+    var present = [_]bool{false} ** 256;
+    for (path) |c| present[toLowerByte(c)] = true;
+    var hits: usize = 0;
+    for (query) |c| {
+        if (present[toLowerByte(c)]) hits += 1;
+    }
+    return hits * 5 < query.len * 3;
+}
 
-    // Init
+// Smith-Waterman-style DP with affine gaps for one (query, path). Returns the raw
+// best_score + matched_chars; the floor/LCS/bonus tail lives in fuzzyFinalize so
+// the scalar and SIMD paths share identical post-processing. Two rows swapped by
+// pointer; per-cell inputs that don't vary with j (lowercased query char, path
+// lowercase + word-boundary flags) are hoisted/precomputed.
+fn fuzzyDP(query: []const u8, path: []const u8) FuzzyDPResult {
+    const fname_start = fuzzyFilenameStart(path);
+
+    var ql_buf: [FUZZY_MAX_QUERY]u8 = undefined;
+    var pl_buf: [FUZZY_MAX_PATH]u8 = undefined;
+    var wb_buf: [FUZZY_MAX_PATH]bool = undefined;
+    const ql = ql_buf[0..query.len];
+    const pl = pl_buf[0..path.len];
+    const wb = wb_buf[0..path.len];
+    for (query, 0..) |c, k| ql[k] = toLowerByte(c);
+    for (path, 0..) |c, k| {
+        pl[k] = toLowerByte(c);
+        wb[k] = isWordBoundary(path, k);
+    }
+
+    var h_a: [FUZZY_MAX_PATH + 1]f32 = undefined;
+    var h_b: [FUZZY_MAX_PATH + 1]f32 = undefined;
+    var g_a: [FUZZY_MAX_PATH + 1]f32 = undefined;
+    var g_b: [FUZZY_MAX_PATH + 1]f32 = undefined;
+    var prev_h: []f32 = h_a[0 .. path.len + 1];
+    var curr_h: []f32 = h_b[0 .. path.len + 1];
+    var prev_gap: []f32 = g_a[0 .. path.len + 1];
+    var curr_gap: []f32 = g_b[0 .. path.len + 1];
     for (0..path.len + 1) |j| {
         prev_h[j] = 0;
-        prev_gap[j] = GAP_OPEN;
+        prev_gap[j] = FZ_GAP_OPEN;
     }
 
     var best_score: f32 = 0;
     var matched_chars: usize = 0;
+    const last_i = query.len - 1;
 
     for (0..query.len) |i| {
+        const qc = ql[i];
+        const qchar = query[i];
         curr_h[0] = 0;
-        curr_gap[0] = GAP_OPEN;
-        var query_gap: f32 = GAP_OPEN; // gap in path (deletion from query)
+        curr_gap[0] = FZ_GAP_OPEN;
+        var query_gap: f32 = FZ_GAP_OPEN;
+        var row_positive = false;
 
         for (0..path.len) |j| {
-            const qc = toLowerByte(query[i]);
-            const pc = toLowerByte(path[j]);
-
-            // Match/mismatch score
-            var match_score: f32 = if (qc == pc) MATCH_SCORE else MISMATCH_PENALTY;
-
-            // Bonuses for matches
-            if (qc == pc) {
-                // Exact case bonus
-                if (query[i] == path[j]) match_score += CASE_BONUS;
-                // Word boundary bonus
-                if (isWordBoundary(path, j)) match_score += DELIMITER_BONUS;
-                // Filename bonus
-                if (j >= fname_start) match_score += FILENAME_BONUS;
-                // Prefix bonus (match at start of path or filename)
-                if (j == 0 or j == fname_start) match_score += PREFIX_BONUS;
-                // Consecutive match bonus
+            const is_match = qc == pl[j];
+            var match_score: f32 = if (is_match) FZ_MATCH else FZ_MISMATCH;
+            if (is_match) {
+                if (qchar == path[j]) match_score += FZ_CASE;
+                if (wb[j]) match_score += FZ_DELIM;
+                if (j >= fname_start) match_score += FZ_FILENAME;
+                if (j == 0 or j == fname_start) match_score += FZ_PREFIX;
                 if (i > 0 and j > 0 and prev_h[j] > prev_h[j + 1] * 0.5) {
-                    match_score += CONSECUTIVE_BONUS;
+                    match_score += FZ_CONSEC;
                 }
             }
-
             const diag = prev_h[j] + match_score;
-
-            // Affine gap penalties
-            curr_gap[j + 1] = @max(prev_h[j + 1] + GAP_OPEN, prev_gap[j + 1] + GAP_EXTEND);
-            query_gap = @max(curr_h[j] + GAP_OPEN, query_gap + GAP_EXTEND);
-
-            // Smith-Waterman: take max of all options, floor at 0
-            curr_h[j + 1] = @max(0, @max(diag, @max(curr_gap[j + 1], query_gap)));
-
-            if (i == query.len - 1 and curr_h[j + 1] > best_score) {
-                best_score = curr_h[j + 1];
-            }
+            curr_gap[j + 1] = @max(prev_h[j + 1] + FZ_GAP_OPEN, prev_gap[j + 1] + FZ_GAP_EXTEND);
+            query_gap = @max(curr_h[j] + FZ_GAP_OPEN, query_gap + FZ_GAP_EXTEND);
+            const v: f32 = @max(0, @max(diag, @max(curr_gap[j + 1], query_gap)));
+            curr_h[j + 1] = v;
+            if (v > 0) row_positive = true;
+            if (i == last_i and v > best_score) best_score = v;
         }
 
-        // Count matched chars (check if any cell in this row is positive)
-        for (1..path.len + 1) |j| {
-            if (curr_h[j] > 0) {
-                matched_chars = i + 1;
-                break;
-            }
-        }
-
-        @memcpy(prev_h[0 .. path.len + 1], curr_h[0 .. path.len + 1]);
-        @memcpy(prev_gap[0 .. path.len + 1], curr_gap[0 .. path.len + 1]);
+        if (row_positive) matched_chars = i + 1;
+        std.mem.swap([]f32, &prev_h, &curr_h);
+        std.mem.swap([]f32, &prev_gap, &curr_gap);
     }
 
+    return .{ .best_score = best_score, .matched_chars = matched_chars };
+}
+
+// Floor + issue-#518 LCS gate + special bonuses + length normalization, shared by
+// the scalar and SIMD scorers. Returns null if the path doesn't qualify.
+pub fn fuzzyFinalize(query: []const u8, path: []const u8, best_in: f32, matched_chars: usize) ?f32 {
+    var best_score = best_in;
     // Require at least 60% of query chars to contribute to score
     if (best_score <= 0 or matched_chars < (query.len + 1) / 2) return null;
-
     // Minimum score threshold based on query length
-    const min_threshold = @as(f32, @floatFromInt(query.len)) * MATCH_SCORE * 0.3;
+    const min_threshold = @as(f32, @floatFromInt(query.len)) * FZ_MATCH * 0.3;
     if (best_score < min_threshold) return null;
-
+    // Issue #518: require a real >=60% in-order subsequence, not stray local hits.
+    if (lcsLenIgnoreCase(query, path) * 5 < query.len * 3) return null;
     // Special entry point bonus (like fff: main.go, index.ts, lib.rs rank higher)
     const fname = getFilename(path);
     if (isSpecialEntryPoint(fname)) best_score += best_score * 0.05;
+    // Issue #363b: an exact basename match must rank above fuzzy matches.
+    if (std.ascii.eqlIgnoreCase(query, fname)) best_score *= 4.0;
+    // Normalize by path length (shorter paths rank higher)
+    return best_score / @sqrt(@as(f32, @floatFromInt(path.len)));
+}
 
-    // Issue #363b: an exact basename match must rank above fuzzy matches in
-    // the same tree. Without this, a query of `cli.rs` against a workspace
-    // containing several `lib.rs` files returned the `lib.rs` files first
-    // because the special-entry-point bonus + length normalization outweighed
-    // the imperfect fuzzy alignment of `cli.rs` against `lib.rs`.
-    if (std.ascii.eqlIgnoreCase(query, fname)) {
-        best_score *= 4.0;
+pub fn fuzzyScore(query: []const u8, path: []const u8) ?f32 {
+    if (query.len == 0 or path.len == 0) return null;
+    if (query.len > FUZZY_MAX_QUERY or path.len > FUZZY_MAX_PATH) return null;
+    if (fuzzyPresenceReject(query, path)) return null;
+    const dp = fuzzyDP(query, path);
+    return fuzzyFinalize(query, path, dp.best_score, dp.matched_chars);
+}
+
+// Number of files scored per SIMD batch (each lane = a different path, same
+// query). 8 f32 lanes map to 2 NEON / 1 AVX2 register and give the inner DP loop
+// enough independent work to hide the per-column dependency latency.
+const FZ_LANES = 8;
+
+// SIMD-across-files Smith-Waterman: scores up to FZ_LANES paths against `query` in
+// lockstep, one path per vector lane. Produces bit-identical best_score +
+// matched_chars to fuzzyDP for every lane (same f32 arithmetic per lane, just
+// vectorized), so the caller's fuzzyFinalize yields identical results. paths.len
+// must be in 1..=FZ_LANES; every path 1..=FUZZY_MAX_PATH; query 1..=FUZZY_MAX_QUERY.
+// Lanes >= paths.len are inert. Shorter paths are masked per column so their
+// padding columns never affect best_score/matched_chars.
+pub fn fuzzyScoreBatch(query: []const u8, paths: []const []const u8, out_best: *[FZ_LANES]f32, out_matched: *[FZ_LANES]u32) void {
+    const V = @Vector(FZ_LANES, f32);
+    const U8V = @Vector(FZ_LANES, u8);
+    const U32V = @Vector(FZ_LANES, u32);
+    const BoolV = @Vector(FZ_LANES, bool);
+
+    const count = paths.len;
+    var lens: [FZ_LANES]usize = .{0} ** FZ_LANES;
+    var len_arr: [FZ_LANES]u32 = .{0} ** FZ_LANES;
+    var fname_arr: [FZ_LANES]u32 = .{0} ** FZ_LANES;
+    var max_len: usize = 0;
+    for (0..count) |l| {
+        lens[l] = paths[l].len;
+        len_arr[l] = @intCast(paths[l].len);
+        fname_arr[l] = @intCast(fuzzyFilenameStart(paths[l]));
+        if (paths[l].len > max_len) max_len = paths[l].len;
+    }
+    const len_v: U32V = len_arr;
+    const fname_v: U32V = fname_arr;
+
+    // Column-major transpose of the batch's paths (lowercased + original + word-
+    // boundary flag per lane). Padding lanes/columns hold 0 / false (never match).
+    var pl_t: [FUZZY_MAX_PATH]U8V = undefined;
+    var po_t: [FUZZY_MAX_PATH]U8V = undefined;
+    var wb_t: [FUZZY_MAX_PATH]BoolV = undefined;
+    for (0..max_len) |j| {
+        var lo: [FZ_LANES]u8 = .{0} ** FZ_LANES;
+        var orig: [FZ_LANES]u8 = .{0} ** FZ_LANES;
+        var wbf: [FZ_LANES]bool = .{false} ** FZ_LANES;
+        for (0..count) |l| {
+            if (j < lens[l]) {
+                const c = paths[l][j];
+                lo[l] = toLowerByte(c);
+                orig[l] = c;
+                wbf[l] = isWordBoundary(paths[l], j);
+            }
+        }
+        pl_t[j] = lo;
+        po_t[j] = orig;
+        wb_t[j] = wbf;
     }
 
-    // Normalize by path length (shorter paths rank higher)
-    const len_factor = @sqrt(@as(f32, @floatFromInt(path.len)));
-    return best_score / len_factor;
+    const zero: V = @splat(0);
+    const gap_open_v: V = @splat(FZ_GAP_OPEN);
+    const gap_ext_v: V = @splat(FZ_GAP_EXTEND);
+    const match_v: V = @splat(FZ_MATCH);
+    const mismatch_v: V = @splat(FZ_MISMATCH);
+    const case_v: V = @splat(FZ_CASE);
+    const delim_v: V = @splat(FZ_DELIM);
+    const filename_v: V = @splat(FZ_FILENAME);
+    const prefix_v: V = @splat(FZ_PREFIX);
+    const consec_v: V = @splat(FZ_CONSEC);
+    const half_v: V = @splat(0.5);
+
+    var h_a: [FUZZY_MAX_PATH + 1]V = undefined;
+    var h_b: [FUZZY_MAX_PATH + 1]V = undefined;
+    var g_a: [FUZZY_MAX_PATH + 1]V = undefined;
+    var g_b: [FUZZY_MAX_PATH + 1]V = undefined;
+    var prev_h: []V = h_a[0 .. max_len + 1];
+    var curr_h: []V = h_b[0 .. max_len + 1];
+    var prev_gap: []V = g_a[0 .. max_len + 1];
+    var curr_gap: []V = g_b[0 .. max_len + 1];
+    for (0..max_len + 1) |j| {
+        prev_h[j] = zero;
+        prev_gap[j] = gap_open_v;
+    }
+
+    var best_v: V = zero;
+    var matched_v: U32V = @splat(0);
+    const last_i = query.len - 1;
+
+    for (0..query.len) |i| {
+        const qc_v: U8V = @splat(toLowerByte(query[i]));
+        const qo_v: U8V = @splat(query[i]);
+        curr_h[0] = zero;
+        curr_gap[0] = gap_open_v;
+        var query_gap: V = gap_open_v;
+        var row_pos_v: V = zero;
+        const is_last = i == last_i;
+        const consec_row = i > 0;
+        const iplus1_v: U32V = @splat(@as(u32, @intCast(i + 1)));
+
+        for (0..max_len) |j| {
+            const jv: U32V = @splat(@as(u32, @intCast(j)));
+            const match_mask: BoolV = pl_t[j] == qc_v;
+
+            // Bonuses (gated to match lanes by the final select below).
+            var bonus: V = @select(f32, po_t[j] == qo_v, case_v, zero);
+            bonus += @select(f32, wb_t[j], delim_v, zero);
+            bonus += @select(f32, jv >= fname_v, filename_v, zero);
+            const at_prefix: BoolV = if (j == 0) @splat(true) else (jv == fname_v);
+            bonus += @select(f32, at_prefix, prefix_v, zero);
+            if (consec_row and j > 0) {
+                const cons: BoolV = prev_h[j] > prev_h[j + 1] * half_v;
+                bonus += @select(f32, cons, consec_v, zero);
+            }
+            const ms: V = @select(f32, match_mask, match_v + bonus, mismatch_v);
+
+            const diag = prev_h[j] + ms;
+            curr_gap[j + 1] = @max(prev_h[j + 1] + gap_open_v, prev_gap[j + 1] + gap_ext_v);
+            query_gap = @max(curr_h[j] + gap_open_v, query_gap + gap_ext_v);
+            const v: V = @max(zero, @max(diag, @max(curr_gap[j + 1], query_gap)));
+            curr_h[j + 1] = v;
+
+            const valid: BoolV = jv < len_v; // lane has a real char at column j
+            row_pos_v = @max(row_pos_v, @select(f32, valid, v, zero));
+            if (is_last) best_v = @select(f32, valid, @max(best_v, v), best_v);
+        }
+
+        const row_has: BoolV = row_pos_v > zero;
+        matched_v = @select(u32, row_has, iplus1_v, matched_v);
+        std.mem.swap([]V, &prev_h, &curr_h);
+        std.mem.swap([]V, &prev_gap, &curr_gap);
+    }
+
+    out_best.* = best_v;
+    out_matched.* = matched_v;
 }

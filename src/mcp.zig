@@ -17,6 +17,8 @@ const AgentRegistry = @import("agent.zig").AgentRegistry;
 const snapshot_json = @import("snapshot_json.zig");
 const watcher = @import("watcher.zig");
 const edit_mod = @import("edit.zig");
+const linter_mod = @import("linter.zig");
+const linter_pref = @import("linter_pref.zig");
 const idx = @import("index.zig");
 const snapshot_mod = @import("snapshot.zig");
 const telemetry_mod = @import("telemetry.zig");
@@ -268,7 +270,7 @@ fn loadProjectWordIndexFromDiskIfPresent(io: std.Io, explorer: *Explorer, projec
         return;
     }
 
-    if (idx.WordIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
+    if (idx.WordIndex.mmapFromDisk(io, data_dir, allocator) orelse idx.WordIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
         explorer.replaceWordIndex(loaded);
     } else {
         explorer.disableWordIndexDiskLoad();
@@ -280,6 +282,10 @@ fn shouldLoadWordIndexForSearch(args: *const std.json.ObjectMap) bool {
     const query = getStr(args, "query") orelse return false;
     if (query.len < 2 or query.len > 256) return false;
 
+    // Single identifiers (legacy) AND multi-word / natural-language queries
+    // (which route to the BM25 ranked path) both resolve through the word
+    // index, so allow spaces between terms. Reject other punctuation so plain
+    // literal-substring searches still skip the load.
     var saw_word_char = false;
     for (query) |c| {
         const is_word_char =
@@ -287,8 +293,8 @@ fn shouldLoadWordIndexForSearch(args: *const std.json.ObjectMap) bool {
             (c >= 'A' and c <= 'Z') or
             (c >= '0' and c <= '9') or
             c == '_';
-        if (!is_word_char) return false;
-        if (c != '_') saw_word_char = true;
+        if (!is_word_char and c != ' ') return false;
+        if (is_word_char and c != '_') saw_word_char = true;
     }
     return saw_word_char;
 }
@@ -312,6 +318,12 @@ const ProjectCache = struct {
     default_snapshot_cache: SnapshotCache,
     default_deps_cache: DepsCache,
     content_cache_capacity: u32,
+    // External-linter state for this connection (trial/graph-based-codedb).
+    // LinterSession.enabled is seeded from the persisted preference in run().
+    // The diagnostics cache uses c_allocator (malloc, thread-safe) because a
+    // detached worker thread writes to it off the request path.
+    linter: linter_mod.LinterSession = .{},
+    diag: linter_mod.DiagnosticsCache,
 
     fn init(alloc_: std.mem.Allocator, default_path_: []const u8, content_cache_capacity_: u32) ProjectCache {
         return .{
@@ -322,10 +334,14 @@ const ProjectCache = struct {
             .default_snapshot_cache = .{},
             .default_deps_cache = .{},
             .content_cache_capacity = content_cache_capacity_,
+            .linter = .{},
+            .diag = linter_mod.DiagnosticsCache.init(std.heap.c_allocator),
         };
     }
 
     fn deinit(self: *ProjectCache) void {
+        // Drain in-flight linter workers BEFORE freeing anything they touch.
+        self.diag.deinit();
         self.default_snapshot_cache.deinit(self.alloc);
         self.default_deps_cache.deinit(self.alloc);
         for (&self.entries) |*slot| {
@@ -490,7 +506,7 @@ pub const BenchContext = struct {
         explorer: *Explorer,
         agents: *AgentRegistry,
     ) void {
-        dispatch(io, alloc, tool, args, out, store, explorer, agents, &self.cache, null);
+        dispatch(io, alloc, tool, args, out, store, explorer, agents, &self.cache, null, 1);
     }
 
     pub fn runHandleCall(
@@ -505,7 +521,7 @@ pub const BenchContext = struct {
         agents: *AgentRegistry,
         telem: *telemetry_mod.Telemetry,
     ) void {
-        handleCall(io, alloc, root, stdout, id, store, explorer, agents, &self.cache, telem, null);
+        handleCall(io, alloc, root, stdout, id, store, explorer, agents, &self.cache, telem, null, 1);
     }
 
     pub fn runToolCall(
@@ -524,7 +540,7 @@ pub const BenchContext = struct {
         defer out.deinit(alloc);
 
         const t0 = cio.nanoTimestamp();
-        dispatch(io, alloc, tool, args, &out, store, explorer, agents, &self.cache, null);
+        dispatch(io, alloc, tool, args, &out, store, explorer, agents, &self.cache, null, 1);
         const elapsed = cio.nanoTimestamp() - t0;
 
         const is_error = std.mem.startsWith(u8, out.items, "error:");
@@ -594,21 +610,23 @@ pub const Tool = enum {
     codedb_glob,
     codedb_ls,
     codedb_context,
+    codedb_diagnostics,
 };
 
 pub const tools_list =
     \\{"tools":[
     \\{"name":"codedb_tree","description":"Whole-repo file tree with per-file language, line counts, and symbol counts. Use to orient in an unfamiliar project.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
-    \\{"name":"codedb_outline","description":"Symbol outline of one file: functions, structs, enums, imports, consts with line numbers. 4-15x smaller than reading the raw file. Run before codedb_read to find the lines you actually need.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"compact":{"type":"boolean","description":"Condensed format without detail comments (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
+    \\{"name":"codedb_outline","description":"Symbol outline of one file: functions, structs, enums, imports, consts with line numbers. 4-15x smaller than reading the raw file. Run before codedb_read to find the lines you actually need. Pass skeleton=true for a signature view — each symbol's declaration line with its body elided as '{ … N lines }', so a 2,000-line file collapses to ~one line per symbol.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"compact":{"type":"boolean","description":"Condensed format without detail comments (default: false)"},"skeleton":{"type":"boolean","description":"Signature view: each symbol's declaration line with its body elided as '{ … N lines }'. Lossless at the API surface; codedb_read the range to expand a body (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
     \\{"name":"codedb_symbol","description":"Find where a named symbol is defined across the index. Returns file, line, and kind. Pass body=true for source. Pick this over codedb_search when you have an exact identifier.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name to search for (exact match)"},"body":{"type":"boolean","description":"Include source body for each symbol (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
-    \\{"name":"codedb_search","description":"Substring full-text search across the index (regex if regex=true). For one identifier prefer codedb_word; for a definition prefer codedb_symbol. Scope with path_glob to filter by language.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match, or regex if regex=true)"},"max_results":{"type":"integer","description":"Maximum results to return (default: 20, raise to 50 for broad surveys)"},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"},"paths_only":{"type":"boolean","description":"Return path:line per result without the matching line text — ~50% fewer tokens per call, useful for broad surveys or for budget-conscious agents (default: false)"},"regex":{"type":"boolean","description":"Treat query as regex pattern (default: false)"},"path_glob":{"type":"string","description":"Filter results to paths matching this glob, e.g. '*.zig', 'src/**/*.zig', or '**/*.{yaml,yml}'. Bare patterns like '*.zig' are auto-promoted to '**/*.zig' to match nested files."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
+    \\{"name":"codedb_search","description":"Substring full-text search across the index (regex if regex=true). For one identifier prefer codedb_word; for a definition prefer codedb_symbol. Scope with path_glob to filter by language.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match, or regex if regex=true)"},"max_results":{"type":"integer","description":"Page size (default: 20, raise to 50 for broad surveys)"},"offset":{"type":"integer","description":"Pagination offset into the ranked results (default: 0). When more results exist, the response ends with a 'more results ... offset=N' line; pass that offset to get the next page."},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"},"paths_only":{"type":"boolean","description":"Return path:line per result without the matching line text — ~50% fewer tokens per call, useful for broad surveys or for budget-conscious agents (default: false)"},"regex":{"type":"boolean","description":"Treat query as regex pattern (default: false)"},"path_glob":{"type":"string","description":"Filter results to paths matching this glob, e.g. '*.zig', 'src/**/*.zig', or '**/*.{yaml,yml}'. Bare patterns like '*.zig' are auto-promoted to '**/*.zig' to match nested files."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
     \\{"name":"codedb_word","description":"Exact-identifier lookup via inverted index — every occurrence of one word, O(1). Use for single identifiers; use codedb_search for substrings or phrases.","inputSchema":{"type":"object","properties":{"word":{"type":"string","description":"Exact word/identifier to look up"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["word"]}},
     \\{"name":"codedb_callers","description":"Find every call site of a named symbol — fuses word-index occurrences with outline scope info. One round-trip vs codedb_word + codedb_outline-per-file. Returns {path, line, snippet, scope_name, scope_kind, scope_lines}. Excludes the symbol's own definition site.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (exact identifier match)"},"max_results":{"type":"integer","description":"Maximum call sites to return (default: 30, raise for hot symbols)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
     \\{"name":"codedb_context","description":"Task-shaped composer: pass a natural-language task; returns ONE tight block (keywords used + symbol definitions + ranked files + top file:line snippets). Replaces 3-5 sequential search/word/symbol calls — use for first-touch orientation on a new task. For narrow follow-ups stick with codedb_search/codedb_symbol.","inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Natural-language task description (3-1024 chars). Include candidate identifiers (camelCase / snake_case) or \"quoted strings\" so the composer can extract keywords."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["task"]}},
+    \\{"name":"codedb_diagnostics","description":"Fetch the latest linter diagnostics for a file, produced off the edit path (ruff/biome/etc.) after a recent codedb_edit. Call right after an edit to surface real errors the change may have introduced (undefined names, type/lint issues) on top of codedb's built-in checks. Returns 'no diagnostics available yet' when none are cached or external linters are disabled.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to fetch diagnostics for"}},"required":["path"]}},
     \\{"name":"codedb_hot","description":"Most recently modified files in the project, newest first.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","description":"Number of files to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_deps","description":"Dependency graph: who imports a file (default) or what a file imports (direction=depends_on). Set transitive=true for the full BFS blast radius.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to check dependencies for"},"direction":{"type":"string","enum":["imported_by","depends_on"],"description":"imported_by (default): who imports this file. depends_on: what this file imports."},"transitive":{"type":"boolean","description":"Follow dependency chain transitively (default: false)"},"max_depth":{"type":"integer","description":"Max traversal depth for transitive queries (default: unlimited)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
     \\{"name":"codedb_read","description":"Read file contents, optionally a line range. Run codedb_outline first to pick the range — large files burn tokens fast. Pass if_hash to skip re-reads when the file is unchanged.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"line_start":{"type":"integer","description":"Start line (1-indexed, inclusive). Omit for full file."},"line_end":{"type":"integer","description":"End line (1-indexed, inclusive). Omit to read to EOF."},"if_hash":{"type":"string","description":"Previous content hash. If unchanged, returns short 'unchanged:HASH' response."},"compact":{"type":"boolean","description":"Skip comment and blank lines (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
-    \\{"name":"codedb_edit","description":"Line-based file edit: replace (range), insert (after line), or delete (range). Pass if_hash from the latest codedb_read to reject stale-line edits. Set dry_run=true for a diff preview.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to edit"},"op":{"type":"string","enum":["replace","insert","delete"],"description":"Edit operation type"},"content":{"type":"string","description":"New content (for replace/insert)"},"range_start":{"type":"integer","description":"Start line number (for replace/delete, 1-indexed)"},"range_end":{"type":"integer","description":"End line number (for replace/delete, 1-indexed)"},"after":{"type":"integer","description":"Insert after this line number (for insert)"},"if_hash":{"type":"string","description":"Hex hash from codedb_read's 'hash:' line. Edit is rejected with HashMismatch if the file has changed since."},"dry_run":{"type":"boolean","description":"If true, return a diff preview without writing. Disk and store are untouched. Default: false."}},"required":["path","op"]}},
+    \\{"name":"codedb_edit","description":"Fallback editor — prefer your own native file-editing tool. codedb is a context/navigation tool, not an editor; reach for codedb_edit only when no native edit capability is available. When you do edit through codedb, op=str_replace with old_string/new_string is safest (old_string must match exactly once) — it cannot mis-target surrounding lines the way a range replace can. Also supports line ops: replace (range), insert (after line), delete (range), and create (author a new file from content). The result includes a syntax-health warning if the edit unbalances delimiters or drops a still-used import — heed it and re-read before continuing. Pass if_hash from the latest codedb_read to reject stale-line edits. Set dry_run=true for a diff preview.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to edit"},"op":{"type":"string","enum":["str_replace","replace","insert","delete","create"],"description":"Edit operation. str_replace=anchored (old_string/new_string); replace/delete use range; insert uses after; create=author a NEW file from content (errors if the path already exists)."},"content":{"type":"string","description":"New content (for replace/insert/create)"},"old_string":{"type":"string","description":"For op=str_replace: exact text to find; must occur exactly once in the file."},"new_string":{"type":"string","description":"For op=str_replace: replacement text for old_string."},"range_start":{"type":"integer","description":"Start line number (for replace/delete, 1-indexed)"},"range_end":{"type":"integer","description":"End line number (for replace/delete, 1-indexed)"},"after":{"type":"integer","description":"Insert after this line number (for insert)"},"if_hash":{"type":"string","description":"Hex hash from codedb_read's 'hash:' line. Edit is rejected with HashMismatch if the file has changed since."},"dry_run":{"type":"boolean","description":"If true, return a diff preview without writing. Disk and store are untouched. Default: false."}},"required":["path","op"]}},
     \\{"name":"codedb_changes","description":"Files changed since a given sequence number. Pair with codedb_status to poll for updates.","inputSchema":{"type":"object","properties":{"since":{"type":"integer","description":"Sequence number to get changes since (default: 0)"}},"required":[]}},
     \\{"name":"codedb_status","description":"Current indexed-file count, sequence number, and scan phase.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_snapshot","description":"Pre-rendered JSON snapshot of the entire index — tree, outlines, symbols, deps. For caching or shipping to edge workers.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
@@ -807,6 +825,10 @@ const Session = struct {
     pending_roots_id: ?i64 = null,
     roots: std.ArrayList(Root) = .empty,
     deferred_scan: ?*DeferredScan = null,
+    /// Per-session advisory-lock owner for codedb_edit (#528 audit). Set to a
+    /// distinct registered agent id at session start; defaults to 1 so any path
+    /// that constructs a Session without registering still uses __filesystem__.
+    edit_agent_id: u64 = 1,
 
     fn freeRoots(self: *Session) void {
         for (self.roots.items) |r| {
@@ -840,6 +862,9 @@ pub fn run(
 
     var cache = ProjectCache.init(alloc, default_path, content_cache_capacity);
     defer cache.deinit();
+    // Seed the external-linter opt-in from the persisted preference. The server
+    // never prompts/installs — that happens at install / `codedb update` time.
+    cache.linter.enabled = linter_pref.enabledFromPref(linter_pref.read(io, alloc));
 
     // Build the `tools/list` payload. The discriminated `oneOf` on the
     // codedb_bundle ops items (issue #437) is incompatible with OpenAI's
@@ -874,6 +899,11 @@ pub fn run(
         .stdout = stdout,
         .deferred_scan = deferred_scan,
     };
+    // #528 audit: give this MCP session a distinct advisory-lock owner so that
+    // concurrent edits from separate connections (if a multi-connection MCP
+    // transport is added) serialize correctly instead of all sharing the
+    // startup __filesystem__ agent. Falls back to 1 (__filesystem__).
+    session.edit_agent_id = agents.register("mcp-session") catch 1;
     defer session.deinit();
 
     var read_buf: [4096]u8 = undefined;
@@ -932,7 +962,7 @@ pub fn run(
         } else if (mcpj.eql(method, "tools/list")) {
             if (!is_notification) writeResult(alloc, stdout, id, tools_list_response);
         } else if (mcpj.eql(method, "tools/call")) {
-            handleCall(io, alloc, root, stdout, id, store, explorer, agents, &cache, telem, session.deferred_scan);
+            handleCall(io, alloc, root, stdout, id, store, explorer, agents, &cache, telem, session.deferred_scan, session.edit_agent_id);
         } else if (mcpj.eql(method, "ping")) {
             if (!is_notification) writeResult(alloc, stdout, id, "{}");
         } else {
@@ -974,7 +1004,7 @@ fn handleInitialize(s: *Session, root: *const std.json.ObjectMap, id: ?std.json.
         if (negotiateProtocolVersion(requested)) |v| negotiated = v;
     }
     const init_result = std.fmt.allocPrint(s.alloc,
-        \\{{"protocolVersion":"{s}","capabilities":{{"tools":{{"listChanged":false}}}},"serverInfo":{{"name":"codedb","version":"{s}"}}}}
+        \\{{"protocolVersion":"{s}","capabilities":{{"tools":{{"listChanged":false}}}},"serverInfo":{{"name":"codedb","version":"{s}"}},"instructions":"codedb is a code-intelligence and context tool — not your editor. Use it to understand the codebase before you change it: search, symbol/caller lookup, dependency graph, outlines, and codedb_context for task-shaped orientation. Make edits with your own native file tools. codedb_edit is only a fallback for clients with no native editing."}}
     , .{ negotiated, release_info.semver }) catch return;
     defer s.alloc.free(init_result);
     writeResult(s.alloc, s.stdout, id, init_result);
@@ -1094,6 +1124,7 @@ fn handleCall(
     cache: *ProjectCache,
     telem: *telemetry_mod.Telemetry,
     deferred_scan: ?*DeferredScan,
+    edit_agent_id: u64,
 ) void {
     const is_notification = id == null;
 
@@ -1132,7 +1163,7 @@ fn handleCall(
     defer out.deinit(alloc);
 
     const t0 = cio.nanoTimestamp();
-    dispatch(io, alloc, tool, args, &out, store, explorer, agents, cache, deferred_scan);
+    dispatch(io, alloc, tool, args, &out, store, explorer, agents, cache, deferred_scan, edit_agent_id);
     const elapsed = cio.nanoTimestamp() - t0;
 
     const is_error = std.mem.startsWith(u8, out.items, "error:");
@@ -1272,6 +1303,7 @@ fn dispatch(
     agents: *AgentRegistry,
     cache: *ProjectCache,
     deferred_scan: ?*DeferredScan,
+    edit_agent_id: u64,
 ) void {
     const project_path = getStr(args, "project");
     const ctx = if (project_path) |path|
@@ -1311,7 +1343,7 @@ fn dispatch(
         waitForScanReady(scan_wait_timeout_ms);
     }
 
-    if (tool == .codedb_word or (tool == .codedb_search and shouldLoadWordIndexForSearch(args))) {
+    if (tool == .codedb_word or tool == .codedb_context or (tool == .codedb_search and shouldLoadWordIndexForSearch(args))) {
         const effective_project = project_path orelse cache.default_path;
         loadProjectWordIndexFromDiskIfPresent(io, ctx.explorer, effective_project, alloc);
     }
@@ -1326,11 +1358,11 @@ fn dispatch(
         .codedb_hot => handleHot(alloc, args, out, ctx.store, ctx.explorer),
         .codedb_deps => handleDeps(alloc, args, out, ctx.explorer),
         .codedb_read => handleRead(io, alloc, args, out, ctx.explorer),
-        .codedb_edit => handleEdit(io, alloc, args, out, default_store, default_explorer, agents),
+        .codedb_edit => handleEdit(io, alloc, args, out, default_store, default_explorer, agents, cache, edit_agent_id),
         .codedb_changes => handleChanges(alloc, args, out, default_store),
         .codedb_status => handleStatus(alloc, out, ctx.store, ctx.explorer),
         .codedb_snapshot => handleSnapshot(alloc, out, ctx.explorer, ctx.store, ctx.snapshot_cache),
-        .codedb_bundle => handleBundle(io, alloc, args, out, ctx.store, ctx.explorer, agents, cache, deferred_scan),
+        .codedb_bundle => handleBundle(io, alloc, args, out, ctx.store, ctx.explorer, agents, cache, deferred_scan, edit_agent_id),
         .codedb_remote => handleRemote(alloc, args, out),
         .codedb_projects => handleProjects(io, alloc, out),
         .codedb_index => handleIndex(io, alloc, args, out, cache, default_store, default_explorer, deferred_scan),
@@ -1339,6 +1371,7 @@ fn dispatch(
         .codedb_glob => handleGlob(alloc, args, out, ctx.explorer),
         .codedb_ls => handleLs(alloc, args, out, ctx.explorer),
         .codedb_context => handleContext(io, alloc, args, out, ctx.explorer, project_path orelse cache.default_path),
+        .codedb_diagnostics => handleDiagnostics(alloc, args, out, cache),
     }
     appendScanProgressHint(alloc, out, tool);
 }
@@ -1384,10 +1417,17 @@ fn handleOutline(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
         return;
     };
     const compact = getBool(args, "compact");
-    const found = explorer.renderOutline(path, alloc, out, compact) catch {
-        out.appendSlice(alloc, "error: outline retrieval failed") catch {};
-        return;
-    };
+    const skeleton = getBool(args, "skeleton");
+    const found = if (skeleton)
+        explorer.renderSkeleton(path, alloc, out) catch {
+            out.appendSlice(alloc, "error: outline retrieval failed") catch {};
+            return;
+        }
+    else
+        explorer.renderOutline(path, alloc, out, compact) catch {
+            out.appendSlice(alloc, "error: outline retrieval failed") catch {};
+            return;
+        };
     if (!found) {
         out.appendSlice(alloc, "error: file not indexed: ") catch {};
         out.appendSlice(alloc, path) catch {};
@@ -1467,6 +1507,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
     // median answer needed <10 results; the extra 40 were paid in tokens
     // every call. Agents that want more can pass max_results explicitly.
     const max_results: usize = if (getInt(args, "max_results")) |n| @intCast(@max(1, @min(n, 10000))) else 20;
+    const offset_n: usize = if (getInt(args, "offset")) |n| @intCast(@max(0, @min(n, 100000))) else 0;
     const scope = getBool(args, "scope");
     const compact = getBool(args, "compact");
     const paths_only = getBool(args, "paths_only");
@@ -1486,8 +1527,8 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
     } else null;
 
     if (scope and is_regex) {
-        const results = explorer.searchContentRegexWithScope(query, alloc, max_results) catch {
-            out.appendSlice(alloc, "error: scoped regex search failed") catch {};
+        const results = explorer.searchContentRegexWithScope(query, alloc, max_results) catch |e| {
+            out.appendSlice(alloc, if (e == error.InvalidRegex) "error: invalid regex" else "error: scoped regex search failed") catch {};
             return;
         };
         defer {
@@ -1588,8 +1629,8 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             w.print("({d} shown, {d} truncated by per-file cap)\n", .{ shown, visible_total - shown }) catch {};
         }
     } else if (is_regex) {
-        const results = explorer.searchContentRegex(query, alloc, max_results) catch {
-            out.appendSlice(alloc, "error: regex search failed") catch {};
+        const results = explorer.searchContentRegex(query, alloc, max_results) catch |e| {
+            out.appendSlice(alloc, if (e == error.InvalidRegex) "error: invalid regex" else "error: regex search failed") catch {};
             return;
         };
         defer {
@@ -1646,17 +1687,33 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             if (rendered) return;
         }
 
-        const results = explorer.searchContent(query, alloc, max_results) catch {
+        // Multi-word queries express natural-language / conceptual intent —
+        // rank them by BM25 (relevance) instead of raw substring order, which
+        // returns nothing for a phrase. Single-token queries keep literal
+        // substring matching so exact-identifier lookups still work.
+        const multiword = std.mem.indexOfScalar(u8, query, ' ') != null;
+        // Over-fetch by `offset` (+1) so we can page into a stable window and
+        // detect whether more results exist beyond this page. BM25 ranking is
+        // deterministic per query, so the offset is a stable, stateless cursor.
+        const fetch_count = @min(offset_n + max_results + 1, 100000);
+        const fetched = (if (multiword)
+            explorer.searchContentRanked(query, alloc, fetch_count)
+        else
+            explorer.searchContent(query, alloc, fetch_count)) catch {
             out.appendSlice(alloc, "error: search failed") catch {};
             return;
         };
         defer {
-            for (results) |r| {
+            for (fetched) |r| {
                 alloc.free(r.line_text);
                 alloc.free(r.path);
             }
-            alloc.free(results);
+            alloc.free(fetched);
         }
+        const page_lo = @min(offset_n, fetched.len);
+        const page_hi = @min(offset_n + max_results, fetched.len);
+        const results = fetched[page_lo..page_hi];
+        const has_more = fetched.len > page_hi;
 
         // Issue #422: header reflects post-filter count; "truncated" footer
         // only fires for per-file-cap, not for glob/compact filtering.
@@ -1673,6 +1730,9 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         out.ensureUnusedCapacity(alloc, 2048) catch {};
         const w = cio.listWriter(out, alloc);
         w.print("{d} results for '{s}':\n", .{ visible_total, query }) catch {};
+        if (has_more) {
+            w.print("  (more results — codedb_search query='{s}' offset={d} for the next page)\n", .{ query, page_hi }) catch {};
+        }
         if (simple_unfiltered and results.len <= 64) {
             const CountEntry = struct { path: []const u8, count: u8 };
             var counts: [64]CountEntry = undefined;
@@ -2030,11 +2090,12 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
     const PerFileHit = struct { line: u32, text: []const u8 };
     const PerFile = struct {
         total: u32 = 0,
+        bm25: f32 = 0,
         top: std.ArrayList(PerFileHit) = .empty,
     };
     var by_file = std.StringHashMap(PerFile).init(A);
 
-    const SymRef = struct { kw: []const u8, kind: []const u8, path: []const u8, line: u32 };
+    const SymRef = struct { kw: []const u8, kind: []const u8, path: []const u8, line: u32, line_end: u32 };
     var sym_refs: std.ArrayList(SymRef) = .empty;
     var seen_syms = std.StringHashMap(void).init(A);
 
@@ -2051,16 +2112,18 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                     .kind = @tagName(d.symbol.kind),
                     .path = d.path,
                     .line = d.symbol.line_start,
+                    .line_end = d.symbol.line_end,
                 }) catch break;
             }
         } else |_| {}
 
         // Content search — small per-keyword cap keeps the arena lean.
-        const hits = explorer.searchContent(kw, A, CONTEXT_MAX_RESULTS_PER_KW) catch continue;
+        const hits = explorer.searchContentRanked(kw, A, CONTEXT_MAX_RESULTS_PER_KW) catch continue;
         for (hits) |h| {
             const gop = by_file.getOrPut(h.path) catch continue;
             if (!gop.found_existing) gop.value_ptr.* = .{};
             gop.value_ptr.total += 1;
+            gop.value_ptr.bm25 += h.score;
             if (gop.value_ptr.top.items.len < CONTEXT_TOP_LINES_PER_FILE) {
                 gop.value_ptr.top.append(A, .{ .line = h.line_num, .text = h.line_text }) catch {};
             }
@@ -2074,24 +2137,17 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
     var symbol_files = std.StringHashMap(void).init(A);
     for (sym_refs.items) |sr| symbol_files.put(sr.path, {}) catch {};
 
-    const FileRank = struct { path: []const u8, hits: u32, score: i32, top: []const PerFileHit };
+    const FileRank = struct { path: []const u8, hits: u32, score: f32, top: []const PerFileHit };
     var ranked: std.ArrayList(FileRank) = .empty;
     var iter = by_file.iterator();
     while (iter.next()) |entry| {
         const path = entry.key_ptr.*;
-        var score: i32 = @intCast(entry.value_ptr.total);
-        if (symbol_files.contains(path)) score += 5; // definition beats pure usage
-        const is_test = std.mem.indexOf(u8, path, "/test") != null or
-            std.mem.indexOf(u8, path, "_test.") != null or
-            std.mem.indexOf(u8, path, ".test.") != null or
-            std.mem.indexOf(u8, path, "/__tests__/") != null or
-            std.mem.indexOf(u8, path, "/spec/") != null or
-            std.mem.indexOf(u8, path, "/fixtures/") != null;
-        const is_doc = std.mem.endsWith(u8, path, ".md") or
-            std.mem.endsWith(u8, path, ".rst") or
-            std.mem.indexOf(u8, path, "/docs/") != null;
-        if (is_test) score -= 3;
-        if (is_doc) score -= 2;
+        // Rank by summed BM25 score, which already carries BM25+ and the
+        // path-relevance multiplier (test/doc down-weight + filename boost) from
+        // searchContentRanked. Files that DEFINE a keyword get the edge
+        // (definition beats usage — codedb_context's unique signal).
+        var score: f32 = entry.value_ptr.bm25;
+        if (symbol_files.contains(path)) score *= 1.5;
         ranked.append(A, .{
             .path = path,
             .hits = entry.value_ptr.total,
@@ -2114,8 +2170,8 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
     if (sym_refs.items.len > 0) {
         w.print("\n## Symbol definitions\n", .{}) catch {};
         // Enhancement (closes T1 flask variance gap): when there are ≤3
-        // symbol definitions, inline the first ~6 lines of each so the agent
-        // doesn't need a follow-up `codedb_read` to see the body. For wider
+        // symbol definitions, inline each symbol's FULL body (capped at 40
+        // lines) so the agent doesn't need a follow-up `codedb_read`. For wider
         // result sets this would bloat the response, so cap at 3.
         const inline_bodies = sym_refs.items.len <= 3;
         for (sym_refs.items) |sr| {
@@ -2126,9 +2182,10 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                     var i: usize = 0;
                     var line_start: ?usize = null;
                     var captured: u32 = 0;
-                    const want_end: u32 = sr.line + 6;
+                    const body_end: u32 = if (sr.line_end > sr.line) @min(sr.line_end, sr.line + 39) else sr.line;
+                    const max_lines: u32 = body_end - sr.line + 1;
                     if (cur_line == sr.line) line_start = 0;
-                    while (i < content.len and captured < 6) : (i += 1) {
+                    while (i < content.len and captured < max_lines) : (i += 1) {
                         if (content[i] == '\n') {
                             if (line_start) |ls| {
                                 const line_end = i;
@@ -2136,7 +2193,7 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                                 captured += 1;
                             }
                             cur_line += 1;
-                            if (cur_line >= sr.line and cur_line <= want_end) {
+                            if (cur_line >= sr.line and cur_line <= body_end) {
                                 line_start = i + 1;
                             } else {
                                 line_start = null;
@@ -2144,7 +2201,7 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                         }
                     }
                     if (line_start) |ls| {
-                        if (captured < 6) {
+                        if (captured < max_lines) {
                             w.print("       {d:>5} | {s}\n", .{ cur_line, content[ls..] }) catch {};
                         }
                     }
@@ -2217,6 +2274,31 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                     }
                     shown_for_sym += 1;
                     total_shown += 1;
+                }
+            }
+        }
+
+        // Callees section (graph-resolved): walk each ≤3 key symbol's call sites
+        // through the resolved call graph and surface where each callee is
+        // defined. This is the dependency side of the neighborhood — pairs with
+        // the Callers section above so the agent sees both who calls a symbol and
+        // what it calls, without a follow-up codedb_outline/read on the callees.
+        if (inline_bodies) {
+            var any_callees = false;
+            var done_sym = std.StringHashMap(void).init(A);
+            for (sym_refs.items) |sr| {
+                const sym_key = std.fmt.allocPrint(A, "{s}:{d}", .{ sr.path, sr.line }) catch continue;
+                if (done_sym.contains(sym_key)) continue;
+                done_sym.put(sym_key, {}) catch {};
+                const callees = explorer.resolveCallees(sr.path, sr.line, sr.line_end, A, 6) catch continue;
+                if (callees.len == 0) continue;
+                if (!any_callees) {
+                    w.print("\n## Calls (graph-resolved callees of these symbols)\n", .{}) catch {};
+                    any_callees = true;
+                }
+                w.print("- {s} ({s}) calls:\n", .{ sr.kw, sr.kind }) catch {};
+                for (callees) |c| {
+                    w.print("    \xe2\x86\x92 {s} ({s})  {s}:{d}\n", .{ c.name, @tagName(c.kind), c.path, c.line }) catch {};
                 }
             }
         }
@@ -2523,7 +2605,7 @@ fn handleRead(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
     }
 }
 
-fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer, agents: *AgentRegistry) void {
+fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer, agents: *AgentRegistry, cache: *ProjectCache, edit_agent_id: u64) void {
     const path = getStr(args, "path") orelse {
         out.appendSlice(alloc, "error: missing 'path'") catch {};
         return;
@@ -2537,14 +2619,15 @@ fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
         return;
     }
     const op_str = getStr(args, "op") orelse "replace";
+    const is_create = eql(op_str, "create");
     const op: @import("version.zig").Op = if (eql(op_str, "insert"))
         .insert
     else if (eql(op_str, "delete"))
         .delete
-    else if (eql(op_str, "replace"))
+    else if (eql(op_str, "replace") or eql(op_str, "str_replace") or is_create)
         .replace
     else {
-        out.appendSlice(alloc, "error: unknown op, must be 'replace', 'insert', or 'delete'") catch {};
+        out.appendSlice(alloc, "error: unknown op, must be 'create', 'replace', 'str_replace', 'insert', or 'delete'") catch {};
         return;
     };
 
@@ -2553,17 +2636,21 @@ fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
     const range_end = getInt(args, "range_end");
     const after = getInt(args, "after");
 
-    // Use agent 1 (the __filesystem__ agent registered at startup).
-    // TODO: agent_id is hardcoded to 1 — two MCP clients share the same agent_id and
-    // could both acquire locks on different files without conflict, but cannot detect
-    // concurrent edits to the same file from separate connections.
+    // Per-session advisory-lock owner. The server threads a distinct agent id
+    // per MCP connection (Session.edit_agent_id), so concurrent edits to the
+    // same file from separate connections are detected instead of all sharing
+    // the startup __filesystem__ agent (#528 audit). Defaults to 1 (the
+    // __filesystem__ agent) for the single-connection stdio path.
     var req = edit_mod.EditRequest{
         .path = path,
-        .agent_id = 1,
+        .agent_id = edit_agent_id,
         .op = op,
         .content = content,
+        .old_string = getStr(args, "old_string"),
+        .new_string = getStr(args, "new_string"),
         .if_hash = getStr(args, "if_hash"),
         .dry_run = getBool(args, "dry_run"),
+        .create = is_create,
     };
     if (range_start != null and range_end != null) {
         if (range_start.? <= 0 or range_end.? <= 0) {
@@ -2592,10 +2679,33 @@ fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
                 const w = cio.listWriter(out, alloc);
                 w.print(" (current hash: {x})", .{std.hash.Wyhash.hash(0, bytes)}) catch {};
             } else |_| {}
+        } else if (err == error.PatternNotFound) {
+            out.appendSlice(alloc, " (old_string not found \u{2014} re-read the file and copy the exact text, including whitespace and indentation)") catch {};
+        } else if (err == error.PatternNotUnique) {
+            // Tell the agent how many times old_string matched so it knows how much
+            // surrounding context to add to make the anchor unique.
+            const edit_dir = explorer.root_dir orelse std.Io.Dir.cwd();
+            if (edit_dir.readFileAlloc(io, path, alloc, .limited(10 * 1024 * 1024))) |bytes| {
+                defer alloc.free(bytes);
+                const old = getStr(args, "old_string") orelse "";
+                var count: usize = 0;
+                if (old.len > 0) {
+                    var i: usize = 0;
+                    while (std.mem.indexOfPos(u8, bytes, i, old)) |pos| {
+                        count += 1;
+                        i = pos + old.len;
+                    }
+                }
+                const w = cio.listWriter(out, alloc);
+                w.print(" (old_string matched {d} times \u{2014} add surrounding lines to make it unique)", .{count}) catch {};
+            } else |_| {}
+        } else if (err == error.FileExists) {
+            out.appendSlice(alloc, " (file already exists \u{2014} use op=str_replace or op=replace to edit it, not op=create)") catch {};
         }
         return;
     };
     defer if (result.preview) |p| alloc.free(p);
+    defer if (result.health) |h| alloc.free(h);
 
     const w = cio.listWriter(out, alloc);
     if (req.dry_run) {
@@ -2605,6 +2715,95 @@ fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
         w.print("edit unchanged: seq={d}, size={d}, hash:{x}", .{ result.seq, result.new_size, result.new_hash }) catch {};
     } else {
         w.print("edit applied: seq={d}, size={d}, hash:{x}", .{ result.seq, result.new_size, result.new_hash }) catch {};
+    }
+    // Advisory syntax-health warning (trial/graph-based-codedb): surface a
+    // mis-spliced multi-line edit so the agent can re-read and fix before
+    // declaring the task done, instead of shipping an unparseable file.
+    if (result.health) |h| out.appendSlice(alloc, h) catch {};
+
+    // External-linter (Tier-1): only when the user opted in. `enabled` is set
+    // once at startup and read-only after, so this guard adds nothing to the
+    // edit hot path when linters are off (the default) — no cache lock, no
+    // detect, no thread spawn. When on, the linter runs on a DETACHED thread
+    // after this response is built, so it never adds latency to the edit.
+    if (!req.dry_run and cache.linter.enabled) {
+        _ = cache.diag.appendIfFresh(alloc, out, path, result.new_hash);
+        const lang = explore_mod.detectLanguage(path);
+        if (cache.linter.shouldTry(lang) and cache.diag.tryBeginWork(path, result.new_hash)) {
+            spawnLintWorker(cache, path, result.new_hash, lang);
+        }
+    }
+}
+
+// ── External-linter worker (runs off the synchronous edit path) ───────────
+
+const LintJob = struct {
+    cache: *ProjectCache,
+    path: []u8, // owned (c_allocator); freed by run()
+    hash: u64,
+    language: explore_mod.Language,
+
+    fn run(job: *LintJob) void {
+        const ca = std.heap.c_allocator;
+        defer {
+            ca.free(job.path);
+            ca.destroy(job);
+        }
+        const summary = linter_mod.runCheck(ca, job.language, job.path) catch {
+            // Tool missing / crashed: disable this language for the session,
+            // then clear the in-flight mark. mark() MUST precede endWork() so
+            // the cache (and session) are still alive — endWork drops the
+            // inflight count the owner drains on before freeing them.
+            job.cache.linter.mark(job.language, .unavailable);
+            job.cache.diag.endWork(job.path);
+            return;
+        };
+        if (summary) |s| {
+            defer ca.free(s);
+            job.cache.diag.store(job.path, job.hash, s); // clears in-flight
+        } else {
+            job.cache.diag.endWork(job.path); // clean file: nothing to store
+        }
+    }
+};
+
+/// Spawn a detached linter worker for (path, hash). Caller has already reserved
+/// the slot via cache.diag.tryBeginWork(); on any failure here we must release
+/// it with endWork() so the in-flight count cannot leak.
+fn spawnLintWorker(cache: *ProjectCache, path: []const u8, hash: u64, language: explore_mod.Language) void {
+    const ca = std.heap.c_allocator;
+    const pdup = ca.dupe(u8, path) catch {
+        cache.diag.endWork(path);
+        return;
+    };
+    const job = ca.create(LintJob) catch {
+        ca.free(pdup);
+        cache.diag.endWork(path);
+        return;
+    };
+    job.* = .{ .cache = cache, .path = pdup, .hash = hash, .language = language };
+    const t = std.Thread.spawn(.{}, LintJob.run, .{job}) catch {
+        ca.free(pdup);
+        ca.destroy(job);
+        cache.diag.endWork(path);
+        return;
+    };
+    t.detach();
+}
+
+fn handleDiagnostics(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), cache: *ProjectCache) void {
+    const path = getStr(args, "path") orelse {
+        out.appendSlice(alloc, "error: missing 'path' argument") catch {};
+        return;
+    };
+    if (!isPathSafe(path)) {
+        out.appendSlice(alloc, "error: path traversal not allowed") catch {};
+        return;
+    }
+    if (!cache.diag.appendLatest(alloc, out, path)) {
+        out.appendSlice(alloc, "no diagnostics available yet for ") catch {};
+        out.appendSlice(alloc, path) catch {};
+        out.appendSlice(alloc, " (linters run shortly after an edit; retry, or they may be disabled — `codedb update` to enable)") catch {};
     }
 }
 
@@ -2789,6 +2988,7 @@ fn handleBundle(
     agents: *AgentRegistry,
     cache: *ProjectCache,
     deferred_scan: ?*DeferredScan,
+    edit_agent_id: u64,
 ) void {
     const ops_val = args.get("ops") orelse {
         out.appendSlice(alloc, "error: missing 'ops' argument") catch {};
@@ -2906,7 +3106,7 @@ fn handleBundle(
         };
         sub_out.ensureTotalCapacity(alloc, sub_reserve) catch {};
 
-        dispatch(io, alloc, tool, sub_args, &sub_out, default_store, default_explorer, agents, cache, deferred_scan);
+        dispatch(io, alloc, tool, sub_args, &sub_out, default_store, default_explorer, agents, cache, deferred_scan, edit_agent_id);
 
         // Check size BEFORE appending to prevent blowout
         if (out.items.len + sub_out.items.len > 200 * 1024) {
@@ -3505,6 +3705,32 @@ fn handleIndex(
     }
 }
 
+// True when `q` is a single compound identifier — camelCase/PascalCase (an
+// interior uppercase alongside a lowercase) or snake_case (an underscore) — and
+// contains only identifier characters (no space, path separator, glob, dot, or
+// colon). These queries are almost always symbol names, not filenames, and are
+// exactly the ones that miss the exact-filename fast path and fall into the slow
+// fuzzy scan. ALL-CAPS (e.g. README) is excluded so filename-ish tokens stay on
+// the fuzzy path.
+pub fn looksLikeCompoundIdentifier(q: []const u8) bool {
+    if (q.len < 4) return false;
+    var inner_upper = false;
+    var has_lower = false;
+    var has_underscore = false;
+    for (q, 0..) |c, i| {
+        switch (c) {
+            'A'...'Z' => if (i > 0) {
+                inner_upper = true;
+            },
+            'a'...'z' => has_lower = true,
+            '_' => has_underscore = true,
+            '0'...'9' => {},
+            else => return false, // space, '/', '.', '*', '?', ':', etc.
+        }
+    }
+    return (inner_upper and has_lower) or has_underscore;
+}
+
 fn handleFind(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
     // Telemetry showed 71% of codedb_find calls were failing with
     // "missing 'query'" — agents were passing `name`/`path`/`pattern`/`q`
@@ -3530,6 +3756,16 @@ fn handleFind(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
         if (exact_count > 0) return;
     }
 
+    // Symbol fast-path: a compound identifier (camelCase / snake_case) typed into
+    // find is almost always a symbol the caller wants the definition of, not a
+    // filename — such queries don't match filenames, so they'd otherwise pay the
+    // full fuzzy scan (the slow case). If the symbol index has it, return the def
+    // sites (O(1)) and skip the scan; a non-matching identifier falls through to
+    // the fuzzy file search below, so legitimate filename searches are unaffected.
+    if (looksLikeCompoundIdentifier(query)) {
+        out.ensureUnusedCapacity(alloc, 128) catch {};
+        if (explorer.renderSymbolDefsFast(query, alloc, out, max_results)) return;
+    }
     var matches = explorer.fuzzyFindFiles(query, alloc, max_results) catch {
         out.appendSlice(alloc, "error: search failed") catch {};
         return;
@@ -3637,6 +3873,160 @@ fn handleLs(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std
             out.appendSlice(alloc, meta) catch {};
         }
     }
+}
+
+/// CLI⇄MCP parity bridge. Serves the read-only navigation tools that `runQuery`
+/// doesn't render natively — symbol / callers / deps / glob / ls / context and
+/// the fuzzy file-name `file` lookup — by building the MCP argument map and
+/// reusing the same handlers against the warm Explorer. Returns the exit code,
+/// or null if `cmd` isn't one we handle (caller falls through to its own usage
+/// error). The rendered data block is appended to `out`. `root` must be the
+/// resolved absolute project root (used to locate the on-disk word index for
+/// callers/context).
+pub fn runCliTool(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    explorer: *Explorer,
+    root: []const u8,
+    cmd: []const u8,
+    args: []const []const u8,
+    cmd_args_start: usize,
+    out: *std.ArrayList(u8),
+) ?u8 {
+    const pos: ?[]const u8 = if (args.len > cmd_args_start) args[cmd_args_start] else null;
+    const out_start = out.items.len;
+
+    var m: std.json.ObjectMap = .empty;
+    defer m.deinit(alloc);
+
+    if (std.mem.eql(u8, cmd, "symbol")) {
+        const name = pos orelse return cliUsage(alloc, out, "symbol <name> [--body]");
+        m.put(alloc, "name", .{ .string = name }) catch return 1;
+        for (args[cmd_args_start..]) |a| {
+            if (std.mem.eql(u8, a, "--body")) m.put(alloc, "body", .{ .bool = true }) catch {};
+        }
+        handleSymbol(alloc, &m, out, explorer);
+        return finishCli(out, out_start);
+    } else if (std.mem.eql(u8, cmd, "callers")) {
+        const name = pos orelse return cliUsage(alloc, out, "callers <name>");
+        m.put(alloc, "name", .{ .string = name }) catch return 1;
+        // handleCallers does a content search (searchContentWithScope), so it
+        // needs the trigram — load the MMAP'd trigram (cheap, reclaimable), NOT
+        // the heap word index. Keeps the footprint at the MCP level.
+        loadProjectTrigramFromDiskIfPresent(io, explorer, root, alloc);
+        handleCallers(alloc, &m, out, explorer);
+        return finishCli(out, out_start);
+    } else if (std.mem.eql(u8, cmd, "deps")) {
+        const da = parseDepsArgs(args, cmd_args_start) catch |e| return cliDepsUsage(alloc, out, e);
+        m.put(alloc, "path", .{ .string = da.path }) catch return 1;
+        if (da.depends_on) m.put(alloc, "direction", .{ .string = "depends_on" }) catch {};
+        if (da.transitive) m.put(alloc, "transitive", .{ .bool = true }) catch {};
+        if (da.max_depth) |md| m.put(alloc, "max_depth", .{ .integer = md }) catch {};
+        handleDeps(alloc, &m, out, explorer);
+        return finishCli(out, out_start);
+    } else if (std.mem.eql(u8, cmd, "glob")) {
+        const pattern = pos orelse return cliUsage(alloc, out, "glob <pattern>");
+        m.put(alloc, "pattern", .{ .string = pattern }) catch return 1;
+        handleGlob(alloc, &m, out, explorer);
+        return finishCli(out, out_start);
+    } else if (std.mem.eql(u8, cmd, "ls")) {
+        if (pos) |p| m.put(alloc, "path", .{ .string = p }) catch return 1;
+        handleLs(alloc, &m, out, explorer);
+        return finishCli(out, out_start);
+    } else if (std.mem.eql(u8, cmd, "file")) {
+        const query = pos orelse return cliUsage(alloc, out, "file <fuzzy-name>");
+        m.put(alloc, "query", .{ .string = query }) catch return 1;
+        handleFind(io, alloc, &m, out, explorer);
+        return finishCli(out, out_start);
+    } else if (std.mem.eql(u8, cmd, "context")) {
+        var task: std.ArrayList(u8) = .empty;
+        defer task.deinit(alloc);
+        var i = cmd_args_start;
+        while (i < args.len) : (i += 1) {
+            if (i > cmd_args_start) task.append(alloc, ' ') catch {};
+            task.appendSlice(alloc, args[i]) catch {};
+        }
+        if (task.items.len == 0) return cliUsage(alloc, out, "context <task...>");
+        m.put(alloc, "task", .{ .string = task.items }) catch return 1;
+        loadProjectWordIndexFromDiskIfPresent(io, explorer, root, alloc);
+        handleContext(io, alloc, &m, out, explorer, root);
+        return finishCli(out, out_start);
+    }
+    return null;
+}
+
+fn cliUsage(alloc: std.mem.Allocator, out: *std.ArrayList(u8), usage: []const u8) u8 {
+    out.appendSlice(alloc, "usage: codedb [root] ") catch {};
+    out.appendSlice(alloc, usage) catch {};
+    out.appendSlice(alloc, "\n") catch {};
+    return 1;
+}
+
+/// Exit code for a bridged handler: 1 if it appended an `error:`-prefixed
+/// message (the same failure marker MCP uses to set `isError` — see the
+/// `startsWith(out.items, "error:")` checks elsewhere in this file), else 0.
+/// Fixes #528 item 6, where bridged handlers printed `error: …` to stdout but
+/// `runCliTool` always reported success, so scripts couldn't detect failures.
+/// Zero-result paths (e.g. find's "no matches") use non-`error:` wording and
+/// therefore keep exit 0.
+pub fn finishCli(out: *std.ArrayList(u8), start: usize) u8 {
+    return if (std.mem.startsWith(u8, out.items[start..], "error:")) 1 else 0;
+}
+/// Parsed `deps` invocation. `max_depth` stays null unless `--max-depth N` was
+/// given so the handler keeps its own default for transitive walks.
+pub const DepsArgs = struct {
+    path: []const u8,
+    depends_on: bool = false,
+    transitive: bool = false,
+    max_depth: ?i64 = null,
+};
+
+pub const DepsArgError = error{ MissingPath, UnknownFlag, MissingMaxDepth, BadMaxDepth, ExtraArg };
+
+/// Parse `deps` args. Flags (`--depends-on`, `--transitive`, `--max-depth N`)
+/// may appear before or after the path, in any order; the first non-flag token
+/// is the path (so `deps --depends-on src/main.zig` no longer misreads the flag
+/// as the path). Unknown flags are rejected instead of silently ignored, and
+/// `--max-depth` must be a positive integer instead of coercing junk to 1.
+/// See issue #528 (items 2, 11).
+pub fn parseDepsArgs(args: []const []const u8, start: usize) DepsArgError!DepsArgs {
+    var result: DepsArgs = .{ .path = "" };
+    var path: ?[]const u8 = null;
+    var i = start;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--depends-on")) {
+            result.depends_on = true;
+        } else if (std.mem.eql(u8, a, "--transitive")) {
+            result.transitive = true;
+        } else if (std.mem.eql(u8, a, "--max-depth")) {
+            if (i + 1 >= args.len) return error.MissingMaxDepth;
+            i += 1;
+            const n = std.fmt.parseInt(i64, args[i], 10) catch return error.BadMaxDepth;
+            if (n < 1) return error.BadMaxDepth;
+            result.max_depth = n;
+        } else if (a.len > 1 and a[0] == '-' and a[1] == '-') {
+            return error.UnknownFlag;
+        } else if (path == null) {
+            path = a;
+        } else {
+            return error.ExtraArg;
+        }
+    }
+    result.path = path orelse return error.MissingPath;
+    return result;
+}
+
+fn cliDepsUsage(alloc: std.mem.Allocator, out: *std.ArrayList(u8), e: DepsArgError) u8 {
+    const msg = switch (e) {
+        error.MissingPath => "error: usage: codedb [root] deps <path> [--depends-on] [--transitive] [--max-depth N]",
+        error.UnknownFlag => "error: unknown flag for deps (valid: --depends-on, --transitive, --max-depth N)",
+        error.MissingMaxDepth, error.BadMaxDepth => "error: --max-depth requires a positive integer",
+        error.ExtraArg => "error: unexpected extra argument for deps",
+    };
+    out.appendSlice(alloc, msg) catch {};
+    out.appendSlice(alloc, "\n") catch {};
+    return 1;
 }
 
 const COMBO_WINDOW_MS: i64 = 5000; // 5 second window between query and file open
@@ -4606,15 +4996,17 @@ pub fn mcpGenerateGuidance(
     if (eql(tool_name, "codedb_tree")) {
         buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_outline path=<file> to inspect symbols" ++ MCP_RESET) catch {};
     } else if (eql(tool_name, "codedb_outline")) {
-        buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_symbol name=<fn> to read a function body" ++ MCP_RESET) catch {};
+        buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_symbol name=<fn> body=true for a symbol's full source in one call" ++ MCP_RESET) catch {};
     } else if (eql(tool_name, "codedb_symbol")) {
         // Bug 8: don't tell the agent to "edit this symbol" when the lookup
         // returned 0 results — there's nothing to edit. Hint at codedb_search
         // instead so they can broaden the lookup.
         if (std.mem.startsWith(u8, output, "no results for:")) {
             buf.appendSlice(alloc, MCP_DIM ++ "hint: try codedb_search query=<name> to find references — symbol not defined" ++ MCP_RESET) catch {};
+        } else if (getBool(args, "body")) {
+            buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_callers name=<fn> for call sites, then edit with your native tool" ++ MCP_RESET) catch {};
         } else {
-            buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_edit to modify this symbol" ++ MCP_RESET) catch {};
+            buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_symbol name=<fn> body=true to see the source" ++ MCP_RESET) catch {};
         }
     } else if (eql(tool_name, "codedb_search")) {
         const has_regex_meta = blk: {

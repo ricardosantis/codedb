@@ -11684,3 +11684,246 @@ test "issue-471b: codedb_find error message enumerates accepted aliases" {
     try testing.expect(std.mem.indexOf(u8, out.items, "path") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "pattern") != null);
 }
+
+test "cli-mcp-parity: runCliTool bridges navigation commands to MCP handlers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try exp.indexFile("src/store.zig", "pub const Store = struct {};\n");
+    try exp.indexFile("src/main.zig", "const Store = @import(\"store.zig\").Store;\npub fn main() void {}\n");
+
+    // glob: pattern -> matching indexed paths (reuses handleGlob)
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        const code = mcp_mod.runCliTool(io, aa, &exp, ".", "glob", &.{ "codedb", ".", "glob", "src/*.zig" }, 3, &out);
+        try testing.expectEqual(@as(?u8, 0), code);
+        try testing.expect(std.mem.indexOf(u8, out.items, "src/store.zig") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "src/main.zig") != null);
+    }
+
+    // symbol: name -> definition site (reuses handleSymbol)
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        const code = mcp_mod.runCliTool(io, aa, &exp, ".", "symbol", &.{ "codedb", ".", "symbol", "Store" }, 3, &out);
+        try testing.expectEqual(@as(?u8, 0), code);
+        try testing.expect(std.mem.indexOf(u8, out.items, "src/store.zig") != null);
+    }
+
+    // unknown command -> null so runQuery falls through to its own usage error
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        try testing.expectEqual(@as(?u8, null), mcp_mod.runCliTool(io, aa, &exp, ".", "bogus", &.{ "codedb", ".", "bogus" }, 3, &out));
+    }
+
+    // missing required arg -> usage line, exit 1
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        try testing.expectEqual(@as(?u8, 1), mcp_mod.runCliTool(io, aa, &exp, ".", "glob", &.{ "codedb", ".", "glob" }, 3, &out));
+        try testing.expect(std.mem.indexOf(u8, out.items, "usage") != null);
+    }
+}
+
+test "p0: writeSnapshot tolerates over-long symbol names (u16 length overflow)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    // An identifier longer than u16 max (65535) — minified/generated files produce
+    // these, and the old code paniced casting the length to u16 in writeSnapshot.
+    const long = try aa.alloc(u8, 70000);
+    @memset(long, 'a');
+    const content = try std.fmt.allocPrint(aa, "pub const {s} = 1;\n", .{long});
+    try exp.indexFile("src/min.zig", content);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = pb[0..try tmp.dir.realPathFile(io, ".", &pb)];
+    const snap = try std.fmt.allocPrint(testing.allocator, "{s}/min.codedb", .{dir});
+    defer testing.allocator.free(snap);
+
+    // Pre-fix: this paniced ("integer does not fit in destination type").
+    try snapshot_mod.writeSnapshot(io, &exp, dir, snap, testing.allocator);
+
+    // And the truncated record must round-trip back without crashing.
+    var exp2 = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer exp2.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    try testing.expect(snapshot_mod.loadSnapshot(io, snap, &exp2, &store, testing.allocator));
+    try testing.expectEqual(@as(usize, 1), exp2.outlines.count());
+}
+
+test "mmap word index: zero-copy load matches heap load and promotes on write" {
+    const alloc = testing.allocator;
+    var wi = WordIndex.init(alloc);
+    defer wi.deinit();
+    wi.skip_file_words = true;
+    try wi.indexFile("src/a.zig", "pub fn alphaToken() void { betaToken(); }\n");
+    try wi.indexFile("src/b.zig", "pub fn betaToken() void { alphaToken(); alphaToken(); }\n");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = pb[0..try tmp.dir.realPathFile(io, ".", &pb)];
+    try wi.writeToDisk(io, dir, null);
+
+    var heap = WordIndex.readFromDisk(io, dir, alloc).?;
+    defer heap.deinit();
+    var mm = WordIndex.mmapFromDisk(io, dir, alloc).?;
+    defer mm.deinit(); // picks the right path (mmap, or heap after promote)
+    try testing.expect(mm.mmap_data != null);
+
+    // search parity (exact)
+    try testing.expectEqual(heap.search("alphaToken").len, mm.search("alphaToken").len);
+    try testing.expect(mm.search("alphaToken").len >= 1);
+
+    // searchDeduped parity + hitPath resolves through the mmap file table
+    {
+        const h = try mm.searchDeduped("betaToken", alloc);
+        defer alloc.free(h);
+        const r = try heap.searchDeduped("betaToken", alloc);
+        defer alloc.free(r);
+        try testing.expectEqual(r.len, h.len);
+        try testing.expect(h.len >= 1);
+        try testing.expectEqualStrings(heap.hitPath(r[0]), mm.hitPath(h[0]));
+    }
+
+    // searchPrefix parity (sorted-range walk vs linear scan)
+    {
+        const h = try mm.searchPrefix("alpha", alloc, 10);
+        defer alloc.free(h);
+        const r = try heap.searchPrefix("alpha", alloc, 10);
+        defer alloc.free(r);
+        try testing.expectEqual(r.len, h.len);
+    }
+
+    // BM25 helpers parity
+    try testing.expectEqual(heap.rankedDocCount(), mm.rankedDocCount());
+    try testing.expectEqual(heap.total_tokens, mm.total_tokens);
+    try testing.expectEqual(heap.docLength(0), mm.docLength(0));
+    try testing.expectEqual(heap.docLength(1), mm.docLength(1));
+
+    // Promote on write: a mutation materializes a heap index, then stays queryable.
+    try mm.indexFile("src/c.zig", "pub fn gammaToken() void {}\n");
+    try testing.expect(mm.mmap_data == null);
+    try testing.expectEqual(@as(usize, 1), (try mm.searchDeduped("gammaToken", alloc)).len);
+    try testing.expect(mm.search("alphaToken").len >= 1); // pre-promote postings survived
+}
+
+test "fuzzy SIMD batch scorer matches scalar fuzzyScore exactly" {
+    // fuzzyFindFiles routes single-part queries through the SIMD-across-files
+    // scorer (fuzzyScoreBatch); it must produce results identical to the scalar
+    // fuzzyScore. All DP values are sums of exactly-representable small integers,
+    // so the comparison is bit-exact. FZL must equal explore.FZ_LANES.
+    const FZL = 8;
+    const paths = [_][]const u8{
+        "src/main.zig",
+        "extensions/codex/provider.ts",
+        "README.md",
+        "src/agents/getTokenProvider.test.ts",
+        "lib/auth/token.go",
+        "a",
+        "src/index.ts",
+        "very/deep/nested/path/to/some/TokenProvider.tsx",
+        "Provider.tsx",
+        "tokenprovider.js",
+        "ui/src/components/handle-request.tsx",
+        "x",
+        "config/settings.yaml",
+        "GETtokenPROVIDER",
+        "no_zzz_qqq.bin",
+        "pi/embedded/subscribe-session.ts",
+    };
+    const queries = [_][]const u8{
+        "getTokenProvider", "TokenProvider", "handleRequest", "token",
+        "provider.ts",      "x",             "main",          "session",
+        "PROVIDER",         "abcxyz",        "index",         "subscribe",
+    };
+
+    // Per-path: scalar fuzzyScore vs a single-element SIMD batch (mirrors the
+    // guards + presence prefilter fuzzyFindFiles applies before batching).
+    for (queries) |q| {
+        for (paths) |p| {
+            const expected = explore.fuzzyScore(q, p);
+            var got: ?f32 = null;
+            if (p.len != 0 and p.len <= 512 and q.len <= 128 and !explore.fuzzyPresenceReject(q, p)) {
+                var best: [FZL]f32 = undefined;
+                var matched: [FZL]u32 = undefined;
+                const one = [_][]const u8{p};
+                explore.fuzzyScoreBatch(q, &one, &best, &matched);
+                got = explore.fuzzyFinalize(q, p, best[0], matched[0]);
+            }
+            if (expected) |e| {
+                try testing.expect(got != null);
+                try testing.expectEqual(e, got.?);
+            } else {
+                try testing.expect(got == null);
+            }
+        }
+    }
+
+    // Full FZ_LANES-wide batch (all lanes active, mixed path lengths) exercises
+    // the per-lane length masking — every lane must still match scalar.
+    {
+        const q = "provider";
+        const batch = paths[0..FZL];
+        var best: [FZL]f32 = undefined;
+        var matched: [FZL]u32 = undefined;
+        explore.fuzzyScoreBatch(q, batch, &best, &matched);
+        for (batch, 0..) |p, l| {
+            const expected = explore.fuzzyScore(q, p);
+            const got: ?f32 = if (explore.fuzzyPresenceReject(q, p)) null else explore.fuzzyFinalize(q, p, best[l], matched[l]);
+            if (expected) |e| {
+                try testing.expect(got != null);
+                try testing.expectEqual(e, got.?);
+            } else {
+                try testing.expect(got == null);
+            }
+        }
+    }
+}
+
+test "find: symbol fast-path classifier + lookup" {
+    const mcp = @import("mcp.zig");
+    // Classifier: compound identifiers (camelCase / snake_case) route to symbols;
+    // filenames, single words, ALL-CAPS, and multi-part queries do not.
+    try testing.expect(mcp.looksLikeCompoundIdentifier("getTokenProvider"));
+    try testing.expect(mcp.looksLikeCompoundIdentifier("TokenProvider"));
+    try testing.expect(mcp.looksLikeCompoundIdentifier("handle_request"));
+    try testing.expect(mcp.looksLikeCompoundIdentifier("abortChatRunById"));
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("auth")); // single lowercase word
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("config"));
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("README")); // ALL-CAPS
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("provider.ts")); // dot -> filename
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("src/main")); // path separator
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("auth provider")); // space -> multi-part
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("abc")); // too short
+
+    // renderSymbolDefsFast resolves a real symbol to its definition (def kinds
+    // ranked above import usages), and returns false WITHOUT writing for a miss.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try explorer.indexFile("src/auth.zig", "pub fn getTokenProvider() void {}\n");
+    try explorer.indexFile("src/use.zig", "const getTokenProvider = @import(\"auth.zig\").getTokenProvider;\n");
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try testing.expect(explorer.renderSymbolDefsFast("getTokenProvider", alloc, &out, 10));
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/auth.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "(function)") != null);
+
+    var miss: std.ArrayList(u8) = .empty;
+    defer miss.deinit(alloc);
+    try testing.expect(!explorer.renderSymbolDefsFast("nonexistentSymbolXyz", alloc, &miss, 10));
+    try testing.expectEqual(@as(usize, 0), miss.items.len);
+}
