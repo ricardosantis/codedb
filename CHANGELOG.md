@@ -1,6 +1,44 @@
 # Changelog
 
 
+## 0.2.5825 - 2026-06-07
+
+`0.2.5825` fixes a class of **post-snapshot-load search and recall gaps** found
+by engram's `codedb-report` (#537, #539), restores **call-graph edges into
+snapshot-restored files** (#537b), and adds an **opt-in for indexing temp roots**
+so SWE-bench / CI harnesses can index `/tmp` checkouts (#538).
+
+### Search recall after a snapshot load (#537, #539)
+
+- **Restored files are searchable again.** After a fast snapshot load a restored
+  file was registered in neither `trigram_index` nor `skip_trigram_files`, so
+  `codedb_search` omitted it entirely once the trigram index was non-empty (the
+  Tier 5 full scan is then ruled out). `insertRestoredFile` now registers restored
+  files in `skip_trigram_files`, mirroring the outline-only path (#507).
+- **`searchContent` blends the complete word index into recall.** It rebuilds the
+  lazily-loaded word index on first use (like `searchWord`), so Tier 0 ranks every
+  file the inverted index knows about — a relevant restored file competes on
+  relevance instead of being crowded out of `max_results` by hot files.
+
+### Call graph into restored files (#537b)
+
+- **`resolveCallees` no longer drops edges into restored files.** `insertRestoredFile`
+  now rebuilds `symbol_index` for restored files (it is built eagerly on every
+  commit and has no lazy fallback), so `codedb_callers` and call-path resolution
+  see edges into snapshot-restored files after a load.
+
+### Opt-in temp-root indexing (#538)
+
+- **`CODEDB_ALLOW_TEMP=1` env or `--allow-temp` flag** allow indexing roots under
+  `/tmp` and `/private/tmp`. The footgun guard stays the default; the opt-in
+  unblocks SWE-bench-Lite / CI retrieval harnesses that clone throwaway checkouts
+  into temp dirs. System dirs (`/usr`, `/etc`, …) and the home-directory guard are
+  unchanged.
+
+<!-- TODO before publishing 0.2.5825: this cut also carries in-progress work that
+was already in the working tree — the codedb_callpath / call-graph path-query
+feature (#531) and #528 CLI-arity hardening. Document those here before tagging. -->
+
 ## 0.2.5824 - 2026-06-05
 
 `0.2.5824` adds a deterministic, no-LLM **code-graph** layer. codedb now builds a
