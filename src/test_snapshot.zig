@@ -1115,3 +1115,60 @@ test "issue-537b: snapshot-restored files resolve call edges (symbol_index diver
     try testing.expect(callees.len >= 1);
     try testing.expect(std.mem.eql(u8, callees[0].name, "uniqueCalleeXyz"));
 }
+
+test "issue-539: search recall includes snapshot-restored files (parity with word index)" {
+    // #539: codedb_search returned a tiny candidate set and omitted files the
+    // word index clearly contained ("2 results" vs "2658 word hits"). Same root
+    // cause as #537 — restored files were in no search tier. This asserts the
+    // RECALL fix: a term living only in RESTORED files is surfaced by
+    // searchContent (via Tier 3), matching searchWord's recall. searchContent is
+    // called BEFORE searchWord so the word index is still empty — isolating the
+    // skip_trigram_files (Tier 3) path rather than a rebuilt Tier 0.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    // Paths absent from the temp dir => restored on load (not re-indexed).
+    try exp.indexFile("recall539/alpha.zig", "pub fn a() void {\n    const payload539 = 1;\n    _ = payload539;\n}\n");
+    try exp.indexFile("recall539/beta.zig", "pub fn b() void {\n    const payload539 = 2;\n    _ = payload539;\n}\n");
+    try exp.indexFile("recall539/gamma.zig", "pub fn c() void {\n    const payload539 = 3;\n    _ = payload539;\n}\n");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/recall.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const aa2 = arena2.allocator();
+    var exp2 = Explorer.init(aa2, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const loaded = snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, aa2);
+    try testing.expect(loaded);
+
+    // Trigram non-empty (a hot file WITHOUT the term) so Tier 5 is ruled out —
+    // recall must come from Tier 3 scanning the restored files.
+    try exp2.indexFile("recall539/hot.zig", "pub fn hot() void {}\n");
+
+    // search must surface a restored file (was 0 results pre-fix).
+    const sres = try exp2.searchContent("payload539", aa2, 20);
+    try testing.expect(sres.len >= 1);
+    var found_restored = false;
+    for (sres) |r| {
+        if (std.mem.startsWith(u8, r.path, "recall539/") and !std.mem.eql(u8, r.path, "recall539/hot.zig")) {
+            found_restored = true;
+        }
+    }
+    try testing.expect(found_restored);
+
+    // Parity check: the word index (rebuilt lazily by searchWord) finds it too.
+    const whits = try exp2.searchWord("payload539", aa2);
+    try testing.expect(whits.len >= 1);
+}
