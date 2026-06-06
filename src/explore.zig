@@ -2272,6 +2272,20 @@ pub const Explorer = struct {
     }
 
     pub fn searchContent(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
+        // #539: ensure the word index — Tier 0's recall source — is populated.
+        // After a snapshot fast-load it is built lazily (see issue-220); without
+        // this, searchContent's recall collapses to the trigram/skip_trigram tiers
+        // and a relevant restored file can be crowded out of max_results by
+        // less-relevant hot files. Rebuild here so the complete inverted index
+        // feeds Tier 0's ranked candidate set (mirrors searchWord). Runs at most
+        // once per load — rebuildWordIndex sets word_index_complete = true. Must
+        // precede the shared lock below: rebuildWordIndex takes the exclusive lock.
+        if (max_results > 0 and !self.word_index_complete) {
+            self.mu.lockShared();
+            const needs_rebuild = self.contents.len() > 0 or (self.io != null and self.root_dir != null);
+            self.mu.unlockShared();
+            if (needs_rebuild) try self.rebuildWordIndex();
+        }
         self.mu.lockShared();
         defer self.mu.unlockShared();
 

@@ -1172,3 +1172,57 @@ test "issue-539: search recall includes snapshot-restored files (parity with wor
     const whits = try exp2.searchWord("payload539", aa2);
     try testing.expect(whits.len >= 1);
 }
+
+test "issue-539b: search recall ranks a relevant restored file above quota (index-blending)" {
+    // #539 quota residual: even with restored files Tier-3-searchable, a MORE
+    // relevant cold file was crowded out of a small max_results by less-relevant
+    // hot files — because searchContent never populated the (complete) word index
+    // that Tier 0 ranks from after a fast load. Fix: searchContent rebuilds the
+    // lazy word index (like searchWord), so the canonical file competes on
+    // relevance and isn't lost to tier-ordering.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    // COLD canonical file (restored): term appears 3x => most relevant.
+    try exp.indexFile("recallpkg/canonical.zig",
+        \\pub fn canonical() void {
+        \\    const x1 = recallterm539;
+        \\    const x2 = recallterm539;
+        \\    const x3 = recallterm539;
+        \\    _ = .{ x1, x2, x3 };
+        \\}
+        \\
+    );
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/recallq.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const aa2 = arena2.allocator();
+    var exp2 = Explorer.init(aa2, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    _ = snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, aa2);
+
+    // HOT files (trigram) with the term ONCE each — quota pressure at max_results=2.
+    try exp2.indexFile("h_a.zig", "pub fn a() void { const y = recallterm539; _ = y; }\n");
+    try exp2.indexFile("h_b.zig", "pub fn b() void { const y = recallterm539; _ = y; }\n");
+    try exp2.indexFile("h_c.zig", "pub fn c() void { const y = recallterm539; _ = y; }\n");
+
+    // The most-relevant (cold, 3 hits) file must make a 2-slot result set.
+    const res = try exp2.searchContent("recallterm539", aa2, 2);
+    var found_canonical = false;
+    for (res) |r| if (std.mem.eql(u8, r.path, "recallpkg/canonical.zig")) {
+        found_canonical = true;
+    };
+    try testing.expect(found_canonical);
+}
