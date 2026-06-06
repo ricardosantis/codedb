@@ -445,7 +445,12 @@ test "issue-537: snapshot-restored files stay searchable when trigram index is n
     // out — the condition under which restored files vanish from search.
     try exp2.indexFile("hot_pkg/active.zig", "pub fn activeFn() void {}\n");
 
-    const results = try exp2.searchContent("FRESHNESS_PARALLEL_THRESHOLD_UNIQUE", aa2, 10);
+    // Query a MID-TOKEN substring ("RESHNESS" inside FRESHNESS_…): the word index
+    // (Tier 0, rebuilt by the #539 fix) matches only whole tokens, so this can be
+    // surfaced ONLY by the Tier 3 skip_trigram content scan — isolating the #537
+    // fix. Without the skip_trigram_files registration the restored file is in no
+    // tier and this returns nothing.
+    const results = try exp2.searchContent("RESHNESS", aa2, 10);
     try testing.expect(results.len >= 1);
     try testing.expect(std.mem.eql(u8, results[0].path, "cold_pkg/buried.zig"));
 }
@@ -1121,9 +1126,9 @@ test "issue-539: search recall includes snapshot-restored files (parity with wor
     // word index clearly contained ("2 results" vs "2658 word hits"). Same root
     // cause as #537 — restored files were in no search tier. This asserts the
     // RECALL fix: a term living only in RESTORED files is surfaced by
-    // searchContent (via Tier 3), matching searchWord's recall. searchContent is
-    // called BEFORE searchWord so the word index is still empty — isolating the
-    // skip_trigram_files (Tier 3) path rather than a rebuilt Tier 0.
+    // searchContent, which now rebuilds the complete word index (the #539 fix) and
+    // finds them via Tier 0 — matching searchWord's recall. (Tier-3 substring
+    // recall for restored files is covered separately by issue-537.)
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const aa = arena.allocator();

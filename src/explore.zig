@@ -2280,9 +2280,10 @@ pub const Explorer = struct {
         // feeds Tier 0's ranked candidate set (mirrors searchWord). Runs at most
         // once per load — rebuildWordIndex sets word_index_complete = true. Must
         // precede the shared lock below: rebuildWordIndex takes the exclusive lock.
-        if (max_results > 0 and !self.word_index_complete) {
+        if (max_results > 0) {
             self.mu.lockShared();
-            const needs_rebuild = self.contents.len() > 0 or (self.io != null and self.root_dir != null);
+            const needs_rebuild = !self.word_index_complete and
+                (self.contents.len() > 0 or (self.io != null and self.root_dir != null));
             self.mu.unlockShared();
             if (needs_rebuild) try self.rebuildWordIndex();
         }
