@@ -149,6 +149,27 @@ test "issue-2: interned dependency keys are reused, not re-allocated per reindex
     try testing.expect(a.ptr != c.ptr);
 }
 
+test "issue-548: a string containing 'import ' is not captured as a dependency" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    // A plain const whose string value merely contains "import " — it is NOT an
+    // import statement, so it must not produce a dependency edge.
+    try explorer.indexFile("src/msg.ts", "export const ERROR = 'failed to import the config module';");
+    var outline = (try explorer.getOutline("src/msg.ts", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+    for (outline.imports.items) |imp| {
+        try testing.expect(!std.mem.eql(u8, imp, "failed to import the config module"));
+    }
+
+    // Regression guard: a real single-line import is still captured.
+    try explorer.indexFile("src/dep.ts", "import { real } from './real-dep.ts';");
+    var outline2 = (try explorer.getOutline("src/dep.ts", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline2.deinit();
+    try expectOutlineImport(&outline2, "./real-dep.ts");
+}
+
 test "issue-301: Dart / Flutter parser" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
