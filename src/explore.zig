@@ -3929,7 +3929,7 @@ pub const Explorer = struct {
                 try appendOutlineSymbol(a, outline, name, kind, line_num, line);
             }
         }
-        if (containsAny(line, &.{ "import ", "require(" })) {
+        if (startsWith(line, "import ") or containsAny(line, &.{ "require(" })) {
             try appendOutlineSymbol(a, outline, line, .import, line_num, null);
             if (extractStringLiteral(line)) |path| {
                 try appendImportPath(a, outline, path);
