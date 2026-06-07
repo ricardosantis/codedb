@@ -1168,6 +1168,14 @@ fn mainImpl() !void {
                 // all content per query. Matches the serve/mcp daemon.
                 loadTrigramFromDiskIfPresent(io, &explorer, data_dir, allocator);
             }
+            if (std.mem.eql(u8, cmd, "search")) {
+                // #547: searchContent's Tier 0 recall is the word inverted index,
+                // not the trigram. Without it, `search` is blind to identifier
+                // terms that `word` surfaces (long / low-frequency names). Cheap
+                // mmap load, mirroring the trigram load above; `word`/`mcp`
+                // already load it, `search` did not.
+                loadWordIndexFromDiskIfPresent(io, &explorer, data_dir, git_head, allocator);
+            }
             if (std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "bench-engine") or std.mem.eql(u8, cmd, "cli-daemon")) {
                 loadWordIndexFromDiskIfPresent(io, &explorer, data_dir, git_head, allocator);
                 // word/bench-engine want a guaranteed-ready index — rebuild + persist
