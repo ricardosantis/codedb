@@ -2261,6 +2261,44 @@ test "disk index: readDiskHeader returns file_count and git_head" {
     try testing.expectEqualSlices(u8, &fake_head, &hdr.?.git_head.?);
 }
 
+test "issue-553: status reads file_count from disk header without loading the index" {
+    // #553: `codedb status` must report from on-disk metadata and exit — never
+    // materialize the full index, or a backgrounded `status &` leaks a multi-GB
+    // resident orphan. readStatusMeta is that cheap path: it reads ONLY the
+    // trigram header (no Explorer, no snapshot load, no re-index).
+    const readStatusMeta = @import("index.zig").readStatusMeta;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+
+    // No persisted index -> "not indexed", no load, no crash (so `status` on an
+    // unindexed repo reports state instead of triggering a full re-index).
+    {
+        const meta = readStatusMeta(io, dir_path, alloc);
+        try testing.expect(!meta.indexed);
+        try testing.expectEqual(@as(u32, 0), meta.file_count);
+        try testing.expect(meta.git_head == null);
+    }
+
+    // Persist a 2-file index; status reports the count straight from the header.
+    var ti = TrigramIndex.init(alloc);
+    defer ti.deinit();
+    try ti.indexFile("a.zig", "pub const A = 1;");
+    try ti.indexFile("b.zig", "pub const B = 2;");
+    const fake_head = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".*;
+    try ti.writeToDisk(io, dir_path, fake_head);
+
+    const meta = readStatusMeta(io, dir_path, alloc);
+    try testing.expect(meta.indexed);
+    try testing.expectEqual(@as(u32, 2), meta.file_count);
+    try testing.expect(meta.git_head != null);
+    try testing.expectEqualSlices(u8, &fake_head, &meta.git_head.?);
+}
+
 
 test "disk index: v1 format (no git_head) still loads and readGitHead returns null" {
     const alloc = testing.allocator;

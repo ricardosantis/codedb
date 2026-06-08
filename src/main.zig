@@ -1081,6 +1081,44 @@ fn mainImpl() !void {
         out.exitWithFlush(1);
     }
 
+    // #553: `status` must be a cheap, fast-exiting metadata query. It previously
+    // fell through to the full index bootstrap below (snapshot mmap, or — with no
+    // snapshot — a complete re-index + multi-GB snapshot rewrite) and, being in
+    // cliIsQueryCmd, also auto-spawned a warm cli-daemon. Backgrounded as a
+    // SessionStart warmup (`codedb . status &`), each call left a multi-GB
+    // resident orphan that stacked until the machine OOM'd. Report from on-disk
+    // metadata only — no Explorer load, no daemon spawn — and exit immediately.
+    if (std.mem.eql(u8, cmd, "status")) {
+        const t0 = cio.nanoTimestamp();
+        const data_dir = getDataDir(io, allocator, abs_root) catch {
+            out.p("{s}\xe2\x9c\x97{s} cannot resolve data dir for {s}{s}{s}\n", .{
+                s.red, s.reset, s.bold, abs_root, s.reset,
+            });
+            out.exitWithFlush(1);
+        };
+        defer allocator.free(data_dir);
+        const meta = index_mod.readStatusMeta(io, data_dir, allocator);
+        const elapsed = cio.nanoTimestamp() - t0;
+        var dur_buf: [64]u8 = undefined;
+        out.p("{s}\xe2\x9c\x93{s} {s}codedb {s}{s}  {s}{s}{s}\n", .{
+            s.green,                               s.reset,
+            s.bold,                                release_info.semver,
+            s.reset,                               sty.durationColor(s, elapsed),
+            sty.formatDuration(&dur_buf, elapsed), s.reset,
+        });
+        out.p("  {s}root{s}      {s}{s}{s}\n", .{ s.dim, s.reset, s.cyan, root, s.reset });
+        if (meta.indexed) {
+            out.p("  {s}files{s}     {s}{d}{s} indexed\n", .{ s.dim, s.reset, s.bold, meta.file_count, s.reset });
+            if (meta.git_head) |h| {
+                out.p("  {s}head{s}      {s}{s}{s}\n", .{ s.dim, s.reset, s.cyan, h[0..12], s.reset });
+            }
+        } else {
+            out.p("  {s}files{s}     {s}not indexed{s}  \xe2\x80\x94 run `codedb {s} index`\n", .{ s.dim, s.reset, s.bold, s.reset, root });
+        }
+        out.p("  {s}data{s}      {s}{s}{s}\n", .{ s.dim, s.reset, s.dim, data_dir, s.reset });
+        out.exitWithFlush(0);
+    }
+
     // Thin-client fast path: if a warm daemon (codedb <root> serve / mcp) is
     // already listening for this project, proxy read-only query commands to it
     // and skip the per-invocation snapshot reload entirely. Falls through to
