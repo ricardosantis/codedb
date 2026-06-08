@@ -290,7 +290,7 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
                 return 1;
             }
         else
-            explorer.searchContent(query, allocator, sa.max_results) catch return 1;
+            explorer.searchContentAuto(query, allocator, sa.max_results) catch return 1;
         defer {
             for (results) |r| {
                 allocator.free(r.path);

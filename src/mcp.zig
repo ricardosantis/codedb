@@ -1782,20 +1782,16 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             if (rendered) return;
         }
 
-        // Multi-word queries express natural-language / conceptual intent —
-        // rank them by BM25 (relevance) instead of raw substring order, which
-        // returns nothing for a phrase. Single-token queries keep literal
-        // substring matching so exact-identifier lookups still work.
-        const multiword = std.mem.indexOfScalar(u8, query, ' ') != null;
+        // Query-shape-aware routing lives in Explorer.searchContentAuto so the CLI
+        // (`runQuery`) and this MCP handler rank identically (#546): a multi-word
+        // query goes to BM25 + centrality, a single token keeps literal substring
+        // matching so exact-identifier lookups still work.
         // Over-fetch by `offset` (+1) so we can page into a stable window and
-        // detect whether more results exist beyond this page. BM25 ranking is
+        // detect whether more results exist beyond this page. Ranking is
         // deterministic per query, so the offset is a stable, stateless cursor.
         const want_count = @min(offset_n + max_results + 1, 100000);
         var fetch_count = want_count;
-        var fetched = (if (multiword)
-            explorer.searchContentRanked(query, alloc, fetch_count)
-        else
-            explorer.searchContent(query, alloc, fetch_count)) catch {
+        var fetched = explorer.searchContentAuto(query, alloc, fetch_count) catch {
             out.appendSlice(alloc, "error: search failed") catch {};
             return;
         };
@@ -1818,10 +1814,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
                     alloc.free(r.path);
                 }
                 alloc.free(fetched);
-                fetched = (if (multiword)
-                    explorer.searchContentRanked(query, alloc, fetch_count)
-                else
-                    explorer.searchContent(query, alloc, fetch_count)) catch {
+                fetched = explorer.searchContentAuto(query, alloc, fetch_count) catch {
                     out.appendSlice(alloc, "error: search failed") catch {};
                     return;
                 };

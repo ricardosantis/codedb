@@ -556,6 +556,103 @@ test "issue-400: BM25 ranks both-terms file above single-term files" {
 }
 
 
+test "issue-546: searchContentAuto applies the ranker to multi-word queries (CLI parity with MCP)" {
+    // #546: `codedb search` runs through runQuery (shared by the cold CLI path and
+    // the warm cli-daemon), which always called the UNRANKED searchContent — so
+    // multi-word/conceptual CLI queries came back in recall order, never the
+    // BM25+centrality order the MCP `search` handler already used. searchContentAuto
+    // is the single query-shape-aware entry point both call, so they rank identically:
+    // a multi-word query routes to searchContentRanked. (Single tokens keep literal
+    // substring matching for exact-identifier lookups — covered elsewhere.)
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    // both.zig covers BOTH query terms; the single-term files are denser lexical
+    // hits for one term but less relevant to the two-term query.
+    try explorer.indexFile("both.zig",
+        \\pub fn parseToken() void {
+        \\    parseToken();
+        \\    parseToken();
+        \\}
+    );
+    try explorer.indexFile("only_parse.zig",
+        \\pub fn parseFoo() void {
+        \\    parse();
+        \\    parse();
+        \\    parse();
+        \\}
+    );
+    try explorer.indexFile("only_token.zig",
+        \\pub fn tokenStream() void {
+        \\    token();
+        \\    token();
+        \\}
+    );
+
+    // Multi-word query: searchContentAuto must route to the ranker, so the
+    // both-terms file ranks first and carries a positive BM25 score (the unranked
+    // recall path neither guarantees this order nor populates a score).
+    const results = try explorer.searchContentAuto("parse Token", testing.allocator, 8);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.line_text);
+            testing.allocator.free(r.path);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expect(results.len > 0);
+    try testing.expectEqualStrings("both.zig", results[0].path);
+    try testing.expect(results[0].score > 0.0);
+}
+
+test "issue-546: searchContentRanked rebuilds an incomplete (snapshot-loaded) word index" {
+    // #546 root cause: a mmap/disk-loaded word index is recall-ready but not
+    // BM25-ready (word_index_complete = false; empty id_to_path / ranked-doc table).
+    // searchContent and searchWord lazily rebuild in that state, but
+    // searchContentRanked did not — so multi-word ranked search returned NOTHING on
+    // a cold CLI / freshly-loaded snapshot even though `word` found hits. This pins
+    // the lazy rebuild: markWordIndexIncomplete simulates the post-load state (file
+    // contents remain), and ranked search must rebuild and return results instead of
+    // collapsing to an empty set.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("both.zig",
+        \\pub fn parseToken() void {
+        \\    parseToken();
+        \\    parseToken();
+        \\}
+    );
+    try explorer.indexFile("only_parse.zig",
+        \\pub fn parseFoo() void {
+        \\    parse();
+        \\}
+    );
+    try explorer.indexFile("only_token.zig",
+        \\pub fn tokenStream() void {
+        \\    token();
+        \\}
+    );
+
+    // Drop the in-memory word index to its post-snapshot-load state: not complete,
+    // contents still present. Without the lazy rebuild, searchContentRanked sees
+    // N == 0 and returns nothing.
+    explorer.markWordIndexIncomplete(false);
+
+    const results = try explorer.searchContentRanked("parse Token", testing.allocator, 8);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.line_text);
+            testing.allocator.free(r.path);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expect(results.len > 0);
+    try testing.expectEqualStrings("both.zig", results[0].path);
+}
+
 test "issue-400-bug1: searchContentRanked returns ranked results when skip_file_words=true" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();

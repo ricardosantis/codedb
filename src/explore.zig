@@ -3210,6 +3210,20 @@ pub const Explorer = struct {
     }
 
     pub fn searchContentRanked(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
+        // #546: BM25 reads the word index's id_to_path + ranked-doc table, which a
+        // mmap/disk-loaded index lacks until rebuilt (word_index_complete = false).
+        // The recall readers (searchContent, searchWord, renderWord) already trigger
+        // this lazy rebuild; searchContentRanked did not — so ranked search returned
+        // nothing on a cold CLI / freshly-loaded snapshot (the index served `word`,
+        // but here N collapsed to 0). Rebuild before the shared lock, matching the
+        // siblings — rebuildWordIndex takes the exclusive lock.
+        if (max_results > 0) {
+            self.mu.lockShared();
+            const needs_rebuild = !self.word_index_complete and
+                (self.contents.len() > 0 or (self.io != null and self.root_dir != null));
+            self.mu.unlockShared();
+            if (needs_rebuild) try self.rebuildWordIndex();
+        }
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
@@ -3408,6 +3422,21 @@ pub const Explorer = struct {
         }
 
         return result_list.toOwnedSlice(allocator);
+    }
+
+    /// Query-shape-aware search shared by the CLI (`runQuery`, used by both the
+    /// cold path and the warm cli-daemon) and the MCP `search` handler so the two
+    /// rank identically. A multi-word query expresses conceptual/NL intent and
+    /// routes to BM25 + centrality (`searchContentRanked`); a single token keeps
+    /// literal substring matching (`searchContent`) so exact-identifier lookups
+    /// still work. #546: the CLI path previously always called the unranked
+    /// `searchContent`, so multi-word CLI/daemon searches never reached the ranker.
+    pub fn searchContentAuto(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
+        const multiword = std.mem.indexOfScalar(u8, query, ' ') != null;
+        return if (multiword)
+            self.searchContentRanked(query, allocator, max_results)
+        else
+            self.searchContent(query, allocator, max_results);
     }
 
     /// Search file contents using a regex pattern with trigram acceleration.
