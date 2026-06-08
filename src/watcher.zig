@@ -178,9 +178,7 @@ fn shouldSkip(path: []const u8) bool {
 }
 
 fn shouldSkipDir(name: []const u8) bool {
-    for (skip_dirs) |skip| {
-        if (std.mem.eql(u8, name, skip)) return true;
-    }
+    for (skip_dirs) |skip| if (std.mem.eql(u8, name, skip)) return true;
     return false;
 }
 

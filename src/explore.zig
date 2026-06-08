@@ -2253,9 +2253,7 @@ pub const Explorer = struct {
             "push",        "find",     "add",      "new",       "build",
             "run",         "deinit",   "toString", "valueOf",   "of",
         };
-        for (common) |c| {
-            if (std.mem.eql(u8, name, c)) return true;
-        }
+        for (common) |c| if (std.mem.eql(u8, name, c)) return true;
         return false;
     }
 
@@ -5642,17 +5640,13 @@ fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 
 fn pathHasSegment(path: []const u8, segment: []const u8) bool {
     var iter = std.mem.tokenizeAny(u8, path, "/\\");
-    while (iter.next()) |seg| {
-        if (std.mem.eql(u8, seg, segment)) return true;
-    }
+    while (iter.next()) |seg| if (std.mem.eql(u8, seg, segment)) return true;
     return false;
 }
 
 fn pathHasSegmentIgnoreCase(path: []const u8, segment: []const u8) bool {
     var iter = std.mem.tokenizeAny(u8, path, "/\\");
-    while (iter.next()) |seg| {
-        if (asciiEqlIgnoreCase(seg, segment)) return true;
-    }
+    while (iter.next()) |seg| if (asciiEqlIgnoreCase(seg, segment)) return true;
     return false;
 }
 fn startsWith(haystack: []const u8, needle: []const u8) bool {
@@ -5833,9 +5827,7 @@ fn extractJvmMethodName(line: []const u8) ?[]const u8 {
 
 fn isControlKeyword(name: []const u8) bool {
     const keywords = [_][]const u8{ "if", "for", "while", "switch", "catch", "return", "throw", "new", "when" };
-    for (keywords) |kw| {
-        if (std.mem.eql(u8, name, kw)) return true;
-    }
+    for (keywords) |kw| if (std.mem.eql(u8, name, kw)) return true;
     return false;
 }
 
@@ -6230,9 +6222,7 @@ fn isCKeyword(s: []const u8) bool {
         "typedef",  "static",   "extern", "inline", "const",    "volatile",
         "register", "restrict", "auto",   "break",  "continue",
     };
-    for (keywords) |kw| {
-        if (std.mem.eql(u8, s, kw)) return true;
-    }
+    for (keywords) |kw| if (std.mem.eql(u8, s, kw)) return true;
     return false;
 }
 
@@ -6417,9 +6407,7 @@ fn resolveDartImport(raw: []const u8, file_path: []const u8, allocator: std.mem.
 }
 
 fn containsAny(s: []const u8, needles: []const []const u8) bool {
-    for (needles) |needle| {
-        if (std.mem.indexOf(u8, s, needle) != null) return true;
-    }
+    for (needles) |needle| if (std.mem.indexOf(u8, s, needle) != null) return true;
     return false;
 }
 
@@ -6484,9 +6472,7 @@ fn isSpecialEntryPoint(filename: []const u8) bool {
         "Makefile",     "build.zig",   "Cargo.toml",
         "package.json",
     };
-    for (specials) |s| {
-        if (std.mem.eql(u8, filename, s)) return true;
-    }
+    for (specials) |s| if (std.mem.eql(u8, filename, s)) return true;
     return false;
 }
 

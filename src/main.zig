@@ -678,9 +678,7 @@ fn cliWriteFull(fd: c_int, data: []const u8) bool {
 /// only by the cold path.
 fn cliIsQueryCmd(cmd: []const u8) bool {
     const cmds = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "status", "symbol", "callers", "callpath", "deps", "glob", "ls", "file", "context", "changes" };
-    for (cmds) |c| {
-        if (std.mem.eql(u8, cmd, c)) return true;
-    }
+    for (cmds) |c| if (std.mem.eql(u8, cmd, c)) return true;
     return false;
 }
 
@@ -1948,9 +1946,7 @@ pub fn isValidMcpFlag(arg: []const u8) bool {
 
 fn isCommand(arg: []const u8) bool {
     const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "status", "symbol", "callers", "callpath", "deps", "glob", "ls", "file", "context", "changes", "snapshot", "serve", "mcp", "update", "nuke", "cli-daemon" };
-    for (commands) |c| {
-        if (std.mem.eql(u8, arg, c)) return true;
-    }
+    for (commands) |c| if (std.mem.eql(u8, arg, c)) return true;
     return false;
 }
 

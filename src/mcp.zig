@@ -3397,9 +3397,7 @@ fn isRemoteRepoChar(c: u8) bool {
 fn isRemoteRepoPart(part: []const u8) bool {
     if (part.len == 0) return false;
     if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
-    for (part) |c| {
-        if (!isRemoteRepoChar(c)) return false;
-    }
+    for (part) |c| if (!isRemoteRepoChar(c)) return false;
     return true;
 }
 
