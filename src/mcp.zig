@@ -4401,6 +4401,11 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
 
     var file_set: std.ArrayList([]const u8) = .empty;
     defer file_set.deinit(alloc);
+    // Strings the deps op appends to file_set must outlive the per-file deps_result
+    // (freed each iteration); own them in a scoped arena freed at pipeline end.
+    var deps_arena = std.heap.ArenaAllocator.init(alloc);
+    defer deps_arena.deinit();
+    const deps_alloc = deps_arena.allocator();
     var have_set = false;
     const w = cio.listWriter(out, alloc);
 
@@ -4534,12 +4539,11 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
             // Accepts optional 'path' for standalone use without a prior seeding step.
             if (!have_set) {
                 if (getStr(step, "path")) |p| {
-                    const duped = alloc.dupe(u8, p) catch {
+                    const duped = deps_alloc.dupe(u8, p) catch {
                         w.print("error: out of memory\n", .{}) catch {};
                         return;
                     };
                     file_set.append(alloc, duped) catch {
-                        alloc.free(duped);
                         w.print("error: out of memory\n", .{}) catch {};
                         return;
                     };
@@ -4601,8 +4605,11 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
 
                 for (deps_result) |dep| {
                     if (!expanded.contains(dep)) {
-                        expanded.put(dep, {}) catch {};
-                        file_set.append(alloc, dep) catch {};
+                        // Own the string in the deps arena so it outlives deps_result
+                        // (freed by the defer above) once stored in file_set / expanded.
+                        const owned = deps_alloc.dupe(u8, dep) catch continue;
+                        expanded.put(owned, {}) catch {};
+                        file_set.append(alloc, owned) catch {};
                     }
                 }
             }
