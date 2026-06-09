@@ -1273,3 +1273,35 @@ test "issue-564: snapshot fast-load defers the symbol index until first symbol u
     try testing.expect(std.mem.eql(u8, results[0].path, "util_564.zig"));
     try testing.expect(exp2.symbol_index.count() > 0);
 }
+
+// ─── audit (2026-06-09): latent-issue sweep — snapshot fast-restore ───
+// src/snapshot.zig:729 — OUTLINE_STATE import read cap (4096) was narrower than the
+// write cap (65535); a >4096-byte import silently disabled fast-restore (borrow path).
+test "audit: long import specifier round-trips on fast-restore (borrow path preserved)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var exp = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    const long_imp = "a" ** 5000; // > 4096 (old read cap), <= 65535 (write cap)
+    const src = "package main\nimport \"" ++ long_imp ++ "\"\nfunc mainFn() {}\n";
+    try exp.indexFile("probe/main.go", src);
+    const pre = exp.outlines.get("probe/main.go") orelse return error.MissingOutline;
+    try testing.expect(pre.imports.items.len == 1);
+    try testing.expect(pre.imports.items[0].len == 5000);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = path_buf[0..try tmp.dir.realPathFile(io, ".", &path_buf)];
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/probe.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
+
+    var exp2 = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer exp2.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    try testing.expect(snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, testing.allocator));
+    const outline = exp2.outlines.get("probe/main.go") orelse return error.MissingOutline;
+    // borrows_strings is the only discriminator: false on main (re-parse fallback), true after fix
+    try testing.expect(outline.borrows_strings);
+}
