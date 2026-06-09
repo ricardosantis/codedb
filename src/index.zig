@@ -1913,6 +1913,26 @@ pub const TrigramIndex = struct {
     }
 };
 
+/// On-disk `status` metadata, readable WITHOUT loading the full index into
+/// memory. #553: CLI `status` used to materialize the whole index (snapshot
+/// mmap, or a full re-index + multi-GB snapshot rewrite when none existed)
+/// before reading a few counts, so a backgrounded `codedb . status &` from a
+/// SessionStart hook leaked a multi-GB resident orphan that stacked to OOM.
+pub const StatusMeta = struct {
+    indexed: bool,
+    file_count: u32,
+    git_head: ?[40]u8,
+};
+
+/// Read `status` metadata from the persisted trigram header alone — no Explorer,
+/// no snapshot load, no re-index. Returns indexed=false when the project has no
+/// persisted index so the caller reports "not indexed" instead of re-indexing.
+pub fn readStatusMeta(io: std.Io, data_dir: []const u8, allocator: std.mem.Allocator) StatusMeta {
+    const hdr = (TrigramIndex.readDiskHeader(io, data_dir, allocator) catch null) orelse
+        return .{ .indexed = false, .file_count = 0, .git_head = null };
+    return .{ .indexed = true, .file_count = hdr.file_count, .git_head = hdr.git_head };
+}
+
 // ── mmap-backed trigram index ───────────────────────────────
 // Zero-copy: binary search on mmap'd lookup table, read postings directly.
 // Replaces heap-based TrigramIndex after writeToDisk for O(log n) lookups
