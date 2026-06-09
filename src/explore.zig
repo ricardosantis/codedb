@@ -328,6 +328,10 @@ pub const DependencyGraph = struct {
     }
 
     pub fn getImportedBy(self: *const DependencyGraph, path: []const u8, allocator: std.mem.Allocator) ![]const []const u8 {
+        return self.getImportedByFiltered(path, allocator, true);
+    }
+
+    pub fn getImportedByFiltered(self: *const DependencyGraph, path: []const u8, allocator: std.mem.Allocator, allow_basename: bool) ![]const []const u8 {
         // Extract basename for matching (e.g., "src/store.zig" -> "store.zig")
         const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |pos| path[pos + 1 ..] else path;
 
@@ -346,8 +350,10 @@ pub const DependencyGraph = struct {
             }
         }
 
-        // Also check basename match (imports often use short names)
-        if (!std.mem.eql(u8, path, basename)) {
+        // Basename fallback (imports often use short names). Skipped when the basename is
+        // ambiguous across indexed files (allow_basename=false): a bare `import conf`
+        // can't be attributed to a specific same-basename file (a/conf.py vs b/conf.py).
+        if (allow_basename and !std.mem.eql(u8, path, basename)) {
             if (self.reverse.get(basename)) |rev_set| {
                 var rev_iter = rev_set.keyIterator();
                 while (rev_iter.next()) |key_ptr| {
@@ -1688,7 +1694,7 @@ pub const Explorer = struct {
         }
         const io = self.io orelse return null;
         const dir = self.root_dir orelse std.Io.Dir.cwd();
-        const data = dir.readFileAlloc(io, path, allocator, .limited(512 * 1024)) catch return null;
+        const data = dir.readFileAlloc(io, path, allocator, .limited(64 * 1024 * 1024)) catch return null;
         return .{ .data = data, .owned = true, .allocator = allocator };
     }
 
@@ -2452,9 +2458,6 @@ pub const Explorer = struct {
                 breakdown.tier0_ns = cio.nanoTimestamp() - t0_start;
                 breakdown.tier_reached = 0;
                 breakdown.result_count = @intCast(result_list.items.len);
-                if (use_line_hits) {
-                    return result_list.toOwnedSlice(allocator);
-                }
                 const t_rerank = cio.nanoTimestamp();
                 const res = self.rerankAndFinalize(&result_list, query, allocator);
                 breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
@@ -2678,14 +2681,41 @@ pub const Explorer = struct {
         if (tier0_files_len == 0) return false;
         const tier0_files = tier0_files_buf[0..tier0_files_len];
         if (tier0_files.len > 1) {
-            std.sort.block(Tier0File, tier0_files, {}, struct {
-                pub fn lessThan(_: void, a: Tier0File, b: Tier0File) bool {
+            const RankCtx = struct {
+                query: []const u8,
+                // Path-prior portion of rerankSignalScore: the canonical-file signals
+                // (basename-stem match, path segment) and demotion penalties. Without it
+                // this fast-path rendered in raw hit-count order, so a high-frequency
+                // non-canonical file outranked the canonical basename match.
+                fn prior(path: []const u8, q: []const u8) f32 {
+                    const base = std.fs.path.basename(path);
+                    const stem_end = std.mem.indexOfScalar(u8, base, '.') orelse base.len;
+                    const stem = base[0..stem_end];
+                    var s: f32 = 0;
+                    if (asciiEqlIgnoreCase(stem, q)) {
+                        s += 15.0;
+                    } else if (asciiContainsIgnoreCase(stem, q) or asciiContainsIgnoreCase(q, stem)) {
+                        s += 8.0;
+                    } else if (pathHasSegmentIgnoreCase(path, q)) {
+                        s += 6.0;
+                    }
+                    if (pathHasSegment(path, "tests") or pathHasSegment(path, "test")) s *= 0.6;
+                    if (pathHasSegment(path, "examples") or pathHasSegment(path, "example")) s *= 0.6;
+                    if (pathHasSegment(path, "vendor") or pathHasSegment(path, "node_modules") or
+                        pathHasSegment(path, "third_party")) s *= 0.4;
+                    return s;
+                }
+                pub fn lessThan(ctx: @This(), a: Tier0File, b: Tier0File) bool {
+                    const pa = prior(a.path, ctx.query);
+                    const pb = prior(b.path, ctx.query);
+                    if (pa != pb) return pa > pb;
                     if (a.is_doc != b.is_doc) return !a.is_doc;
                     if (a.count != b.count) return a.count > b.count;
                     if (a.first_seen != b.first_seen) return a.first_seen < b.first_seen;
                     return std.mem.lessThan(u8, a.path, b.path);
                 }
-            }.lessThan);
+            };
+            std.sort.block(Tier0File, tier0_files, RankCtx{ .query = query }, RankCtx.lessThan);
         }
 
         const tier0_per_file_cap: usize = if (tier0_files.len <= 1) max_results else @max(1, max_results / 5);
@@ -3765,7 +3795,17 @@ pub const Explorer = struct {
     pub fn getImportedBy(self: *Explorer, path: []const u8, allocator: std.mem.Allocator) ![]const []const u8 {
         self.mu.lockShared();
         defer self.mu.unlockShared();
-        return self.dep_graph.getImportedBy(path, allocator);
+        // A bare import resolved only by basename is ambiguous when 2+ indexed files
+        // share that basename; disable the basename fallback in that case so it is not
+        // attributed to every same-basename file (e.g. a/conf.py and b/conf.py).
+        const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |pos| path[pos + 1 ..] else path;
+        var basename_count: usize = 0;
+        var it = self.outlines.keyIterator();
+        while (it.next()) |k| {
+            const kb = if (std.mem.lastIndexOfScalar(u8, k.*, '/')) |p| k.*[p + 1 ..] else k.*;
+            if (std.mem.eql(u8, kb, basename)) basename_count += 1;
+        }
+        return self.dep_graph.getImportedByFiltered(path, allocator, basename_count <= 1);
     }
 
     pub fn renderImportedBy(self: *Explorer, path: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !struct { count: usize, known: bool } {
@@ -3967,24 +4007,22 @@ pub const Explorer = struct {
             }
         } else if (startsWith(line, "import ") or startsWith(line, "from ")) {
             try appendOutlineSymbol(a, outline, line, .import, line_num, null);
-            // Extract module path and convert dots to slashes for dep matching.
-            // "from mypackage.utils.helpers import X" → "mypackage/utils/helpers.py"
-            // "import os.path" → "os/path.py"
-            if (extractPythonModulePath(line)) |mod_path| {
-                var buf: [512]u8 = undefined;
-                var pos: usize = 0;
-                for (mod_path) |c| {
-                    if (pos >= buf.len - 3) break;
-                    buf[pos] = if (c == '.') '/' else c;
-                    pos += 1;
+            if (startsWith(line, "from ")) {
+                // "from mypackage.utils import X" -> mypackage/utils.py (single module dep)
+                if (extractPythonModulePath(line)) |mod_path| {
+                    try appendPythonModuleDep(a, outline, mod_path);
                 }
-                if (pos + 3 <= buf.len) {
-                    buf[pos] = '.';
-                    buf[pos + 1] = 'p';
-                    buf[pos + 2] = 'y';
-                    pos += 3;
+            } else {
+                // "import a, b.c, d as e" -- record one dep per comma-separated module.
+                const rest = std.mem.trimStart(u8, line[7..], " \t");
+                var it = std.mem.splitScalar(u8, rest, ',');
+                while (it.next()) |raw| {
+                    var mod = std.mem.trim(u8, raw, " \t");
+                    if (std.mem.indexOf(u8, mod, " as ")) |as_pos| mod = std.mem.trimEnd(u8, mod[0..as_pos], " \t");
+                    if (std.mem.indexOfScalar(u8, mod, ' ')) |sp| mod = mod[0..sp];
+                    if (mod.len == 0 or mod[0] == '.') continue;
+                    try appendPythonModuleDep(a, outline, mod);
                 }
-                try appendImportPath(a, outline, buf[0..pos]);
             }
         }
     }
@@ -5829,6 +5867,9 @@ fn parseDelimitedImport(line: []const u8, prefix: []const u8, delimiter: []const
     if (delimiter.len > 0) {
         if (std.mem.indexOf(u8, body, delimiter)) |end| body = body[0..end];
     }
+    // Strip a trailing `as <alias>` (Kotlin/Swift aliased import: `import X as Y`) so the
+    // dep key is the imported path X, not "X as Y".
+    if (std.mem.indexOf(u8, body, " as ")) |as_pos| body = body[0..as_pos];
     body = std.mem.trim(u8, body, " \t;");
     return if (body.len > 0) body else null;
 }
@@ -6460,7 +6501,7 @@ fn extractPythonModulePath(line: []const u8) ?[]const u8 {
         const rest = std.mem.trimStart(u8, line[5..], " \t");
         // Skip relative imports (start with dot)
         if (rest.len > 0 and rest[0] == '.') return null;
-        // "from module.path import ..." — extract up to " import"
+        // "from module.path import ..." -- extract up to " import"
         if (std.mem.indexOf(u8, rest, " import")) |imp_pos| {
             const mod = std.mem.trimEnd(u8, rest[0..imp_pos], " \t");
             if (mod.len > 0) return mod;
@@ -6468,13 +6509,33 @@ fn extractPythonModulePath(line: []const u8) ?[]const u8 {
         return null;
     } else if (startsWith(line, "import ")) {
         const rest = std.mem.trimStart(u8, line[7..], " \t");
-        // "import os.path" or "import foo" — take up to comma or space
+        // "import os.path" or "import foo" -- take up to comma or space
         var end: usize = 0;
         while (end < rest.len and rest[end] != ' ' and rest[end] != ',' and rest[end] != '\t') : (end += 1) {}
         if (end > 0) return rest[0..end];
         return null;
     }
     return null;
+}
+
+// Convert a Python module path (`os.path`, `mypackage.utils`) to a repo-style dep key
+// (`os/path.py`) and record it on the outline. Shared by the `from` branch and the
+// comma-split `import a, b` branch in parsePythonLine.
+fn appendPythonModuleDep(a: std.mem.Allocator, outline: *FileOutline, mod_path: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    for (mod_path) |c| {
+        if (pos >= buf.len - 3) break;
+        buf[pos] = if (c == '.') '/' else c;
+        pos += 1;
+    }
+    if (pos + 3 <= buf.len) {
+        buf[pos] = '.';
+        buf[pos + 1] = 'p';
+        buf[pos + 2] = 'y';
+        pos += 3;
+    }
+    try appendImportPath(a, outline, buf[0..pos]);
 }
 
 // ── Fuzzy file matching ─────────────────────────────────────────
