@@ -2029,10 +2029,13 @@ test "issue-573: cli bridge must not bind a leading flag as the positional name"
     defer explorer.deinit();
     try explorer.indexFile("src/a.zig", "pub fn indexFile() void {}\npub fn caller() void {\n    indexFile();\n}\n");
 
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
     const argv = [_][]const u8{ "--max-results", "3", "indexFile" };
-    const code = mcp_mod.runCliTool(io, testing.allocator, &explorer, ".", "callers", &argv, 0, &out);
+    const code = mcp_mod.runCliTool(io, testing.allocator, &explorer, &store, ".", "callers", &argv, 0, &out);
     try testing.expect(code != null);
     // The flag must not be reported as the function name…
     try testing.expect(std.mem.indexOf(u8, out.items, "call sites for '--max-results'") == null);
@@ -2041,8 +2044,6 @@ test "issue-573: cli bridge must not bind a leading flag as the positional name"
 
     // Companion UX defect, same audit: an explicitly empty symbol name must be
     // a usage error (mirrors codedb_callers), not "no results for: ".
-    var store = Store.init(testing.allocator);
-    defer store.deinit();
     var agents = AgentRegistry.init(testing.allocator);
     defer agents.deinit();
     _ = try agents.register("__filesystem__");
@@ -2103,4 +2104,27 @@ test "issue-576: codedb_ls distinguishes a non-indexed path from an empty listin
     defer ok_out.deinit(testing.allocator);
     bench_ctx.runDispatch(io, testing.allocator, .codedb_ls, &ok_parsed.value.object, &ok_out, &store, &explorer, &agents);
     try testing.expect(std.mem.indexOf(u8, ok_out.items, "a.zig") != null);
+}
+
+
+test "issue-578: cli bridge serves codedb_changes" {
+    // `codedb changes` parsed as a ROOT directory (unknown first token in the
+    // [root] <command> grammar) and printed usage — codedb_changes existed
+    // only as an MCP tool because the bridge had no store to hand to
+    // handleChanges. The bridge must serve it like the other read-only tools.
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/a.zig", "pub fn a() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    _ = store.recordSnapshot("src/a.zig", 10, 123) catch {};
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    const argv = [_][]const u8{};
+    const code = mcp_mod.runCliTool(io, testing.allocator, &explorer, &store, ".", "changes", &argv, 0, &out);
+    // Pre-#578 the bridge did not know 'changes' and returned null.
+    try testing.expect(code != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "seq:") != null);
 }

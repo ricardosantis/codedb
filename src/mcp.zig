@@ -4138,6 +4138,7 @@ pub fn runCliTool(
     io: std.Io,
     alloc: std.mem.Allocator,
     explorer: *Explorer,
+    store: *Store,
     root: []const u8,
     cmd: []const u8,
     args: []const []const u8,
@@ -4173,6 +4174,15 @@ pub fn runCliTool(
         // the heap word index. Keeps the footprint at the MCP level.
         loadProjectTrigramFromDiskIfPresent(io, explorer, root, alloc);
         handleCallers(alloc, &m, out, explorer);
+        return finishCli(out, out_start);
+    } else if (std.mem.eql(u8, cmd, "changes")) {
+        // #578: changes reads the Store ledger (not the Explorer), which is why
+        // the bridge takes `store`. Optional positional = since_seq.
+        if (pos) |p| {
+            const since = std.fmt.parseInt(i64, p, 10) catch return cliUsage(alloc, out, "changes [since_seq]");
+            m.put(alloc, "since", .{ .integer = since }) catch return 1;
+        }
+        handleChanges(alloc, &m, out, store);
         return finishCli(out, out_start);
     } else if (std.mem.eql(u8, cmd, "callpath")) {
         if (args.len < cmd_args_start + 2) return cliUsage(alloc, out, "callpath <from> <to>");
