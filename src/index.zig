@@ -105,47 +105,108 @@ pub const WordIndex = struct {
 
     /// Remove all index entries for a file (call before re-indexing).
     pub fn removeFile(self: *WordIndex, path: []const u8) void {
-        const removed = self.file_words.fetchRemove(path) orelse return;
-        const stable_path = removed.key;
-        const words_slice = removed.value;
-
-        const doc_id = self.path_to_id.get(stable_path) orelse {
-            self.allocator.free(words_slice);
-            self.allocator.free(stable_path);
-            return;
-        };
-        _ = self.path_to_id.remove(stable_path);
-        if (doc_id < self.id_to_path.items.len) {
-            self.id_to_path.items[doc_id] = "";
+        if (self.mmap_data != null) {
+            // Zero-copy mode: postings live in the mmap and a remove is a
+            // write, so promote first — but only when the file is actually
+            // tracked (id_to_path is the only populated map in this mode).
+            var tracked = false;
+            for (self.id_to_path.items) |p| {
+                if (std.mem.eql(u8, p, path)) {
+                    tracked = true;
+                    break;
+                }
+            }
+            if (!tracked) return;
+            self.promoteIfBorrowed() catch return;
         }
+
+        if (self.file_words.fetchRemove(path)) |removed| {
+            const stable_path = removed.key;
+            const words_slice = removed.value;
+
+            const doc_id = self.path_to_id.get(stable_path) orelse {
+                self.allocator.free(words_slice);
+                self.allocator.free(stable_path);
+                return;
+            };
+            _ = self.path_to_id.remove(stable_path);
+            if (doc_id < self.id_to_path.items.len) {
+                const old_path = self.id_to_path.items[doc_id];
+                // Bulk modes (skip_file_words) give id_to_path its own strings;
+                // otherwise the slot aliases stable_path, freed below.
+                if (self.skip_file_words and old_path.len > 0) self.allocator.free(old_path);
+                self.id_to_path.items[doc_id] = "";
+            }
+            if (self.doc_lengths.fetchRemove(doc_id)) |kv| {
+                self.total_tokens -= kv.value;
+            }
+            defer {
+                self.allocator.free(words_slice);
+                self.allocator.free(stable_path);
+            }
+
+            // For each word this file contributed, remove hits with this doc_id.
+            // Prune empty buckets so churn does not leak key/list entries.
+            for (words_slice) |word| {
+                const word_ptr = &word;
+                if (self.index.getEntry(word_ptr.*)) |entry| {
+                    const hits = entry.value_ptr;
+                    var i: usize = 0;
+                    while (i < hits.items.len) {
+                        if (hits.items[i].doc_id == doc_id) {
+                            _ = hits.swapRemove(i);
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    if (hits.items.len == 0) {
+                        const owned_word = entry.key_ptr.*;
+                        hits.deinit(self.allocator);
+                        _ = self.index.remove(word_ptr.*);
+                        self.allocator.free(owned_word);
+                    }
+                }
+            }
+            return;
+        }
+
+        // No per-file word list: the file came from a bulk path (disk
+        // fast-load, sharded cold scan), where removeFile used to be a silent
+        // no-op that left every stale posting behind. Sweep all posting lists
+        // for the doc_id instead; the next indexFile gives the file a word
+        // list, so this runs at most once per file.
+        const doc_id = self.path_to_id.get(path) orelse return;
+        _ = self.path_to_id.remove(path);
         if (self.doc_lengths.fetchRemove(doc_id)) |kv| {
             self.total_tokens -= kv.value;
         }
-        defer {
-            self.allocator.free(words_slice);
-            self.allocator.free(stable_path);
+        if (doc_id < self.id_to_path.items.len) {
+            const old_path = self.id_to_path.items[doc_id];
+            if (self.skip_file_words and old_path.len > 0) self.allocator.free(old_path);
+            self.id_to_path.items[doc_id] = "";
         }
-
-        // For each word this file contributed, remove hits with this doc_id.
-        // Prune empty buckets so churn does not leak key/list entries.
-        for (words_slice) |word| {
-            const word_ptr = &word;
-            if (self.index.getEntry(word_ptr.*)) |entry| {
-                const hits = entry.value_ptr;
-                var i: usize = 0;
-                while (i < hits.items.len) {
-                    if (hits.items[i].doc_id == doc_id) {
-                        _ = hits.swapRemove(i);
-                    } else {
-                        i += 1;
-                    }
+        var empty_words: std.ArrayList([]const u8) = .empty;
+        defer empty_words.deinit(self.allocator);
+        var it = self.index.iterator();
+        while (it.next()) |entry| {
+            const hits = entry.value_ptr;
+            var i: usize = 0;
+            while (i < hits.items.len) {
+                if (hits.items[i].doc_id == doc_id) {
+                    _ = hits.swapRemove(i);
+                } else {
+                    i += 1;
                 }
-                if (hits.items.len == 0) {
-                    const owned_word = entry.key_ptr.*;
-                    hits.deinit(self.allocator);
-                    _ = self.index.remove(word_ptr.*);
-                    self.allocator.free(owned_word);
-                }
+            }
+            if (hits.items.len == 0) {
+                empty_words.append(self.allocator, entry.key_ptr.*) catch continue;
+            }
+        }
+        for (empty_words.items) |word| {
+            if (self.index.fetchRemove(word)) |kv| {
+                var hits = kv.value;
+                hits.deinit(self.allocator);
+                self.allocator.free(kv.key);
             }
         }
     }
@@ -182,17 +243,12 @@ pub const WordIndex = struct {
         if (!self.enabled) return;
         // A write to a zero-copy (mmap) index must first materialize a heap index.
         try self.promoteIfBorrowed();
-        // Clean up old entries first
+        // Clean up old entries first; removeFile guarantees the path is no
+        // longer tracked, so the stable copy is always a fresh dupe.
         self.removeFile(path);
 
-        // If the path is already tracked (e.g. skip_file_words=true and removeFile
-        // early-exited), reuse the existing stable copy rather than leaking a new dup.
-        const stable_path = if (self.path_to_id.contains(path))
-            path
-        else
-            try self.allocator.dupe(u8, path);
-        const owned_path = stable_path.ptr != path.ptr;
-        errdefer if (owned_path) self.allocator.free(stable_path);
+        const stable_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(stable_path);
 
         const doc_id = try self.getOrCreateDocId(stable_path);
 
@@ -260,15 +316,25 @@ pub const WordIndex = struct {
             }
         }
 
-        if (!self.skip_file_words) {
-            // Compact the HashMap to a simple slice — saves ~70KB per file
+        // Per-file word list — what makes the next removeFile O(file) instead
+        // of an index-wide sweep. Bulk paths (readFromDisk/mergeShard) leave it
+        // empty for their files; anything indexed through here gets a list. In
+        // skip_file_words mode id_to_path owns stable_path, so the file_words
+        // key must be its own allocation.
+        {
+            const fw_key = if (self.skip_file_words)
+                try self.allocator.dupe(u8, stable_path)
+            else
+                stable_path;
+            errdefer if (self.skip_file_words) self.allocator.free(fw_key);
             const compact = try self.allocator.alloc([]const u8, words_set.count());
+            errdefer self.allocator.free(compact);
             var ki: usize = 0;
             var wk_iter = words_set.keyIterator();
             while (wk_iter.next()) |k| : (ki += 1) {
                 compact[ki] = k.*;
             }
-            try self.file_words.put(stable_path, compact);
+            try self.file_words.put(fw_key, compact);
         }
         words_set.deinit();
 
@@ -552,23 +618,14 @@ pub const WordIndex = struct {
         var disk_path_to_id = std.StringHashMap(u32).init(self.allocator);
         defer disk_path_to_id.deinit();
 
-        if (self.file_words.count() > 0) {
-            var file_iter = self.file_words.iterator();
-            while (file_iter.next()) |entry| {
-                const path = entry.key_ptr.*;
-                if (path.len > std.math.maxInt(u16)) return error.NameTooLong;
-                const id: u32 = @intCast(file_table.items.len);
-                try file_table.append(self.allocator, path);
-                try disk_path_to_id.put(path, id);
-            }
-        } else {
-            for (self.id_to_path.items) |path| {
-                if (path.len == 0) continue;
-                if (path.len > std.math.maxInt(u16)) return error.NameTooLong;
-                const id: u32 = @intCast(file_table.items.len);
-                try file_table.append(self.allocator, path);
-                try disk_path_to_id.put(path, id);
-            }
+        // id_to_path is the doc table and always complete; file_words only
+        // covers incrementally indexed files once bulk-loaded docs exist.
+        for (self.id_to_path.items) |path| {
+            if (path.len == 0) continue;
+            if (path.len > std.math.maxInt(u16)) return error.NameTooLong;
+            const id: u32 = @intCast(file_table.items.len);
+            try file_table.append(self.allocator, path);
+            try disk_path_to_id.put(path, id);
         }
 
         var words_sorted: std.ArrayList([]const u8) = .empty;
