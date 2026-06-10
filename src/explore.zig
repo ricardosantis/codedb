@@ -3551,7 +3551,75 @@ pub const Explorer = struct {
 
         self.mu.lockShared();
         defer self.mu.unlockShared();
+        // #569: a multi-word query can never be a single index token — fall back
+        // to per-token matching so phrase-shaped queries don't silently dead-end.
+        if (std.mem.indexOfScalar(u8, word, ' ') != null) {
+            return self.searchWordTokensLocked(word, allocator);
+        }
         return self.word_index.searchDeduped(word, allocator);
+    }
+
+    /// Per-token fallback for a whitespace-separated query (#569): each distinct
+    /// token is looked up in the word index and files are ranked by how many
+    /// distinct tokens they hit, then total hits, then path. Returns one
+    /// representative hit (lowest matching line) per file, allocated for the
+    /// caller. Caller must hold the shared lock.
+    fn searchWordTokensLocked(self: *Explorer, query: []const u8, allocator: std.mem.Allocator) ![]const idx.WordHit {
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+
+        const Agg = struct { distinct: u32, total: u32, line: u32, last_token: u32 };
+        var per_doc = U32HashMap(Agg).init(sa);
+
+        var seen_tokens = std.StringHashMap(void).init(sa);
+        var token_serial: u32 = 0;
+        var tok = idx.WordTokenizer{ .buf = query };
+        while (tok.next()) |raw| {
+            if (raw.len < 2) continue;
+            const lower = try sa.alloc(u8, raw.len);
+            for (raw, 0..) |c, i| lower[i] = idx.normalizeChar(c);
+            const tok_gop = try seen_tokens.getOrPut(lower);
+            if (tok_gop.found_existing) continue;
+            token_serial += 1;
+            for (self.word_index.search(lower)) |h| {
+                const gop = try per_doc.getOrPut(h.doc_id);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = .{ .distinct = 1, .total = 1, .line = h.line_num, .last_token = token_serial };
+                } else {
+                    gop.value_ptr.total += 1;
+                    if (gop.value_ptr.last_token != token_serial) {
+                        gop.value_ptr.distinct += 1;
+                        gop.value_ptr.last_token = token_serial;
+                    }
+                    if (h.line_num < gop.value_ptr.line) gop.value_ptr.line = h.line_num;
+                }
+            }
+        }
+        if (per_doc.count() == 0) return try allocator.alloc(idx.WordHit, 0);
+
+        const Ranked = struct { doc_id: u32, distinct: u32, total: u32, line: u32 };
+        const ranked = try sa.alloc(Ranked, per_doc.count());
+        var it = per_doc.iterator();
+        var n: usize = 0;
+        while (it.next()) |e| : (n += 1) {
+            ranked[n] = .{ .doc_id = e.key_ptr.*, .distinct = e.value_ptr.distinct, .total = e.value_ptr.total, .line = e.value_ptr.line };
+        }
+        const SortCtx = struct {
+            wi: *const idx.WordIndex,
+            fn lessThan(ctx: @This(), a: Ranked, b: Ranked) bool {
+                if (a.distinct != b.distinct) return a.distinct > b.distinct;
+                if (a.total != b.total) return a.total > b.total;
+                const pa = ctx.wi.hitPath(.{ .doc_id = a.doc_id, .line_num = 0 });
+                const pb = ctx.wi.hitPath(.{ .doc_id = b.doc_id, .line_num = 0 });
+                return std.mem.lessThan(u8, pa, pb);
+            }
+        };
+        std.mem.sort(Ranked, ranked, SortCtx{ .wi = &self.word_index }, SortCtx.lessThan);
+
+        const out_hits = try allocator.alloc(idx.WordHit, ranked.len);
+        for (ranked, 0..) |r, i| out_hits[i] = .{ .doc_id = r.doc_id, .line_num = r.line };
+        return out_hits;
     }
 
     /// Format a word-index lookup directly from the posting list. The indexer
@@ -3568,6 +3636,20 @@ pub const Explorer = struct {
 
         self.mu.lockShared();
         defer self.mu.unlockShared();
+
+        // #569: multi-word queries fall back to per-token matching — one line
+        // per file, files hitting more distinct tokens first.
+        if (std.mem.indexOfScalar(u8, word, ' ') != null) {
+            const hits = try self.searchWordTokensLocked(word, allocator);
+            defer allocator.free(hits);
+            try out.ensureUnusedCapacity(allocator, 64 + hits.len * 48);
+            const w = cio.listWriter(out, allocator);
+            try w.print("{d} hits for '{s}' (tokenized):\n", .{ hits.len, word });
+            for (hits) |h| {
+                try w.print("  {s}:{d}\n", .{ self.word_index.hitPath(h), h.line_num });
+            }
+            return;
+        }
 
         const hits = self.word_index.search(word);
         try out.ensureUnusedCapacity(allocator, 64 + hits.len * 48);
