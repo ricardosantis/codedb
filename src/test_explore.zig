@@ -2311,3 +2311,75 @@ test "issue-587: removeFile drops the path from skip_trigram_files" {
     explorer.removeFile("src/gone.zig");
     try testing.expectEqual(@as(usize, 0), explorer.skip_trigram_files.count());
 }
+
+test "issue-594: failed re-index restores the word index from valid prior content" {
+    // commitParsedFileOwnedOutline reads `prior_content` out of the content
+    // cache and THEN calls contents.put, which frees that value in place. The
+    // trigram-failure errdefer later "restores" the word index by re-indexing
+    // prior_content — freed memory. Under the DebugAllocator poison the
+    // tokenizer finds no words in it, so a failed re-index silently wipes the
+    // file's postings instead of restoring them (release builds read garbage).
+    const FailOnce = struct {
+        backing: std.mem.Allocator,
+        next_index: usize = 0,
+        fail_index: usize,
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = allocImpl,
+                .resize = resizeImpl,
+                .remap = remapImpl,
+                .free = freeImpl,
+            } };
+        }
+        fn allocImpl(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const idx = self.next_index;
+            self.next_index += 1;
+            if (idx == self.fail_index) return null;
+            return self.backing.rawAlloc(len, alignment, ra);
+        }
+        fn resizeImpl(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.backing.rawResize(memory, alignment, new_len, ra);
+        }
+        fn remapImpl(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.backing.rawRemap(memory, alignment, new_len, ra);
+        }
+        fn freeImpl(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.backing.rawFree(memory, alignment, ra);
+        }
+    };
+
+    // Pass 1: count the allocation window of the re-index on a successful run.
+    var window_start: usize = 0;
+    var window_end: usize = 0;
+    {
+        var counter = FailOnce{ .backing = testing.allocator, .fail_index = std.math.maxInt(usize) };
+        var explorer = Explorer.init(counter.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+        defer explorer.deinit();
+        try explorer.indexFile("src/a.zig", "pub fn alphaTok() void {}\n");
+        window_start = counter.next_index;
+        try explorer.indexFile("src/a.zig", "pub fn betaTok() void {}\n");
+        window_end = counter.next_index;
+    }
+    try testing.expect(window_end > window_start);
+
+    // Pass 2: fail each allocation in that window exactly once. Whenever the
+    // re-index errors out, the old content must still be word-searchable.
+    var fi = window_start;
+    while (fi < window_end) : (fi += 1) {
+        var failer = FailOnce{ .backing = testing.allocator, .fail_index = fi };
+        var explorer = Explorer.init(failer.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+        defer explorer.deinit();
+        explorer.indexFile("src/a.zig", "pub fn alphaTok() void {}\n") catch unreachable;
+        if (explorer.indexFile("src/a.zig", "pub fn betaTok() void {}\n")) |_| {
+            // Tolerated failure — the new content must be live.
+            try testing.expect(explorer.word_index.search("betatok").len > 0);
+        } else |_| {
+            if (explorer.word_index.search("alphatok").len == 0) return error.PriorContentLostOnFailedReindex;
+        }
+    }
+}
