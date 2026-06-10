@@ -673,12 +673,19 @@ fn cliWriteFull(fd: c_int, data: []const u8) bool {
     return true;
 }
 
+/// The read-only query commands — single source of truth (#578 grew from
+/// three hand-maintained copies drifting: cliIsQueryCmd, isCommand, and the
+/// runQuery dispatch chain in mainImpl). isCommand appends the non-query
+/// commands; the dispatch chain calls cliIsQueryCmd directly.
+const cli_query_cmds = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "status", "symbol", "callers", "callpath", "deps", "glob", "ls", "file", "context", "changes" };
+
 /// True for the read-only query commands the daemon will serve / the client
 /// will proxy. Everything else (serve, mcp, snapshot, index, ...) is handled
 /// only by the cold path.
 fn cliIsQueryCmd(cmd: []const u8) bool {
-    const cmds = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "status", "symbol", "callers", "callpath", "deps", "glob", "ls", "file", "context", "changes" };
-    for (cmds) |c| if (std.mem.eql(u8, cmd, c)) return true;
+    for (cli_query_cmds) |c| {
+        if (std.mem.eql(u8, cmd, c)) return true;
+    }
     return false;
 }
 
@@ -1430,12 +1437,7 @@ fn mainImpl() !void {
             }
         } // end else (no snapshot)
     }
-    if (std.mem.eql(u8, cmd, "tree") or std.mem.eql(u8, cmd, "outline") or std.mem.eql(u8, cmd, "find") or
-        std.mem.eql(u8, cmd, "search") or std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "read") or
-        std.mem.eql(u8, cmd, "hot") or std.mem.eql(u8, cmd, "symbol") or std.mem.eql(u8, cmd, "callers") or
-        std.mem.eql(u8, cmd, "callpath") or std.mem.eql(u8, cmd, "deps") or std.mem.eql(u8, cmd, "glob") or
-        std.mem.eql(u8, cmd, "ls") or std.mem.eql(u8, cmd, "file") or std.mem.eql(u8, cmd, "context") or
-        std.mem.eql(u8, cmd, "changes") or std.mem.eql(u8, cmd, "status"))
+    if (cliIsQueryCmd(cmd))
     {
         const code = runQuery(io, allocator, &explorer, &store, abs_root, cmd, args, cmd_args_start, &out, s);
         out.flush();
@@ -2013,8 +2015,12 @@ pub fn isValidMcpFlag(arg: []const u8) bool {
 }
 
 fn isCommand(arg: []const u8) bool {
-    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "status", "symbol", "callers", "callpath", "deps", "glob", "ls", "file", "context", "changes", "snapshot", "serve", "mcp", "update", "nuke", "cli-daemon" };
-    for (commands) |c| if (std.mem.eql(u8, arg, c)) return true;
+    // cli_query_cmds is the shared query-command table (see its doc); only the
+    // non-query commands are listed here.
+    const commands = cli_query_cmds ++ [_][]const u8{ "snapshot", "serve", "mcp", "update", "nuke", "cli-daemon" };
+    for (commands) |c| {
+        if (std.mem.eql(u8, arg, c)) return true;
+    }
     return false;
 }
 
