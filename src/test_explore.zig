@@ -2271,3 +2271,43 @@ test "audit: extractCallees ignores comment/string mentions" {
     }
     try testing.expect(saw_real); // real call in code is still captured
 }
+
+test "issue-586: symbol_index keys must survive re-index of the file that first inserted them" {
+    // rebuildSymbolIndexFor keys the global symbol index with sym.name slices
+    // OWNED BY THE FILE'S OUTLINE. Re-indexing that file deinits the old
+    // outline — freeing the bytes the map hashes and compares — but the entry
+    // survives whenever another file shares the name (init/deinit/main are
+    // shared by nearly every Zig file). Every later probe eql()s freed memory:
+    // UB in release, and under the DebugAllocator poison the O(1) index
+    // silently loses the name, degrading every lookup to the outline scans.
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    // a.zig inserts sharedFn first -> the map key aliases a.zig's outline string.
+    try explorer.indexFile("src/a.zig", "pub fn sharedFn() void {}\n");
+    try explorer.indexFile("src/b.zig", "pub fn sharedFn() void {}\n");
+
+    // Re-index the key owner: its old outline is freed; the entry stays alive
+    // because b.zig still holds a location.
+    try explorer.indexFile("src/a.zig", "pub fn sharedFn() void {}\npub fn other() void {}\n");
+
+    const locs = explorer.symbol_index.get("sharedFn") orelse return error.SymbolLostFromIndex;
+    try testing.expect(locs.items.len >= 2);
+}
+
+test "issue-587: removeFile drops the path from skip_trigram_files" {
+    // Explorer.removeFile cleans dep_graph, symbol_index, contents, word and
+    // trigram indexes, then frees the outlines key — but never removes the
+    // skip_trigram_files entry, whose key ALIASES that freed outlines key.
+    // The tier-3 search scan then iterates a dangling path and hands it to
+    // readContentForSearch (UB read; with reused memory, an arbitrary path).
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    // Outline-only indexing registers the file in skip_trigram_files (#507).
+    try explorer.indexFileOutlineOnly("src/gone.zig", "pub fn ghostFn() void {}\n");
+    try testing.expectEqual(@as(usize, 1), explorer.skip_trigram_files.count());
+
+    explorer.removeFile("src/gone.zig");
+    try testing.expectEqual(@as(usize, 0), explorer.skip_trigram_files.count());
+}
