@@ -2858,7 +2858,12 @@ pub const Explorer = struct {
             score += 6.0;
         }
 
-        if (pathHasSegment(r.path, "tests") or pathHasSegment(r.path, "test")) score *= 0.6;
+        // #580: match BM25's pathRelevanceMultiplier — test files identified by
+        // BASENAME (tests.zig, test_*.zig, *_tests.zig) are tests even without
+        // a test/ directory segment.
+        const is_test_file = pathHasSegment(r.path, "tests") or pathHasSegment(r.path, "test") or
+            std.mem.startsWith(u8, basename, "test") or std.mem.indexOf(u8, basename, "_test") != null;
+        if (is_test_file) score *= 0.6;
         if (pathHasSegment(r.path, "examples") or pathHasSegment(r.path, "example")) score *= 0.6;
         if (pathHasSegment(r.path, "bench") or pathHasSegment(r.path, "benchmarks") or
             pathHasSegment(r.path, "scripts") or pathHasSegment(r.path, "website") or
