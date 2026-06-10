@@ -3899,6 +3899,15 @@ pub const Explorer = struct {
         defer self.mu.unlockShared();
 
         const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |pos| path[pos + 1 ..] else path;
+        // #588: mirror getImportedBy — a bare import resolved only by basename
+        // is ambiguous when 2+ indexed files share the basename; skip the
+        // fallback rather than attribute it to every candidate.
+        var basename_count: usize = 0;
+        var bit = self.outlines.keyIterator();
+        while (bit.next()) |k| {
+            const kb = if (std.mem.lastIndexOfScalar(u8, k.*, '/')) |p| k.*[p + 1 ..] else k.*;
+            if (std.mem.eql(u8, kb, basename)) basename_count += 1;
+        }
         const exact = self.dep_graph.reverse.get(path);
         const w = cio.listWriter(out, allocator);
         var count: usize = 0;
@@ -3911,7 +3920,7 @@ pub const Explorer = struct {
             }
         }
 
-        if (!std.mem.eql(u8, path, basename)) {
+        if (basename_count <= 1 and !std.mem.eql(u8, path, basename)) {
             if (self.dep_graph.reverse.get(basename)) |rev_set| {
                 var rev_iter = rev_set.keyIterator();
                 while (rev_iter.next()) |key_ptr| {
