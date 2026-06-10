@@ -2861,6 +2861,17 @@ pub const Explorer = struct {
     fn rerankSignalScore(self: *const Explorer, r: SearchResult, query: []const u8) f32 {
         var score: f32 = countOccurrences(r.line_text, query);
 
+        // #598: mention-dense tooling files (a bench script repeating the term
+        // six times per line) saturate the per-line count and shrug off the
+        // ×0.5 path prior below. Cap the occurrence BASE for tooling paths
+        // before the stem/symbol boosts so density cannot dominate, while an
+        // eponymous lookup (query 'install' → install/install.sh) still wins
+        // through its +15 stem boost.
+        const is_tooling_path = pathHasSegment(r.path, "bench") or pathHasSegment(r.path, "benchmarks") or
+            pathHasSegment(r.path, "scripts") or pathHasSegment(r.path, "website") or
+            pathHasSegment(r.path, "install");
+        if (is_tooling_path) score = @min(score, 2.0);
+
         if (self.outlines.get(r.path)) |outline| {
             for (outline.symbols.items) |sym| {
                 if (sym.line_start == r.line_num and asciiEqlIgnoreCase(sym.name, query)) {
@@ -2897,9 +2908,7 @@ pub const Explorer = struct {
             std.mem.startsWith(u8, basename, "test") or std.mem.indexOf(u8, basename, "_test") != null;
         if (is_test_file) score *= 0.6;
         if (pathHasSegment(r.path, "examples") or pathHasSegment(r.path, "example")) score *= 0.6;
-        if (pathHasSegment(r.path, "bench") or pathHasSegment(r.path, "benchmarks") or
-            pathHasSegment(r.path, "scripts") or pathHasSegment(r.path, "website") or
-            pathHasSegment(r.path, "install")) score *= 0.5;
+        if (is_tooling_path) score *= 0.5;
         if (pathHasSegment(r.path, "vendor") or pathHasSegment(r.path, "node_modules") or
             pathHasSegment(r.path, "third_party")) score *= 0.4;
         // Doc-language penalty: markdown / data files (CHANGELOG.md, design
