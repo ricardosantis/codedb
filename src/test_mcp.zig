@@ -2076,3 +2076,47 @@ test "audit: isSensitivePath blocks *.env suffix files and .git-credentials" {
     try testing.expect(!watcher.isSensitivePath("main.zig"));
     try testing.expect(!watcher.isSensitivePath("environment.ts"));
 }
+
+// ─── #568: empty deps lists print '(none)' with no '(N files)' summary ───
+// Non-empty lists end with a '(N files)' summary; empty lists printed a body
+// line '  (none)' and no summary, so machine consumers that parse the list
+// body saw one entry (engram counted in-degree 1 for every zero-importer
+// file). The summary line must be present unconditionally.
+test "issue-568: deps empty list prints a (0 files) summary" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/lone.zig", "pub fn lonely() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    // imported_by (default): nothing imports src/lone.zig.
+    const rev_json =
+        \\{"path":"src/lone.zig"}
+    ;
+    const rev_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, rev_json, .{});
+    defer rev_parsed.deinit();
+    var rev_out: std.ArrayList(u8) = .empty;
+    defer rev_out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_deps, &rev_parsed.value.object, &rev_out, &store, &explorer, &agents);
+    try testing.expect(std.mem.indexOf(u8, rev_out.items, "(none)") != null);
+    try testing.expect(std.mem.indexOf(u8, rev_out.items, "(0 files)") != null);
+
+    // depends_on: src/lone.zig imports nothing.
+    const fwd_json =
+        \\{"path":"src/lone.zig","direction":"depends_on"}
+    ;
+    const fwd_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, fwd_json, .{});
+    defer fwd_parsed.deinit();
+    var fwd_out: std.ArrayList(u8) = .empty;
+    defer fwd_out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_deps, &fwd_parsed.value.object, &fwd_out, &store, &explorer, &agents);
+    try testing.expect(std.mem.indexOf(u8, fwd_out.items, "(none)") != null);
+    try testing.expect(std.mem.indexOf(u8, fwd_out.items, "(0 files)") != null);
+}
