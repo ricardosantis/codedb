@@ -2162,3 +2162,49 @@ test "issue-592: cli-daemon spawn lock is exclusive per project" {
     _ = std.c.close(held.?);
     try testing.expect(main_mod.daemonLockAvailable(dir_path));
 }
+
+test "cli-mcp-parity: runCliTool bridges navigation commands to MCP handlers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try exp.indexFile("src/store.zig", "pub const Store = struct {};\n");
+    try exp.indexFile("src/main.zig", "const Store = @import(\"store.zig\").Store;\npub fn main() void {}\n");
+
+    var store = Store.init(aa);
+
+    // glob: pattern -> matching indexed paths (reuses handleGlob)
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        const code = mcp_mod.runCliTool(io, aa, &exp, &store, ".", "glob", &.{ "codedb", ".", "glob", "src/*.zig" }, 3, &out);
+        try testing.expectEqual(@as(?u8, 0), code);
+        try testing.expect(std.mem.indexOf(u8, out.items, "src/store.zig") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "src/main.zig") != null);
+    }
+
+    // symbol: name -> definition site (reuses handleSymbol)
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        const code = mcp_mod.runCliTool(io, aa, &exp, &store, ".", "symbol", &.{ "codedb", ".", "symbol", "Store" }, 3, &out);
+        try testing.expectEqual(@as(?u8, 0), code);
+        try testing.expect(std.mem.indexOf(u8, out.items, "src/store.zig") != null);
+    }
+
+    // unknown command -> null so runQuery falls through to its own usage error
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        try testing.expectEqual(@as(?u8, null), mcp_mod.runCliTool(io, aa, &exp, &store, ".", "bogus", &.{ "codedb", ".", "bogus" }, 3, &out));
+    }
+
+    // missing required arg -> usage line, exit 1
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(aa);
+        try testing.expectEqual(@as(?u8, 1), mcp_mod.runCliTool(io, aa, &exp, &store, ".", "glob", &.{ "codedb", ".", "glob" }, 3, &out));
+        try testing.expect(std.mem.indexOf(u8, out.items, "usage") != null);
+    }
+}

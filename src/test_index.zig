@@ -3128,3 +3128,62 @@ test "issue-593: mmap trigram index — removeFile takes effect and re-index mas
     // File accounting follows: 3 on disk, one removed.
     try testing.expectEqual(@as(u32, 2), any_idx.fileCount());
 }
+
+test "mmap word index: zero-copy load matches heap load and promotes on write" {
+    const alloc = testing.allocator;
+    var wi = WordIndex.init(alloc);
+    defer wi.deinit();
+    wi.skip_file_words = true;
+    try wi.indexFile("src/a.zig", "pub fn alphaToken() void { betaToken(); }\n");
+    try wi.indexFile("src/b.zig", "pub fn betaToken() void { alphaToken(); alphaToken(); }\n");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = pb[0..try tmp.dir.realPathFile(io, ".", &pb)];
+    try wi.writeToDisk(io, dir, null);
+
+    var heap = WordIndex.readFromDisk(io, dir, alloc).?;
+    defer heap.deinit();
+    var mm = WordIndex.mmapFromDisk(io, dir, alloc).?;
+    defer mm.deinit(); // picks the right path (mmap, or heap after promote)
+    try testing.expect(mm.mmap_data != null);
+
+    // search parity (exact)
+    try testing.expectEqual(heap.search("alphaToken").len, mm.search("alphaToken").len);
+    try testing.expect(mm.search("alphaToken").len >= 1);
+
+    // searchDeduped parity + hitPath resolves through the mmap file table
+    {
+        const h = try mm.searchDeduped("betaToken", alloc);
+        defer alloc.free(h);
+        const r = try heap.searchDeduped("betaToken", alloc);
+        defer alloc.free(r);
+        try testing.expectEqual(r.len, h.len);
+        try testing.expect(h.len >= 1);
+        try testing.expectEqualStrings(heap.hitPath(r[0]), mm.hitPath(h[0]));
+    }
+
+    // searchPrefix parity (sorted-range walk vs linear scan)
+    {
+        const h = try mm.searchPrefix("alpha", alloc, 10);
+        defer alloc.free(h);
+        const r = try heap.searchPrefix("alpha", alloc, 10);
+        defer alloc.free(r);
+        try testing.expectEqual(r.len, h.len);
+    }
+
+    // BM25 helpers parity
+    try testing.expectEqual(heap.rankedDocCount(), mm.rankedDocCount());
+    try testing.expectEqual(heap.total_tokens, mm.total_tokens);
+    try testing.expectEqual(heap.docLength(0), mm.docLength(0));
+    try testing.expectEqual(heap.docLength(1), mm.docLength(1));
+
+    // Promote on write: a mutation materializes a heap index, then stays queryable.
+    try mm.indexFile("src/c.zig", "pub fn gammaToken() void {}\n");
+    try testing.expect(mm.mmap_data == null);
+    const g = try mm.searchDeduped("gammaToken", alloc);
+    defer alloc.free(g);
+    try testing.expectEqual(@as(usize, 1), g.len);
+    try testing.expect(mm.search("alphaToken").len >= 1); // pre-promote postings survived
+}
