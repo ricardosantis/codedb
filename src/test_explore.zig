@@ -2234,3 +2234,40 @@ test "issue-531: searchSymbols fuzzy match" {
     try testing.expect(results.len >= 1);
     try testing.expectEqualStrings("ensureCallGraph", results[0].symbol.name);
 }
+
+// ─── audit (2026-06-09): latent-issue sweep — call-graph phantom edges ───
+// src/codegraph.zig extractCallees paired every '(' with the preceding identifier with
+// no comment/string stripping, so a name mentioned only in a // comment surfaced as a
+// real resolved callee in codedb_context (#548 family, for the call graph).
+test "audit: comment-only mention is not a resolved callee" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var exp = Explorer.init(a, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try exp.indexFile("util.zig", "pub fn uniqueHelper() void {}\n");
+    try exp.indexFile("caller.zig",
+        \\pub fn caller() void {
+        \\    // see uniqueHelper() for details
+        \\}
+        \\
+    );
+    const callees = try exp.resolveCallees("caller.zig", 1, 3, a, 8);
+    for (callees) |c| try testing.expect(!std.mem.eql(u8, c.name, "uniqueHelper"));
+}
+
+test "audit: extractCallees ignores comment/string mentions" {
+    const body =
+        \\    realCall(x);
+        \\    // ghostFn() lives only in this comment
+        \\    log("please stringOnlyFn() here");
+    ;
+    const callees = try codegraph.extractCallees(testing.allocator, body);
+    defer testing.allocator.free(callees);
+    var saw_real = false;
+    for (callees) |c| {
+        if (std.mem.eql(u8, c, "realCall")) saw_real = true;
+        try testing.expect(!std.mem.eql(u8, c, "ghostFn"));
+        try testing.expect(!std.mem.eql(u8, c, "stringOnlyFn"));
+    }
+    try testing.expect(saw_real); // real call in code is still captured
+}
