@@ -2060,3 +2060,47 @@ test "issue-573: cli bridge must not bind a leading flag as the positional name"
     bench_ctx.runDispatch(io, testing.allocator, .codedb_symbol, &parsed.value.object, &sout, &store, &explorer, &agents);
     try testing.expect(std.mem.indexOf(u8, sout.items, "error: empty name") != null);
 }
+
+
+test "issue-576: codedb_ls distinguishes a non-indexed path from an empty listing" {
+    // `codedb ls nonexistent/dir` printed 'no entries' with exit 0 —
+    // indistinguishable from a real-but-empty directory. An index only knows
+    // a directory through files under it, so an empty listing for a non-empty
+    // prefix always means the path is not indexed: say so (the 'error:' prefix
+    // also makes finishCli return exit 1 on the CLI bridge).
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/a.zig", "pub fn a() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const bad_json =
+        \\{"path":"nonexistent/dir"}
+    ;
+    const bad_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, bad_json, .{});
+    defer bad_parsed.deinit();
+
+    var bad_out: std.ArrayList(u8) = .empty;
+    defer bad_out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_ls, &bad_parsed.value.object, &bad_out, &store, &explorer, &agents);
+    try testing.expect(std.mem.indexOf(u8, bad_out.items, "error: no indexed files under 'nonexistent/dir'") != null);
+
+    // A real prefix still lists its entries.
+    const ok_json =
+        \\{"path":"src"}
+    ;
+    const ok_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, ok_json, .{});
+    defer ok_parsed.deinit();
+
+    var ok_out: std.ArrayList(u8) = .empty;
+    defer ok_out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_ls, &ok_parsed.value.object, &ok_out, &store, &explorer, &agents);
+    try testing.expect(std.mem.indexOf(u8, ok_out.items, "a.zig") != null);
+}
