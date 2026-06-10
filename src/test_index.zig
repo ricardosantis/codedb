@@ -3032,3 +3032,99 @@ test "issue-447: searchContent surfaces large (>64KB) skip-trigram files for com
     try testing.expect(found_canonical);
 }
 
+
+test "issue-583: disk-loaded word index — re-index and removeFile must drop stale postings" {
+    // readFromDisk/mmapFromDisk set skip_file_words=true, which made removeFile
+    // a silent no-op (file_words is empty). In a daemon that fast-loads the
+    // index, every file edit then APPENDS postings while the stale ones stay:
+    // deleted terms keep hitting (wrong lines), deleted files ghost-hit, and
+    // postings grow without bound across re-saves (RSS).
+    const alloc = testing.allocator;
+    var wi = WordIndex.init(alloc);
+    defer wi.deinit();
+    try wi.indexFile("src/a.zig", "pub fn alphaToken() void {}\n");
+    try wi.indexFile("src/b.zig", "pub fn betaToken() void {}\n");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+    try wi.writeToDisk(io, dir_path, null);
+
+    // Heap fast-load: re-indexing a file must drop its old postings.
+    var loaded = WordIndex.readFromDisk(io, dir_path, alloc).?;
+    defer loaded.deinit();
+    try loaded.indexFile("src/a.zig", "pub fn gammaToken() void {}\n");
+    const stale = try loaded.searchDeduped("alphaToken", alloc);
+    defer alloc.free(stale);
+    try testing.expectEqual(@as(usize, 0), stale.len);
+    const fresh = try loaded.searchDeduped("gammaToken", alloc);
+    defer alloc.free(fresh);
+    try testing.expectEqual(@as(usize, 1), fresh.len);
+
+    // Deleting a file must drop its postings outright.
+    loaded.removeFile("src/b.zig");
+    const ghost = try loaded.searchDeduped("betaToken", alloc);
+    defer alloc.free(ghost);
+    try testing.expectEqual(@as(usize, 0), ghost.len);
+
+    // Zero-copy mmap load: removeFile is a write — it must promote, not no-op.
+    var mloaded = WordIndex.mmapFromDisk(io, dir_path, alloc).?;
+    defer mloaded.deinit();
+    mloaded.removeFile("src/a.zig");
+    const mghost = try mloaded.searchDeduped("alphaToken", alloc);
+    defer alloc.free(mghost);
+    try testing.expectEqual(@as(usize, 0), mghost.len);
+}
+
+test "issue-593: mmap trigram index — removeFile takes effect and re-index masks stale base entries" {
+    // AnyTrigramIndex.removeFile is a silent no-op in pure-mmap mode, and the
+    // mmap_overlay promotion never masks the base: a deleted file stays
+    // "contained" forever and an edited file feeds candidates from BOTH its
+    // old (mmap base) and new (overlay) content — ghost candidates that every
+    // search tier then has to read and discard.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/auth.zig", "pub fn handleAuth(req: *Request) !void { validate(req); }");
+    try explorer.indexFile("src/gate.zig", "pub fn checkGate(ctx: *Context) !bool { return ctx.authenticated; }");
+    try explorer.indexFile("src/util.zig", "pub fn formatStr(buf: []u8, args: anytype) !void {}");
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp_dir.dir.realPathFile(io, ".", &path_buf);
+    const tmp_path = path_buf[0..tmp_path_len];
+    try explorer.trigram_index.writeToDisk(io, tmp_path, null);
+
+    const mmap_idx = MmapTrigramIndex.initFromDisk(io, tmp_path, testing.allocator) orelse
+        return error.MmapInitFailed;
+    var any_idx = AnyTrigramIndex{ .mmap = mmap_idx };
+    defer any_idx.deinit();
+
+    // A delete while zero-copy must take effect, not silently no-op.
+    any_idx.removeFile("src/gate.zig");
+    try testing.expect(!any_idx.containsFile("src/gate.zig"));
+    if (any_idx.candidates("checkGate", allocator)) |cands| {
+        for (cands) |p| try testing.expect(!std.mem.eql(u8, p, "src/gate.zig"));
+    }
+
+    // Re-indexing must mask the base's stale trigrams for that path.
+    try any_idx.indexFile("src/auth.zig", "pub fn renamedAuth() void {}");
+    if (any_idx.candidates("handleAuth", allocator)) |cands| {
+        for (cands) |p| try testing.expect(!std.mem.eql(u8, p, "src/auth.zig"));
+    }
+    const fresh = any_idx.candidates("renamedAuth", allocator) orelse return error.NoCandidates;
+    var found = false;
+    for (fresh) |p| {
+        if (std.mem.eql(u8, p, "src/auth.zig")) found = true;
+    }
+    try testing.expect(found);
+
+    // File accounting follows: 3 on disk, one removed.
+    try testing.expectEqual(@as(u32, 2), any_idx.fileCount());
+}

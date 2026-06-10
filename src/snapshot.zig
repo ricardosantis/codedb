@@ -1329,6 +1329,7 @@ pub fn isSensitivePath(path: []const u8) bool {
         ".dev.vars",        ".npmrc",               ".pypirc",      ".netrc",
         "credentials.json", "service-account.json", "secrets.json", "secrets.yaml",
         "secrets.yml",      "id_rsa",               "id_ed25519",   ".git-credentials",
+        "id_ecdsa",         "id_dsa",               "id_ecdsa_sk",  "id_ed25519_sk",
     };
     for (sensitive_names) |name| {
         if (std.mem.eql(u8, basename, name)) return true;

@@ -2120,3 +2120,45 @@ test "issue-568: deps empty list prints a (0 files) summary" {
     try testing.expect(std.mem.indexOf(u8, fwd_out.items, "(none)") != null);
     try testing.expect(std.mem.indexOf(u8, fwd_out.items, "(0 files)") != null);
 }
+
+test "issue-589: isSensitivePath blocks all OpenSSH default private key names" {
+    // The exact-name list covers id_rsa and id_ed25519 but misses the other
+    // ssh-keygen defaults: id_ecdsa, id_dsa, and the FIDO variants
+    // id_ecdsa_sk / id_ed25519_sk. Outside ~/.ssh (which the directory rule
+    // catches), a key copied into a repo — deploy/id_ecdsa — was indexed and
+    // readable while deploy/id_rsa was blocked.
+    const keys = [_][]const u8{ "id_ecdsa", "id_dsa", "id_ecdsa_sk", "id_ed25519_sk" };
+    for (keys) |k| {
+        try testing.expect(watcher.isSensitivePath(k));
+        try testing.expect(snapshot_mod.isSensitivePath(k));
+    }
+    try testing.expect(watcher.isSensitivePath("deploy/id_ecdsa"));
+    // negatives — names that merely start like a key must stay indexable
+    try testing.expect(!watcher.isSensitivePath("id_map.zig"));
+    try testing.expect(!watcher.isSensitivePath("identity.ts"));
+}
+
+test "issue-592: cli-daemon spawn lock is exclusive per project" {
+    // Concurrent cold CLI calls used to fork a cli-daemon EACH (no mutual
+    // exclusion), every duplicate re-scanned the index, and the stale-socket
+    // unlink let late arrivals steal the winner's socket — orphan daemons
+    // churned CPU long after the calls exited. The per-project flock makes
+    // spawn mutually exclusive: holders win, probes report unavailable, and
+    // the kernel releases the lock on any exit.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_len];
+
+    const held = main_mod.daemonLockTryAcquire(dir_path);
+    try testing.expect(held != null);
+    // A second acquire (the would-be duplicate daemon) must lose...
+    try testing.expect(main_mod.daemonLockTryAcquire(dir_path) == null);
+    // ...and the CLI spawn probe must report the lock as taken.
+    try testing.expect(!main_mod.daemonLockAvailable(dir_path));
+
+    _ = std.c.flock(held.?, std.c.LOCK.UN);
+    _ = std.c.close(held.?);
+    try testing.expect(main_mod.daemonLockAvailable(dir_path));
+}
