@@ -863,6 +863,10 @@ pub const Explorer = struct {
         try self.contents.put(stable_path, content);
 
         if (full_index) {
+            // A disabled word index (cold CLI scan keeps it off to save memory)
+            // can't absorb this file, so it no longer reflects the indexed set —
+            // ranked/BM25 readers must lazy-rebuild instead of trusting it (#546).
+            if (!self.word_index.enabled) self.word_index_complete = false;
             if (!self.word_index_complete) {
                 self.word_index_can_load_from_disk = false;
             }

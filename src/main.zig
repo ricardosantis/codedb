@@ -1264,8 +1264,19 @@ fn mainImpl() !void {
             // For search: single-pass scan + trigram build (no re-reading files).
             // For other commands: outline-only scan, trigrams from disk or rebuild.
             const is_search = std.mem.eql(u8, cmd, "search");
+            // #546: a multi-word query ranks via BM25, which rebuilds the word index
+            // from in-memory outlines/contents — the trigram-only fast scan commits
+            // neither, so the first-ever cold multi-word search ranked over an empty
+            // index and returned nothing. Route it through the full single-pass scan
+            // (outlines + contents + trigrams); single-token and --regex searches
+            // keep the trigram-only fast path.
+            const search_skips_outlines = blk: {
+                if (!is_search) break :blk true;
+                const sa = parseSearchArgs(args, cmd_args_start) catch break :blk true;
+                break :blk sa.use_regex or std.mem.indexOfScalar(u8, sa.query, ' ') == null;
+            };
             if (is_search and !heads_match) {
-                const tmp_tri = try watcher.initialScanWithTrigrams(io, &store, &explorer, root, allocator, std.heap.c_allocator, true);
+                const tmp_tri = try watcher.initialScanWithTrigrams(io, &store, &explorer, root, allocator, std.heap.c_allocator, search_skips_outlines);
                 if (tmp_tri) |tri| {
                     tri.writeToDisk(io, data_dir, git_head) catch {};
                     tri.deinit();
