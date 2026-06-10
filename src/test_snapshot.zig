@@ -510,8 +510,17 @@ test "snapshot: parallel freshness load re-indexes changed files, restores the r
 
     // Changed files carry fresh content (changed branch); the rest keep snapshot
     // content (restored branch) — verified directly via the content cache.
+    // Flaked once under full-suite parallelism (2026-06-10, missing content with
+    // all outlines present; 0/25 repro in isolation) — on failure, dump which
+    // file and what state survived so the next occurrence localizes the branch.
     for (0..total) |i| {
-        const cached = exp2.contents.get(abs_paths[i]) orelse return error.MissingContent;
+        const cached = exp2.contents.get(abs_paths[i]) orelse {
+            std.debug.print(
+                "MissingContent: i={d} changed={} outline_present={} contents_cached={d}/{d}\n",
+                .{ i, is_changed[i], exp2.outlines.contains(abs_paths[i]), exp2.contents.len(), total },
+            );
+            return error.MissingContent;
+        };
         const want = if (is_changed[i])
             try std.fmt.allocPrint(aa, "pub fn newfn_{d}() void {{}}\n", .{i})
         else
