@@ -655,6 +655,8 @@ pub const Explorer = struct {
     dep_graph: DependencyGraph,
     contents: ContentCache,
     symbol_index: std.StringHashMap(std.ArrayList(SymbolLocation)),
+    /// False after a snapshot fast-load until ensureSymbolIndex runs (#564).
+    symbol_index_complete: bool,
     word_index: WordIndex,
     trigram_index: AnyTrigramIndex,
     /// Paths indexed with skip_trigram=true (past 15k cap or excluded).
@@ -721,6 +723,7 @@ pub const Explorer = struct {
             .dep_graph = DependencyGraph.init(allocator),
             .contents = ContentCache.init(allocator, content_cache_capacity),
             .symbol_index = std.StringHashMap(std.ArrayList(SymbolLocation)).init(allocator),
+            .symbol_index_complete = true,
             .word_index = WordIndex.init(allocator),
             .trigram_index = .{ .heap = TrigramIndex.init(allocator) },
             .skip_trigram_files = std.StringHashMap(void).init(allocator),
@@ -1399,6 +1402,35 @@ pub const Explorer = struct {
         self.word_index_persisted_generation = self.word_index_generation;
     }
 
+    /// Snapshot fast-load defers the global symbol index — plain content
+    /// search never reads it, so one-shot CLI queries skip ~symbols-per-file
+    /// map inserts and their heap (#564). rebuildSymbolIndexFor no-ops while
+    /// incomplete; ensureSymbolIndex builds it on first symbol/caller use.
+    pub fn markSymbolIndexIncomplete(self: *Explorer) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.symbol_index_complete = false;
+    }
+
+    /// Build the global symbol index from outlines if a snapshot fast-load
+    /// deferred it (#564). Cheap when complete (one flag check). Mirrors the
+    /// lazy word-index rebuild: call BEFORE taking the shared lock — this
+    /// takes the exclusive lock itself.
+    pub fn ensureSymbolIndex(self: *Explorer) void {
+        self.mu.lockShared();
+        const incomplete = !self.symbol_index_complete;
+        self.mu.unlockShared();
+        if (!incomplete) return;
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.symbol_index_complete) return;
+        self.symbol_index_complete = true;
+        var it = self.outlines.iterator();
+        while (it.next()) |entry| {
+            self.rebuildSymbolIndexFor(entry.key_ptr.*, entry.value_ptr, false);
+        }
+    }
+
     pub fn disableWordIndexDiskLoad(self: *Explorer) void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -1809,6 +1841,7 @@ pub const Explorer = struct {
     }
 
     pub fn findSymbol(self: *Explorer, name: []const u8, allocator: std.mem.Allocator) !?struct { path: []const u8, symbol: Symbol } {
+        self.ensureSymbolIndex();
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
@@ -1861,6 +1894,7 @@ pub const Explorer = struct {
     }
 
     pub fn findAllSymbols(self: *Explorer, name: []const u8, allocator: std.mem.Allocator) ![]const SymbolResult {
+        self.ensureSymbolIndex();
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
@@ -1971,6 +2005,7 @@ pub const Explorer = struct {
     }
 
     pub fn searchSymbols(self: *Explorer, spec: SymbolSearchSpec, allocator: std.mem.Allocator) ![]ScoredSymbolResult {
+        self.ensureSymbolIndex();
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
@@ -2133,6 +2168,7 @@ pub const Explorer = struct {
         max: usize,
     ) ![]CalleeRef {
         if (max == 0 or line_end < line_start) return &.{};
+        self.ensureSymbolIndex();
         const content = (self.getContent(path, allocator) catch return &.{}) orelse return &.{};
         const body = sliceLineRange(content, line_start, line_end);
         if (body.len == 0) return &.{};
@@ -2244,6 +2280,7 @@ pub const Explorer = struct {
         return content[start..i];
     }
     pub fn renderSymbols(self: *Explorer, name: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !bool {
+        self.ensureSymbolIndex();
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
@@ -2823,6 +2860,9 @@ pub const Explorer = struct {
 
         if (pathHasSegment(r.path, "tests") or pathHasSegment(r.path, "test")) score *= 0.6;
         if (pathHasSegment(r.path, "examples") or pathHasSegment(r.path, "example")) score *= 0.6;
+        if (pathHasSegment(r.path, "bench") or pathHasSegment(r.path, "benchmarks") or
+            pathHasSegment(r.path, "scripts") or pathHasSegment(r.path, "website") or
+            pathHasSegment(r.path, "install")) score *= 0.5;
         if (pathHasSegment(r.path, "vendor") or pathHasSegment(r.path, "node_modules") or
             pathHasSegment(r.path, "third_party")) score *= 0.4;
         // Doc-language penalty: markdown / data files (CHANGELOG.md, design
@@ -2973,6 +3013,7 @@ pub const Explorer = struct {
     /// ensureCallCentrality assumes the caller already holds a shared lock (it is
     /// normally reached from searchContentRanked); this wrapper takes that lock.
     pub fn buildCallCentrality(self: *Explorer, allocator: std.mem.Allocator) void {
+        self.ensureSymbolIndex();
         self.mu.lockShared();
         defer self.mu.unlockShared();
         self.ensureCallCentrality(allocator);
@@ -2983,6 +3024,11 @@ pub const Explorer = struct {
     /// codedb_callpath and computes per-file centrality (PageRank by default).
     fn ensureCallGraph(self: *Explorer, allocator: std.mem.Allocator) void {
         if (self.call_graph != null) return;
+        // #564: never build (and cache) a graph from a deferred symbol index —
+        // resolveCallees would see no definitions and the empty graph would be
+        // cached forever. Callers that need the graph ensureSymbolIndex first;
+        // ranking paths just skip the boost until then.
+        if (!self.symbol_index_complete) return;
         self.centrality_build_mu.lock();
         defer self.centrality_build_mu.unlock();
         if (self.call_graph != null) return;
@@ -3118,6 +3164,7 @@ pub const Explorer = struct {
         allocator: std.mem.Allocator,
         max_hops: usize,
     ) !?[]CallPathStep {
+        self.ensureSymbolIndex();
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
@@ -4864,6 +4911,11 @@ pub const Explorer = struct {
     }
 
     pub fn rebuildSymbolIndexFor(self: *Explorer, path: []const u8, outline: *FileOutline, had_prior: bool) void {
+        // #564: while the index is deferred (snapshot fast-load), per-file
+        // rebuilds are wasted work — ensureSymbolIndex rebuilds everything from
+        // outlines on first use. ensureSymbolIndex flips the flag back BEFORE
+        // calling this, so its own rebuild passes the guard.
+        if (!self.symbol_index_complete) return;
         // removeSymbolIndexFor scans the entire global symbol index, so calling
         // it per file makes a cold scan O(files * total_symbols). A brand-new
         // path has no prior entries to evict, so skip the scan entirely — only
