@@ -1982,3 +1982,39 @@ test "issue-538: temp roots are indexable only when CODEDB_ALLOW_TEMP opts in" {
     try testing.expect(!root_policy.isIndexableRoot("/usr/local/bin"));
     try testing.expect(!root_policy.isIndexableRoot("/"));
 }
+
+
+test "issue-570: codedb_context falls back to plain words for all-lowercase tasks" {
+    // 'fix search ranking' has no identifier-shaped token (no snake_case, no
+    // camelCase, no quotes), so extractContextCandidates finds nothing and the
+    // handler dead-ends with 'no candidate identifiers found'. Natural-language
+    // tasks are the documented input shape — the composer must fall back to
+    // plain words instead of erroring.
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/ranking.zig", "pub fn rankingBoost() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"task":"fix search ranking"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_context, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // An all-lowercase task must not dead-end…
+    try testing.expect(std.mem.indexOf(u8, out.items, "no candidate identifiers") == null);
+    // …its longest meaningful word ('ranking') must drive the composer.
+    try testing.expect(std.mem.indexOf(u8, out.items, "ranking") != null);
+}
