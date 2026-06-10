@@ -2052,7 +2052,11 @@ fn loadWordIndexFromDiskIfPresent(
 ) void {
     if (!explorer.wordIndexCanLoadFromDisk()) return;
 
+    // Each disable below logs WHY at debug level: a silent fallback here means
+    // the next query pays a full heap rebuild with no breadcrumb, which reads
+    // as an unexplained RSS/latency spike when profiling.
     const header = WordIndex.readDiskHeader(io, data_dir, allocator) catch null orelse {
+        std.log.debug("word.index disk load skipped: no readable header", .{});
         explorer.disableWordIndexDiskLoad();
         return;
     };
@@ -2061,6 +2065,7 @@ fn loadWordIndexFromDiskIfPresent(
     const current_count = @as(u32, @intCast(explorer.outlines.count()));
     explorer.mu.unlockShared();
     if (header.file_count != current_count) {
+        std.log.debug("word.index disk load skipped: file_count {d} != indexed {d}", .{ header.file_count, current_count });
         explorer.disableWordIndexDiskLoad();
         return;
     }
@@ -2071,6 +2076,7 @@ fn loadWordIndexFromDiskIfPresent(
         break :blk std.mem.eql(u8, &current_git_head.?, &header.git_head.?);
     };
     if (!heads_match) {
+        std.log.debug("word.index disk load skipped: git head mismatch", .{});
         explorer.disableWordIndexDiskLoad();
         return;
     }
@@ -2078,6 +2084,7 @@ fn loadWordIndexFromDiskIfPresent(
     if (WordIndex.mmapFromDisk(io, data_dir, allocator) orelse WordIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
         explorer.replaceWordIndex(loaded);
     } else {
+        std.log.debug("word.index disk load skipped: mmap and heap read both failed", .{});
         explorer.disableWordIndexDiskLoad();
     }
 }
