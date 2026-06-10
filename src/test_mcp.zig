@@ -2020,7 +2020,7 @@ test "issue-570: codedb_context falls back to plain words for all-lowercase task
 }
 
 
-test "issue-572: cli bridge must not bind a leading flag as the positional name" {
+test "issue-573: cli bridge must not bind a leading flag as the positional name" {
     // Live repro: `codedb callers --max-results 3 indexFile` reported
     // "1 call sites for '--max-results'" — the bridge takes args[cmd_args_start]
     // blindly, so a leading flag silently becomes the name. It must fall
