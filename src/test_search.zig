@@ -1666,3 +1666,47 @@ test "issue-546: searchContent rerank penalizes non-source tooling paths (bench/
     try testing.expect(results.len >= 5);
     try testing.expectEqualStrings("src/sample.zig", results[0].path);
 }
+
+
+test "issue-560: path_glob page must not be starved by higher-ranked out-of-glob files" {
+    // 40 out-of-glob decoys tie the gold file on score; the path-asc
+    // tiebreaker ranks lib/ decoys above src/gold.zig, so the gold hit sits
+    // beyond the fetched window. Pre-fix the handler fetches
+    // offset+max_results+1 ranked results and only THEN applies path_glob —
+    // every fetched row is out-of-glob, so the response is '0 results' plus
+    // a 'more results' hint even though src/gold.zig matches query and glob.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        const name = try std.fmt.allocPrint(arena.allocator(), "lib/decoy{d:0>2}.zig", .{i});
+        try explorer.indexFile(name, "pub fn x() void { _ = starveTerm; }\n");
+    }
+    try explorer.indexFile("src/gold.zig", "pub fn x() void { _ = starveTerm; }\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"query":"starveTerm","path_glob":"src/**","max_results":5}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_search, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // The in-glob match must be visible.
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/gold.zig") != null);
+    // And the header must not claim zero results.
+    try testing.expect(std.mem.indexOf(u8, out.items, "0 results") == null);
+}

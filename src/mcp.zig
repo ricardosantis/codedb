@@ -1779,14 +1779,43 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         // Over-fetch by `offset` (+1) so we can page into a stable window and
         // detect whether more results exist beyond this page. BM25 ranking is
         // deterministic per query, so the offset is a stable, stateless cursor.
-        const fetch_count = @min(offset_n + max_results + 1, 100000);
-        const fetched = (if (multiword)
+        const want_count = @min(offset_n + max_results + 1, 100000);
+        var fetch_count = want_count;
+        var fetched = (if (multiword)
             explorer.searchContentRanked(query, alloc, fetch_count)
         else
             explorer.searchContent(query, alloc, fetch_count)) catch {
             out.appendSlice(alloc, "error: search failed") catch {};
             return;
         };
+        // #560: path_glob filters AFTER ranking, so a window of global results
+        // can hold zero in-glob hits while deeper ranks match — the page must
+        // be filled from the glob-filtered sequence, not the global one.
+        // Escalate the fetch window until the in-glob set fills the page or
+        // the index is exhausted.
+        if (path_glob) |g| {
+            while (true) {
+                var in_glob: usize = 0;
+                for (fetched) |r| {
+                    if (globMatch(g, r.path)) in_glob += 1;
+                }
+                const exhausted = fetched.len < fetch_count;
+                if (in_glob >= want_count or exhausted or fetch_count >= 100000) break;
+                fetch_count = @min(fetch_count * 4, 100000);
+                for (fetched) |r| {
+                    alloc.free(r.line_text);
+                    alloc.free(r.path);
+                }
+                alloc.free(fetched);
+                fetched = (if (multiword)
+                    explorer.searchContentRanked(query, alloc, fetch_count)
+                else
+                    explorer.searchContent(query, alloc, fetch_count)) catch {
+                    out.appendSlice(alloc, "error: search failed") catch {};
+                    return;
+                };
+            }
+        }
         defer {
             for (fetched) |r| {
                 alloc.free(r.line_text);
@@ -1794,10 +1823,20 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             }
             alloc.free(fetched);
         }
-        const page_lo = @min(offset_n, fetched.len);
-        const page_hi = @min(offset_n + max_results, fetched.len);
-        const results = fetched[page_lo..page_hi];
-        const has_more = fetched.len > page_hi;
+        // Page over the glob-filtered view so offset/max_results address
+        // in-glob results rather than global ranks.
+        var glob_view: std.ArrayList(explore_mod.SearchResult) = .empty;
+        defer glob_view.deinit(alloc);
+        if (path_glob) |g| {
+            for (fetched) |r| {
+                if (globMatch(g, r.path)) glob_view.append(alloc, r) catch {};
+            }
+        }
+        const page_src: []const explore_mod.SearchResult = if (path_glob != null) glob_view.items else fetched;
+        const page_lo = @min(offset_n, page_src.len);
+        const page_hi = @min(offset_n + max_results, page_src.len);
+        const results = page_src[page_lo..page_hi];
+        const has_more = page_src.len > page_hi;
         if (json_fmt) {
             writeSearchResultsJson(out, alloc, explorer, query, results, page_lo, has_more, paths_only, path_glob, compact);
             return;
