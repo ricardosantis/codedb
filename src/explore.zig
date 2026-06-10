@@ -328,6 +328,10 @@ pub const DependencyGraph = struct {
     }
 
     pub fn getImportedBy(self: *const DependencyGraph, path: []const u8, allocator: std.mem.Allocator) ![]const []const u8 {
+        return self.getImportedByFiltered(path, allocator, true);
+    }
+
+    pub fn getImportedByFiltered(self: *const DependencyGraph, path: []const u8, allocator: std.mem.Allocator, allow_basename: bool) ![]const []const u8 {
         // Extract basename for matching (e.g., "src/store.zig" -> "store.zig")
         const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |pos| path[pos + 1 ..] else path;
 
@@ -346,8 +350,10 @@ pub const DependencyGraph = struct {
             }
         }
 
-        // Also check basename match (imports often use short names)
-        if (!std.mem.eql(u8, path, basename)) {
+        // Basename fallback (imports often use short names). Skipped when the basename is
+        // ambiguous across indexed files (allow_basename=false): a bare `import conf`
+        // can't be attributed to a specific same-basename file (a/conf.py vs b/conf.py).
+        if (allow_basename and !std.mem.eql(u8, path, basename)) {
             if (self.reverse.get(basename)) |rev_set| {
                 var rev_iter = rev_set.keyIterator();
                 while (rev_iter.next()) |key_ptr| {
@@ -857,6 +863,10 @@ pub const Explorer = struct {
         try self.contents.put(stable_path, content);
 
         if (full_index) {
+            // A disabled word index (cold CLI scan keeps it off to save memory)
+            // can't absorb this file, so it no longer reflects the indexed set —
+            // ranked/BM25 readers must lazy-rebuild instead of trusting it (#546).
+            if (!self.word_index.enabled) self.word_index_complete = false;
             if (!self.word_index_complete) {
                 self.word_index_can_load_from_disk = false;
             }
@@ -1688,7 +1698,7 @@ pub const Explorer = struct {
         }
         const io = self.io orelse return null;
         const dir = self.root_dir orelse std.Io.Dir.cwd();
-        const data = dir.readFileAlloc(io, path, allocator, .limited(512 * 1024)) catch return null;
+        const data = dir.readFileAlloc(io, path, allocator, .limited(64 * 1024 * 1024)) catch return null;
         return .{ .data = data, .owned = true, .allocator = allocator };
     }
 
@@ -2253,9 +2263,7 @@ pub const Explorer = struct {
             "push",        "find",     "add",      "new",       "build",
             "run",         "deinit",   "toString", "valueOf",   "of",
         };
-        for (common) |c| {
-            if (std.mem.eql(u8, name, c)) return true;
-        }
+        for (common) |c| if (std.mem.eql(u8, name, c)) return true;
         return false;
     }
 
@@ -2454,9 +2462,6 @@ pub const Explorer = struct {
                 breakdown.tier0_ns = cio.nanoTimestamp() - t0_start;
                 breakdown.tier_reached = 0;
                 breakdown.result_count = @intCast(result_list.items.len);
-                if (use_line_hits) {
-                    return result_list.toOwnedSlice(allocator);
-                }
                 const t_rerank = cio.nanoTimestamp();
                 const res = self.rerankAndFinalize(&result_list, query, allocator);
                 breakdown.rerank_ns = cio.nanoTimestamp() - t_rerank;
@@ -2680,14 +2685,41 @@ pub const Explorer = struct {
         if (tier0_files_len == 0) return false;
         const tier0_files = tier0_files_buf[0..tier0_files_len];
         if (tier0_files.len > 1) {
-            std.sort.block(Tier0File, tier0_files, {}, struct {
-                pub fn lessThan(_: void, a: Tier0File, b: Tier0File) bool {
+            const RankCtx = struct {
+                query: []const u8,
+                // Path-prior portion of rerankSignalScore: the canonical-file signals
+                // (basename-stem match, path segment) and demotion penalties. Without it
+                // this fast-path rendered in raw hit-count order, so a high-frequency
+                // non-canonical file outranked the canonical basename match.
+                fn prior(path: []const u8, q: []const u8) f32 {
+                    const base = std.fs.path.basename(path);
+                    const stem_end = std.mem.indexOfScalar(u8, base, '.') orelse base.len;
+                    const stem = base[0..stem_end];
+                    var s: f32 = 0;
+                    if (asciiEqlIgnoreCase(stem, q)) {
+                        s += 15.0;
+                    } else if (asciiContainsIgnoreCase(stem, q) or asciiContainsIgnoreCase(q, stem)) {
+                        s += 8.0;
+                    } else if (pathHasSegmentIgnoreCase(path, q)) {
+                        s += 6.0;
+                    }
+                    if (pathHasSegment(path, "tests") or pathHasSegment(path, "test")) s *= 0.6;
+                    if (pathHasSegment(path, "examples") or pathHasSegment(path, "example")) s *= 0.6;
+                    if (pathHasSegment(path, "vendor") or pathHasSegment(path, "node_modules") or
+                        pathHasSegment(path, "third_party")) s *= 0.4;
+                    return s;
+                }
+                pub fn lessThan(ctx: @This(), a: Tier0File, b: Tier0File) bool {
+                    const pa = prior(a.path, ctx.query);
+                    const pb = prior(b.path, ctx.query);
+                    if (pa != pb) return pa > pb;
                     if (a.is_doc != b.is_doc) return !a.is_doc;
                     if (a.count != b.count) return a.count > b.count;
                     if (a.first_seen != b.first_seen) return a.first_seen < b.first_seen;
                     return std.mem.lessThan(u8, a.path, b.path);
                 }
-            }.lessThan);
+            };
+            std.sort.block(Tier0File, tier0_files, RankCtx{ .query = query }, RankCtx.lessThan);
         }
 
         const tier0_per_file_cap: usize = if (tier0_files.len <= 1) max_results else @max(1, max_results / 5);
@@ -3212,6 +3244,20 @@ pub const Explorer = struct {
     }
 
     pub fn searchContentRanked(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
+        // #546: BM25 reads the word index's id_to_path + ranked-doc table, which a
+        // mmap/disk-loaded index lacks until rebuilt (word_index_complete = false).
+        // The recall readers (searchContent, searchWord, renderWord) already trigger
+        // this lazy rebuild; searchContentRanked did not — so ranked search returned
+        // nothing on a cold CLI / freshly-loaded snapshot (the index served `word`,
+        // but here N collapsed to 0). Rebuild before the shared lock, matching the
+        // siblings — rebuildWordIndex takes the exclusive lock.
+        if (max_results > 0) {
+            self.mu.lockShared();
+            const needs_rebuild = !self.word_index_complete and
+                (self.contents.len() > 0 or (self.io != null and self.root_dir != null));
+            self.mu.unlockShared();
+            if (needs_rebuild) try self.rebuildWordIndex();
+        }
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
@@ -3412,6 +3458,21 @@ pub const Explorer = struct {
         return result_list.toOwnedSlice(allocator);
     }
 
+    /// Query-shape-aware search shared by the CLI (`runQuery`, used by both the
+    /// cold path and the warm cli-daemon) and the MCP `search` handler so the two
+    /// rank identically. A multi-word query expresses conceptual/NL intent and
+    /// routes to BM25 + centrality (`searchContentRanked`); a single token keeps
+    /// literal substring matching (`searchContent`) so exact-identifier lookups
+    /// still work. #546: the CLI path previously always called the unranked
+    /// `searchContent`, so multi-word CLI/daemon searches never reached the ranker.
+    pub fn searchContentAuto(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
+        const multiword = std.mem.indexOfScalar(u8, query, ' ') != null;
+        return if (multiword)
+            self.searchContentRanked(query, allocator, max_results)
+        else
+            self.searchContent(query, allocator, max_results);
+    }
+
     /// Search file contents using a regex pattern with trigram acceleration.
     /// Decomposes the regex to extract literal trigrams for candidate filtering,
     /// then does actual regex matching on candidates.
@@ -3490,7 +3551,75 @@ pub const Explorer = struct {
 
         self.mu.lockShared();
         defer self.mu.unlockShared();
+        // #569: a multi-word query can never be a single index token — fall back
+        // to per-token matching so phrase-shaped queries don't silently dead-end.
+        if (std.mem.indexOfScalar(u8, word, ' ') != null) {
+            return self.searchWordTokensLocked(word, allocator);
+        }
         return self.word_index.searchDeduped(word, allocator);
+    }
+
+    /// Per-token fallback for a whitespace-separated query (#569): each distinct
+    /// token is looked up in the word index and files are ranked by how many
+    /// distinct tokens they hit, then total hits, then path. Returns one
+    /// representative hit (lowest matching line) per file, allocated for the
+    /// caller. Caller must hold the shared lock.
+    fn searchWordTokensLocked(self: *Explorer, query: []const u8, allocator: std.mem.Allocator) ![]const idx.WordHit {
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+
+        const Agg = struct { distinct: u32, total: u32, line: u32, last_token: u32 };
+        var per_doc = U32HashMap(Agg).init(sa);
+
+        var seen_tokens = std.StringHashMap(void).init(sa);
+        var token_serial: u32 = 0;
+        var tok = idx.WordTokenizer{ .buf = query };
+        while (tok.next()) |raw| {
+            if (raw.len < 2) continue;
+            const lower = try sa.alloc(u8, raw.len);
+            for (raw, 0..) |c, i| lower[i] = idx.normalizeChar(c);
+            const tok_gop = try seen_tokens.getOrPut(lower);
+            if (tok_gop.found_existing) continue;
+            token_serial += 1;
+            for (self.word_index.search(lower)) |h| {
+                const gop = try per_doc.getOrPut(h.doc_id);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = .{ .distinct = 1, .total = 1, .line = h.line_num, .last_token = token_serial };
+                } else {
+                    gop.value_ptr.total += 1;
+                    if (gop.value_ptr.last_token != token_serial) {
+                        gop.value_ptr.distinct += 1;
+                        gop.value_ptr.last_token = token_serial;
+                    }
+                    if (h.line_num < gop.value_ptr.line) gop.value_ptr.line = h.line_num;
+                }
+            }
+        }
+        if (per_doc.count() == 0) return try allocator.alloc(idx.WordHit, 0);
+
+        const Ranked = struct { doc_id: u32, distinct: u32, total: u32, line: u32 };
+        const ranked = try sa.alloc(Ranked, per_doc.count());
+        var it = per_doc.iterator();
+        var n: usize = 0;
+        while (it.next()) |e| : (n += 1) {
+            ranked[n] = .{ .doc_id = e.key_ptr.*, .distinct = e.value_ptr.distinct, .total = e.value_ptr.total, .line = e.value_ptr.line };
+        }
+        const SortCtx = struct {
+            wi: *const idx.WordIndex,
+            fn lessThan(ctx: @This(), a: Ranked, b: Ranked) bool {
+                if (a.distinct != b.distinct) return a.distinct > b.distinct;
+                if (a.total != b.total) return a.total > b.total;
+                const pa = ctx.wi.hitPath(.{ .doc_id = a.doc_id, .line_num = 0 });
+                const pb = ctx.wi.hitPath(.{ .doc_id = b.doc_id, .line_num = 0 });
+                return std.mem.lessThan(u8, pa, pb);
+            }
+        };
+        std.mem.sort(Ranked, ranked, SortCtx{ .wi = &self.word_index }, SortCtx.lessThan);
+
+        const out_hits = try allocator.alloc(idx.WordHit, ranked.len);
+        for (ranked, 0..) |r, i| out_hits[i] = .{ .doc_id = r.doc_id, .line_num = r.line };
+        return out_hits;
     }
 
     /// Format a word-index lookup directly from the posting list. The indexer
@@ -3507,6 +3636,20 @@ pub const Explorer = struct {
 
         self.mu.lockShared();
         defer self.mu.unlockShared();
+
+        // #569: multi-word queries fall back to per-token matching — one line
+        // per file, files hitting more distinct tokens first.
+        if (std.mem.indexOfScalar(u8, word, ' ') != null) {
+            const hits = try self.searchWordTokensLocked(word, allocator);
+            defer allocator.free(hits);
+            try out.ensureUnusedCapacity(allocator, 64 + hits.len * 48);
+            const w = cio.listWriter(out, allocator);
+            try w.print("{d} hits for '{s}' (tokenized):\n", .{ hits.len, word });
+            for (hits) |h| {
+                try w.print("  {s}:{d}\n", .{ self.word_index.hitPath(h), h.line_num });
+            }
+            return;
+        }
 
         const hits = self.word_index.search(word);
         try out.ensureUnusedCapacity(allocator, 64 + hits.len * 48);
@@ -3738,7 +3881,17 @@ pub const Explorer = struct {
     pub fn getImportedBy(self: *Explorer, path: []const u8, allocator: std.mem.Allocator) ![]const []const u8 {
         self.mu.lockShared();
         defer self.mu.unlockShared();
-        return self.dep_graph.getImportedBy(path, allocator);
+        // A bare import resolved only by basename is ambiguous when 2+ indexed files
+        // share that basename; disable the basename fallback in that case so it is not
+        // attributed to every same-basename file (e.g. a/conf.py and b/conf.py).
+        const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |pos| path[pos + 1 ..] else path;
+        var basename_count: usize = 0;
+        var it = self.outlines.keyIterator();
+        while (it.next()) |k| {
+            const kb = if (std.mem.lastIndexOfScalar(u8, k.*, '/')) |p| k.*[p + 1 ..] else k.*;
+            if (std.mem.eql(u8, kb, basename)) basename_count += 1;
+        }
+        return self.dep_graph.getImportedByFiltered(path, allocator, basename_count <= 1);
     }
 
     pub fn renderImportedBy(self: *Explorer, path: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !struct { count: usize, known: bool } {
@@ -3940,24 +4093,22 @@ pub const Explorer = struct {
             }
         } else if (startsWith(line, "import ") or startsWith(line, "from ")) {
             try appendOutlineSymbol(a, outline, line, .import, line_num, null);
-            // Extract module path and convert dots to slashes for dep matching.
-            // "from mypackage.utils.helpers import X" → "mypackage/utils/helpers.py"
-            // "import os.path" → "os/path.py"
-            if (extractPythonModulePath(line)) |mod_path| {
-                var buf: [512]u8 = undefined;
-                var pos: usize = 0;
-                for (mod_path) |c| {
-                    if (pos >= buf.len - 3) break;
-                    buf[pos] = if (c == '.') '/' else c;
-                    pos += 1;
+            if (startsWith(line, "from ")) {
+                // "from mypackage.utils import X" -> mypackage/utils.py (single module dep)
+                if (extractPythonModulePath(line)) |mod_path| {
+                    try appendPythonModuleDep(a, outline, mod_path);
                 }
-                if (pos + 3 <= buf.len) {
-                    buf[pos] = '.';
-                    buf[pos + 1] = 'p';
-                    buf[pos + 2] = 'y';
-                    pos += 3;
+            } else {
+                // "import a, b.c, d as e" -- record one dep per comma-separated module.
+                const rest = std.mem.trimStart(u8, line[7..], " \t");
+                var it = std.mem.splitScalar(u8, rest, ',');
+                while (it.next()) |raw| {
+                    var mod = std.mem.trim(u8, raw, " \t");
+                    if (std.mem.indexOf(u8, mod, " as ")) |as_pos| mod = std.mem.trimEnd(u8, mod[0..as_pos], " \t");
+                    if (std.mem.indexOfScalar(u8, mod, ' ')) |sp| mod = mod[0..sp];
+                    if (mod.len == 0 or mod[0] == '.') continue;
+                    try appendPythonModuleDep(a, outline, mod);
                 }
-                try appendImportPath(a, outline, buf[0..pos]);
             }
         }
     }
@@ -5642,17 +5793,13 @@ fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 
 fn pathHasSegment(path: []const u8, segment: []const u8) bool {
     var iter = std.mem.tokenizeAny(u8, path, "/\\");
-    while (iter.next()) |seg| {
-        if (std.mem.eql(u8, seg, segment)) return true;
-    }
+    while (iter.next()) |seg| if (std.mem.eql(u8, seg, segment)) return true;
     return false;
 }
 
 fn pathHasSegmentIgnoreCase(path: []const u8, segment: []const u8) bool {
     var iter = std.mem.tokenizeAny(u8, path, "/\\");
-    while (iter.next()) |seg| {
-        if (asciiEqlIgnoreCase(seg, segment)) return true;
-    }
+    while (iter.next()) |seg| if (asciiEqlIgnoreCase(seg, segment)) return true;
     return false;
 }
 fn startsWith(haystack: []const u8, needle: []const u8) bool {
@@ -5806,6 +5953,9 @@ fn parseDelimitedImport(line: []const u8, prefix: []const u8, delimiter: []const
     if (delimiter.len > 0) {
         if (std.mem.indexOf(u8, body, delimiter)) |end| body = body[0..end];
     }
+    // Strip a trailing `as <alias>` (Kotlin/Swift aliased import: `import X as Y`) so the
+    // dep key is the imported path X, not "X as Y".
+    if (std.mem.indexOf(u8, body, " as ")) |as_pos| body = body[0..as_pos];
     body = std.mem.trim(u8, body, " \t;");
     return if (body.len > 0) body else null;
 }
@@ -5833,9 +5983,7 @@ fn extractJvmMethodName(line: []const u8) ?[]const u8 {
 
 fn isControlKeyword(name: []const u8) bool {
     const keywords = [_][]const u8{ "if", "for", "while", "switch", "catch", "return", "throw", "new", "when" };
-    for (keywords) |kw| {
-        if (std.mem.eql(u8, name, kw)) return true;
-    }
+    for (keywords) |kw| if (std.mem.eql(u8, name, kw)) return true;
     return false;
 }
 
@@ -6230,9 +6378,7 @@ fn isCKeyword(s: []const u8) bool {
         "typedef",  "static",   "extern", "inline", "const",    "volatile",
         "register", "restrict", "auto",   "break",  "continue",
     };
-    for (keywords) |kw| {
-        if (std.mem.eql(u8, s, kw)) return true;
-    }
+    for (keywords) |kw| if (std.mem.eql(u8, s, kw)) return true;
     return false;
 }
 
@@ -6417,9 +6563,7 @@ fn resolveDartImport(raw: []const u8, file_path: []const u8, allocator: std.mem.
 }
 
 fn containsAny(s: []const u8, needles: []const []const u8) bool {
-    for (needles) |needle| {
-        if (std.mem.indexOf(u8, s, needle) != null) return true;
-    }
+    for (needles) |needle| if (std.mem.indexOf(u8, s, needle) != null) return true;
     return false;
 }
 
@@ -6443,7 +6587,7 @@ fn extractPythonModulePath(line: []const u8) ?[]const u8 {
         const rest = std.mem.trimStart(u8, line[5..], " \t");
         // Skip relative imports (start with dot)
         if (rest.len > 0 and rest[0] == '.') return null;
-        // "from module.path import ..." — extract up to " import"
+        // "from module.path import ..." -- extract up to " import"
         if (std.mem.indexOf(u8, rest, " import")) |imp_pos| {
             const mod = std.mem.trimEnd(u8, rest[0..imp_pos], " \t");
             if (mod.len > 0) return mod;
@@ -6451,13 +6595,33 @@ fn extractPythonModulePath(line: []const u8) ?[]const u8 {
         return null;
     } else if (startsWith(line, "import ")) {
         const rest = std.mem.trimStart(u8, line[7..], " \t");
-        // "import os.path" or "import foo" — take up to comma or space
+        // "import os.path" or "import foo" -- take up to comma or space
         var end: usize = 0;
         while (end < rest.len and rest[end] != ' ' and rest[end] != ',' and rest[end] != '\t') : (end += 1) {}
         if (end > 0) return rest[0..end];
         return null;
     }
     return null;
+}
+
+// Convert a Python module path (`os.path`, `mypackage.utils`) to a repo-style dep key
+// (`os/path.py`) and record it on the outline. Shared by the `from` branch and the
+// comma-split `import a, b` branch in parsePythonLine.
+fn appendPythonModuleDep(a: std.mem.Allocator, outline: *FileOutline, mod_path: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    for (mod_path) |c| {
+        if (pos >= buf.len - 3) break;
+        buf[pos] = if (c == '.') '/' else c;
+        pos += 1;
+    }
+    if (pos + 3 <= buf.len) {
+        buf[pos] = '.';
+        buf[pos + 1] = 'p';
+        buf[pos + 2] = 'y';
+        pos += 3;
+    }
+    try appendImportPath(a, outline, buf[0..pos]);
 }
 
 // ── Fuzzy file matching ─────────────────────────────────────────
@@ -6484,9 +6648,7 @@ fn isSpecialEntryPoint(filename: []const u8) bool {
         "Makefile",     "build.zig",   "Cargo.toml",
         "package.json",
     };
-    for (specials) |s| {
-        if (std.mem.eql(u8, filename, s)) return true;
-    }
+    for (specials) |s| if (std.mem.eql(u8, filename, s)) return true;
     return false;
 }
 

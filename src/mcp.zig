@@ -1782,20 +1782,16 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             if (rendered) return;
         }
 
-        // Multi-word queries express natural-language / conceptual intent —
-        // rank them by BM25 (relevance) instead of raw substring order, which
-        // returns nothing for a phrase. Single-token queries keep literal
-        // substring matching so exact-identifier lookups still work.
-        const multiword = std.mem.indexOfScalar(u8, query, ' ') != null;
+        // Query-shape-aware routing lives in Explorer.searchContentAuto so the CLI
+        // (`runQuery`) and this MCP handler rank identically (#546): a multi-word
+        // query goes to BM25 + centrality, a single token keeps literal substring
+        // matching so exact-identifier lookups still work.
         // Over-fetch by `offset` (+1) so we can page into a stable window and
-        // detect whether more results exist beyond this page. BM25 ranking is
+        // detect whether more results exist beyond this page. Ranking is
         // deterministic per query, so the offset is a stable, stateless cursor.
         const want_count = @min(offset_n + max_results + 1, 100000);
         var fetch_count = want_count;
-        var fetched = (if (multiword)
-            explorer.searchContentRanked(query, alloc, fetch_count)
-        else
-            explorer.searchContent(query, alloc, fetch_count)) catch {
+        var fetched = explorer.searchContentAuto(query, alloc, fetch_count) catch {
             out.appendSlice(alloc, "error: search failed") catch {};
             return;
         };
@@ -1818,10 +1814,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
                     alloc.free(r.path);
                 }
                 alloc.free(fetched);
-                fetched = (if (multiword)
-                    explorer.searchContentRanked(query, alloc, fetch_count)
-                else
-                    explorer.searchContent(query, alloc, fetch_count)) catch {
+                fetched = explorer.searchContentAuto(query, alloc, fetch_count) catch {
                     out.appendSlice(alloc, "error: search failed") catch {};
                     return;
                 };
@@ -2661,6 +2654,7 @@ fn handleDeps(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
             };
             if (rendered.count == 0) {
                 w.writeAll("  (none)\n") catch {};
+                w.writeAll("(0 files)\n") catch {};
                 if (!rendered.known) appendFuzzyPathSuggestions(alloc, out, explorer, path);
             } else {
                 w.print("({d} files)\n", .{rendered.count}) catch {};
@@ -2689,6 +2683,9 @@ fn handleDeps(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
     }
     if (results.len == 0) {
         w.writeAll("  (none)\n") catch {};
+        // #568: empty lists must keep the '(N files)' summary so machine
+        // consumers never have to special-case the '(none)' sentinel.
+        w.writeAll("(0 files)\n") catch {};
         // Bug 4: if the path isn't indexed at all, agents read "(none)" as
         // "file exists but no callers" — which is wrong. Append fuzzy
         // suggestions so a typo is recoverable in one shot.
@@ -2713,6 +2710,7 @@ fn handleDepsPathOnly(alloc: std.mem.Allocator, path: []const u8, out: *std.Arra
     };
     if (rendered.count == 0) {
         w.writeAll("  (none)\n") catch {};
+        w.writeAll("(0 files)\n") catch {};
         if (!rendered.known) appendFuzzyPathSuggestions(alloc, out, explorer, path);
     } else {
         w.print("({d} files)\n", .{rendered.count}) catch {};
@@ -3397,9 +3395,7 @@ fn isRemoteRepoChar(c: u8) bool {
 fn isRemoteRepoPart(part: []const u8) bool {
     if (part.len == 0) return false;
     if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
-    for (part) |c| {
-        if (!isRemoteRepoChar(c)) return false;
-    }
+    for (part) |c| if (!isRemoteRepoChar(c)) return false;
     return true;
 }
 
@@ -4410,6 +4406,11 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
 
     var file_set: std.ArrayList([]const u8) = .empty;
     defer file_set.deinit(alloc);
+    // Strings the deps op appends to file_set must outlive the per-file deps_result
+    // (freed each iteration); own them in a scoped arena freed at pipeline end.
+    var deps_arena = std.heap.ArenaAllocator.init(alloc);
+    defer deps_arena.deinit();
+    const deps_alloc = deps_arena.allocator();
     var have_set = false;
     const w = cio.listWriter(out, alloc);
 
@@ -4543,12 +4544,11 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
             // Accepts optional 'path' for standalone use without a prior seeding step.
             if (!have_set) {
                 if (getStr(step, "path")) |p| {
-                    const duped = alloc.dupe(u8, p) catch {
+                    const duped = deps_alloc.dupe(u8, p) catch {
                         w.print("error: out of memory\n", .{}) catch {};
                         return;
                     };
                     file_set.append(alloc, duped) catch {
-                        alloc.free(duped);
                         w.print("error: out of memory\n", .{}) catch {};
                         return;
                     };
@@ -4610,8 +4610,11 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
 
                 for (deps_result) |dep| {
                     if (!expanded.contains(dep)) {
-                        expanded.put(dep, {}) catch {};
-                        file_set.append(alloc, dep) catch {};
+                        // Own the string in the deps arena so it outlives deps_result
+                        // (freed by the defer above) once stored in file_set / expanded.
+                        const owned = deps_alloc.dupe(u8, dep) catch continue;
+                        expanded.put(owned, {}) catch {};
+                        file_set.append(alloc, owned) catch {};
                     }
                 }
             }

@@ -726,7 +726,7 @@ fn loadOutlineStateMap(io: std.Io, snapshot_path: []const u8, allocator: std.mem
         const import_count = try readSectionInt(u32, bytes, &cursor);
         try outline.imports.ensureTotalCapacity(allocator, import_count);
         for (0..import_count) |_| {
-            const imp = try readSectionStringBorrowed(bytes, &cursor, 4096);
+            const imp = try readSectionStringBorrowed(bytes, &cursor, std.math.maxInt(u16));
             outline.imports.appendAssumeCapacity(imp);
         }
 
@@ -1302,50 +1302,46 @@ fn parseJsonU64(json: []const u8, key: []const u8) ?u64 {
 /// the two are parity-tested in test_snapshot.zig ("issue-528: isSensitivePath
 /// parity") so any future drift in this security filter fails CI.
 pub fn isSensitivePath(path: []const u8) bool {
-    const sensitive_names = [_][]const u8{
-        ".env",
-        ".env.local",
-        ".env.production",
-        ".env.development",
-        ".env.staging",
-        ".env.test",
-        ".dev.vars",
-        "credentials.json",
-        "service-account.json",
-        "secrets.json",
-        "secrets.yaml",
-        "secrets.yml",
-        ".npmrc",
-        ".pypirc",
-        ".netrc",
-        "id_rsa",
-        "id_ed25519",
-        ".pem",
-    };
-
-    // Check exact filename (basename)
     const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| path[sep + 1 ..] else path;
-
+    // Fast path: most source files have extensions like .zig, .ts, .py — none start with '.'
+    // or match sensitive patterns. Skip the full check for common cases.
+    if (basename.len == 0) return false;
+    const first = basename[0];
+    // Only check sensitive names if basename starts with '.', 'c', 's', 'i' or has key/cert extension
+    if (first != '.' and first != 'c' and first != 's' and first != 'i') {
+        // Still need to check extensions and directory patterns
+        if (std.mem.endsWith(u8, basename, ".env") or
+            std.mem.endsWith(u8, basename, ".pem") or
+            std.mem.endsWith(u8, basename, ".key") or
+            std.mem.endsWith(u8, basename, ".p12") or
+            std.mem.endsWith(u8, basename, ".pfx") or
+            std.mem.endsWith(u8, basename, ".jks")) return true;
+        if (std.mem.indexOf(u8, path, ".ssh/") != null or
+            std.mem.indexOf(u8, path, ".gnupg/") != null or
+            std.mem.indexOf(u8, path, ".aws/") != null) return true;
+        return false;
+    }
+    // .env, .env.<token>; do NOT match .envoy, .envrc, .environment, etc.
+    if (basename.len >= 4 and std.mem.eql(u8, basename[0..4], ".env") and
+        (basename.len == 4 or basename[4] == '.' or basename[4] == '-' or basename[4] == '_')) return true;
+    // Exact matches
+    const sensitive_names = [_][]const u8{
+        ".dev.vars",        ".npmrc",               ".pypirc",      ".netrc",
+        "credentials.json", "service-account.json", "secrets.json", "secrets.yaml",
+        "secrets.yml",      "id_rsa",               "id_ed25519",   ".git-credentials",
+    };
     for (sensitive_names) |name| {
         if (std.mem.eql(u8, basename, name)) return true;
     }
-
-    // Catch .env, .env.anything; do NOT match .envoy, .envrc, .environment, etc.
-    if (basename.len >= 4 and std.mem.eql(u8, basename[0..4], ".env") and
-        (basename.len == 4 or basename[4] == '.' or basename[4] == '-' or basename[4] == '_')) return true;
-
-    // Check extensions
-    if (endsWith(basename, ".pem")) return true;
-    if (endsWith(basename, ".key")) return true;
-    if (endsWith(basename, ".p12")) return true;
-    if (endsWith(basename, ".pfx")) return true;
-    if (endsWith(basename, ".jks")) return true;
-
-    // Check directory patterns
-    if (std.mem.indexOf(u8, path, ".ssh/") != null) return true;
-    if (std.mem.indexOf(u8, path, ".gnupg/") != null) return true;
-    if (std.mem.indexOf(u8, path, ".aws/") != null) return true;
-
+    if (std.mem.endsWith(u8, basename, ".env") or
+        std.mem.endsWith(u8, basename, ".pem") or
+        std.mem.endsWith(u8, basename, ".key") or
+        std.mem.endsWith(u8, basename, ".p12") or
+        std.mem.endsWith(u8, basename, ".pfx") or
+        std.mem.endsWith(u8, basename, ".jks")) return true;
+    if (std.mem.indexOf(u8, path, ".ssh/") != null or
+        std.mem.indexOf(u8, path, ".gnupg/") != null or
+        std.mem.indexOf(u8, path, ".aws/") != null) return true;
     return false;
 }
 fn endsWith(s: []const u8, suffix: []const u8) bool {
