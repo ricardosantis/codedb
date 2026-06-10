@@ -1749,3 +1749,31 @@ test "issue-562: codedb_callers excludes full-line comment mentions" {
     // …and must not inflate the header count.
     try testing.expect(std.mem.indexOf(u8, out.items, "1 call sites for 'insertThing'") != null);
 }
+
+
+test "issue-580: basename test files rank below non-test source for concept queries" {
+    // rerankSignalScore's test penalty only matches DIRECTORY segments named
+    // test/tests, so files like src/tests.zig or src/widget_tests.zig dodge
+    // the ×0.6 entirely (live: 'codedb search snapshot' put src/tests.zig at
+    // file-rank 3, above non-test source). BM25's pathRelevanceMultiplier
+    // already checks the basename — the scan-rerank path must match it.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    // The test-named file mentions the term more densely (as test files do);
+    // without a basename penalty it outranks the implementation line.
+    try explorer.indexFile("src/zz_tests.zig", "pub fn x() void { _ = conceptTerm; _ = conceptTerm; _ = conceptTerm; }\n");
+    try explorer.indexFile("src/owner.zig", "pub fn x() void { _ = conceptTerm; _ = conceptTerm; }\n");
+
+    const results = try explorer.searchContent("conceptTerm", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expect(results.len >= 2);
+    try testing.expectEqualStrings("src/owner.zig", results[0].path);
+}
