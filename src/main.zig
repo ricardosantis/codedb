@@ -587,7 +587,7 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
         // reach the same warm tools the MCP surface exposes.
         var nav: std.ArrayList(u8) = .empty;
         defer nav.deinit(allocator);
-        if (mcp_server.runCliTool(io, allocator, explorer, root, cmd, args, cmd_args_start, &nav)) |code| {
+        if (mcp_server.runCliTool(io, allocator, explorer, store, root, cmd, args, cmd_args_start, &nav)) |code| {
             out.p("{s}", .{nav.items});
             return code;
         }
@@ -677,7 +677,7 @@ fn cliWriteFull(fd: c_int, data: []const u8) bool {
 /// will proxy. Everything else (serve, mcp, snapshot, index, ...) is handled
 /// only by the cold path.
 fn cliIsQueryCmd(cmd: []const u8) bool {
-    const cmds = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "status", "symbol", "callers", "callpath", "deps", "glob", "ls", "file", "context" };
+    const cmds = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "status", "symbol", "callers", "callpath", "deps", "glob", "ls", "file", "context", "changes" };
     for (cmds) |c| {
         if (std.mem.eql(u8, cmd, c)) return true;
     }
@@ -1381,7 +1381,7 @@ fn mainImpl() !void {
         std.mem.eql(u8, cmd, "hot") or std.mem.eql(u8, cmd, "symbol") or std.mem.eql(u8, cmd, "callers") or
         std.mem.eql(u8, cmd, "callpath") or std.mem.eql(u8, cmd, "deps") or std.mem.eql(u8, cmd, "glob") or
         std.mem.eql(u8, cmd, "ls") or std.mem.eql(u8, cmd, "file") or std.mem.eql(u8, cmd, "context") or
-        std.mem.eql(u8, cmd, "status"))
+        std.mem.eql(u8, cmd, "changes") or std.mem.eql(u8, cmd, "status"))
     {
         const code = runQuery(io, allocator, &explorer, &store, abs_root, cmd, args, cmd_args_start, &out, s);
         out.flush();
@@ -1758,6 +1758,10 @@ fn mainImpl() !void {
         out.p("{s}\xe2\x9c\x97{s} unknown command: {s}{s}{s}\n", .{
             s.red, s.reset, s.bold, cmd, s.reset,
         });
+        // #578: flush before exit — std.process.exit skips buffered output, so
+        // the 'unknown command' line was silently lost (observed as exit 1
+        // with no output at all).
+        out.flush();
         std.process.exit(1);
     }
 }
@@ -1943,7 +1947,7 @@ pub fn isValidMcpFlag(arg: []const u8) bool {
 }
 
 fn isCommand(arg: []const u8) bool {
-    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "status", "symbol", "callers", "callpath", "deps", "glob", "ls", "file", "context", "snapshot", "serve", "mcp", "update", "nuke", "cli-daemon" };
+    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "status", "symbol", "callers", "callpath", "deps", "glob", "ls", "file", "context", "changes", "snapshot", "serve", "mcp", "update", "nuke", "cli-daemon" };
     for (commands) |c| {
         if (std.mem.eql(u8, arg, c)) return true;
     }

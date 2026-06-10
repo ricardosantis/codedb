@@ -2029,10 +2029,13 @@ test "issue-573: cli bridge must not bind a leading flag as the positional name"
     defer explorer.deinit();
     try explorer.indexFile("src/a.zig", "pub fn indexFile() void {}\npub fn caller() void {\n    indexFile();\n}\n");
 
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
     const argv = [_][]const u8{ "--max-results", "3", "indexFile" };
-    const code = mcp_mod.runCliTool(io, testing.allocator, &explorer, ".", "callers", &argv, 0, &out);
+    const code = mcp_mod.runCliTool(io, testing.allocator, &explorer, &store, ".", "callers", &argv, 0, &out);
     try testing.expect(code != null);
     // The flag must not be reported as the function name…
     try testing.expect(std.mem.indexOf(u8, out.items, "call sites for '--max-results'") == null);
@@ -2041,8 +2044,6 @@ test "issue-573: cli bridge must not bind a leading flag as the positional name"
 
     // Companion UX defect, same audit: an explicitly empty symbol name must be
     // a usage error (mirrors codedb_callers), not "no results for: ".
-    var store = Store.init(testing.allocator);
-    defer store.deinit();
     var agents = AgentRegistry.init(testing.allocator);
     defer agents.deinit();
     _ = try agents.register("__filesystem__");
@@ -2122,7 +2123,7 @@ test "issue-578: cli bridge serves codedb_changes" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
     const argv = [_][]const u8{};
-    const code = mcp_mod.runCliTool(io, testing.allocator, &explorer, ".", "changes", &argv, 0, &out);
+    const code = mcp_mod.runCliTool(io, testing.allocator, &explorer, &store, ".", "changes", &argv, 0, &out);
     // Pre-#578 the bridge did not know 'changes' and returned null.
     try testing.expect(code != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "seq:") != null);
