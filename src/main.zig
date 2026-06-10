@@ -1124,7 +1124,12 @@ fn mainImpl() !void {
     // and skip the per-invocation snapshot reload entirely. Falls through to
     // the cold in-process path below when no daemon answers. Must run before
     // getDataDir + the load section so the proxied call pays none of that cost.
-    if (cliIsQueryCmd(cmd)) {
+    // CODEDB_NO_CLI_DAEMON disables the thin client ENTIRELY — proxy and
+    // auto-spawn — so benchmarks/tests pin the in-process path. It previously
+    // gated only the spawn, so a pre-existing daemon still answered queries
+    // despite the variable (observed while profiling #564: a stray cli-daemon
+    // served 'search' in 944µs with the variable set).
+    if (cliIsQueryCmd(cmd) and cio.posixGetenv("CODEDB_NO_CLI_DAEMON") == null) {
         if (cliTryProxy(io, allocator, abs_root, args, use_color)) |code| {
             out.flush();
             std.process.exit(code);
@@ -1133,10 +1138,9 @@ fn mainImpl() !void {
         // is warm; this call still falls through to the cold path below. The
         // daemon is the SAME binary (resolved via the self-exe path) run as
         // `codedb <abs_root> cli-daemon`, with stdio redirected to /dev/null and
-        // no waitpid (fire-and-forget). Gated by CODEDB_NO_CLI_DAEMON and skipped
-        // for an empty root. cli-daemon is not a query command, so the spawned
-        // process won't recurse into this path.
-        if (cio.posixGetenv("CODEDB_NO_CLI_DAEMON") == null and abs_root.len > 0) {
+        // no waitpid (fire-and-forget). Skipped for an empty root. cli-daemon is
+        // not a query command, so the spawned process won't recurse into this path.
+        if (abs_root.len > 0) {
             if (std.process.executablePathAlloc(io, allocator)) |self_exe| {
                 defer allocator.free(self_exe);
                 const daemon_argv = [_][]const u8{ self_exe, abs_root, "cli-daemon" };
