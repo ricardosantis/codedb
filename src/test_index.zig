@@ -3032,3 +3032,48 @@ test "issue-447: searchContent surfaces large (>64KB) skip-trigram files for com
     try testing.expect(found_canonical);
 }
 
+
+test "issue-583: disk-loaded word index — re-index and removeFile must drop stale postings" {
+    // readFromDisk/mmapFromDisk set skip_file_words=true, which made removeFile
+    // a silent no-op (file_words is empty). In a daemon that fast-loads the
+    // index, every file edit then APPENDS postings while the stale ones stay:
+    // deleted terms keep hitting (wrong lines), deleted files ghost-hit, and
+    // postings grow without bound across re-saves (RSS).
+    const alloc = testing.allocator;
+    var wi = WordIndex.init(alloc);
+    defer wi.deinit();
+    try wi.indexFile("src/a.zig", "pub fn alphaToken() void {}\n");
+    try wi.indexFile("src/b.zig", "pub fn betaToken() void {}\n");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+    try wi.writeToDisk(io, dir_path, null);
+
+    // Heap fast-load: re-indexing a file must drop its old postings.
+    var loaded = WordIndex.readFromDisk(io, dir_path, alloc).?;
+    defer loaded.deinit();
+    try loaded.indexFile("src/a.zig", "pub fn gammaToken() void {}\n");
+    const stale = try loaded.searchDeduped("alphaToken", alloc);
+    defer alloc.free(stale);
+    try testing.expectEqual(@as(usize, 0), stale.len);
+    const fresh = try loaded.searchDeduped("gammaToken", alloc);
+    defer alloc.free(fresh);
+    try testing.expectEqual(@as(usize, 1), fresh.len);
+
+    // Deleting a file must drop its postings outright.
+    loaded.removeFile("src/b.zig");
+    const ghost = try loaded.searchDeduped("betaToken", alloc);
+    defer alloc.free(ghost);
+    try testing.expectEqual(@as(usize, 0), ghost.len);
+
+    // Zero-copy mmap load: removeFile is a write — it must promote, not no-op.
+    var mloaded = WordIndex.mmapFromDisk(io, dir_path, alloc).?;
+    defer mloaded.deinit();
+    mloaded.removeFile("src/a.zig");
+    const mghost = try mloaded.searchDeduped("alphaToken", alloc);
+    defer alloc.free(mghost);
+    try testing.expectEqual(@as(usize, 0), mghost.len);
+}
