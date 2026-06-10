@@ -2104,3 +2104,26 @@ test "issue-576: codedb_ls distinguishes a non-indexed path from an empty listin
     bench_ctx.runDispatch(io, testing.allocator, .codedb_ls, &ok_parsed.value.object, &ok_out, &store, &explorer, &agents);
     try testing.expect(std.mem.indexOf(u8, ok_out.items, "a.zig") != null);
 }
+
+
+test "issue-578: cli bridge serves codedb_changes" {
+    // `codedb changes` parsed as a ROOT directory (unknown first token in the
+    // [root] <command> grammar) and printed usage — codedb_changes existed
+    // only as an MCP tool because the bridge had no store to hand to
+    // handleChanges. The bridge must serve it like the other read-only tools.
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/a.zig", "pub fn a() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    _ = store.recordSnapshot("src/a.zig", 10, 123) catch {};
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    const argv = [_][]const u8{};
+    const code = mcp_mod.runCliTool(io, testing.allocator, &explorer, ".", "changes", &argv, 0, &out);
+    // Pre-#578 the bridge did not know 'changes' and returned null.
+    try testing.expect(code != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "seq:") != null);
+}
