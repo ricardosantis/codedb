@@ -1710,3 +1710,42 @@ test "issue-560: path_glob page must not be starved by higher-ranked out-of-glob
     // And the header must not claim zero results.
     try testing.expect(std.mem.indexOf(u8, out.items, "0 results") == null);
 }
+
+
+test "issue-562: codedb_callers excludes full-line comment mentions" {
+    // Live repro: callers of insertRestoredFile reported snapshot.zig:822
+    // ('// is false: insertRestoredFile errors above…') and a test-file
+    // comment as call sites. A full-line comment is documentation, not a
+    // call — it must not be counted or rendered.
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/zlib.zig", "pub fn insertThing() void {}\n");
+    try explorer.indexFile("src/caller.zig", "pub fn doIt() void {\n    insertThing();\n}\n");
+    try explorer.indexFile("src/noisy.zig", "// insertThing errors above if the path already exists\npub fn unrelated() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"name":"insertThing"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_callers, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // The real call site stays.
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/caller.zig:2") != null);
+    // The comment mention must not appear as a call site…
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/noisy.zig") == null);
+    // …and must not inflate the header count.
+    try testing.expect(std.mem.indexOf(u8, out.items, "1 call sites for 'insertThing'") != null);
+}
