@@ -1949,7 +1949,10 @@ fn handleCallers(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
 
     var shown: usize = 0;
     for (results) |r| {
-        if (!langHasCallSites(explore_mod.detectLanguage(r.path))) continue;
+        const lang = explore_mod.detectLanguage(r.path);
+        if (!langHasCallSites(lang)) continue;
+        // #562: a full-line comment mention is documentation, not a call site.
+        if (explore_mod.isCommentOrBlank(r.line_text, lang)) continue;
         var is_def = false;
         for (defs) |d| {
             if (r.line_num == d.symbol.line_start and std.mem.eql(u8, r.path, d.path)) {
@@ -1965,7 +1968,10 @@ fn handleCallers(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
     const w = cio.listWriter(out, alloc);
     w.print("{d} call sites for '{s}':\n", .{ shown, name }) catch {};
     for (results) |r| {
-        if (!langHasCallSites(explore_mod.detectLanguage(r.path))) continue;
+        const lang = explore_mod.detectLanguage(r.path);
+        if (!langHasCallSites(lang)) continue;
+        // #562: a full-line comment mention is documentation, not a call site.
+        if (explore_mod.isCommentOrBlank(r.line_text, lang)) continue;
         var is_def = false;
         for (defs) |d| {
             if (r.line_num == d.symbol.line_start and std.mem.eql(u8, r.path, d.path)) {
