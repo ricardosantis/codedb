@@ -2654,6 +2654,7 @@ fn handleDeps(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
             };
             if (rendered.count == 0) {
                 w.writeAll("  (none)\n") catch {};
+                w.writeAll("(0 files)\n") catch {};
                 if (!rendered.known) appendFuzzyPathSuggestions(alloc, out, explorer, path);
             } else {
                 w.print("({d} files)\n", .{rendered.count}) catch {};
@@ -2682,6 +2683,9 @@ fn handleDeps(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
     }
     if (results.len == 0) {
         w.writeAll("  (none)\n") catch {};
+        // #568: empty lists must keep the '(N files)' summary so machine
+        // consumers never have to special-case the '(none)' sentinel.
+        w.writeAll("(0 files)\n") catch {};
         // Bug 4: if the path isn't indexed at all, agents read "(none)" as
         // "file exists but no callers" — which is wrong. Append fuzzy
         // suggestions so a typo is recoverable in one shot.
@@ -2706,6 +2710,7 @@ fn handleDepsPathOnly(alloc: std.mem.Allocator, path: []const u8, out: *std.Arra
     };
     if (rendered.count == 0) {
         w.writeAll("  (none)\n") catch {};
+        w.writeAll("(0 files)\n") catch {};
         if (!rendered.known) appendFuzzyPathSuggestions(alloc, out, explorer, path);
     } else {
         w.print("({d} files)\n", .{rendered.count}) catch {};
