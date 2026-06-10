@@ -1916,3 +1916,43 @@ test "audit: searchContent loses a word-indexed file >512KB evicted from the con
     // big.zig must be reachable now that the read cap matches the indexer's 64MB
     try testing.expect(found);
 }
+
+// ─── #546 follow-up: cold CLI scan leaves an empty-but-"complete" word index ───
+// main.zig's cold non-index scan disables the word index to save memory, but
+// word_index_complete defaults to true. Files commit into outlines/contents while
+// WordIndex.indexFile silently no-ops, so searchContentRanked trusts the flag,
+// skips the lazy rebuild, sees N == 0, and every multi-word CLI search on a cold
+// start returns nothing.
+test "issue-546: cold CLI scan (word index disabled) still ranks multi-word queries" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    // Mirror the cold CLI scan state (main.zig sets both for non-index commands).
+    explorer.word_index.skip_file_words = true;
+    explorer.word_index.enabled = false;
+
+    try explorer.indexFile("both.zig",
+        \\pub fn parseToken() void {
+        \\    parseToken();
+        \\    parseToken();
+        \\}
+    );
+    try explorer.indexFile("only_parse.zig",
+        \\pub fn parseFoo() void {
+        \\    parse();
+        \\}
+    );
+
+    const results = try explorer.searchContentAuto("parse Token", testing.allocator, 8);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.line_text);
+            testing.allocator.free(r.path);
+        }
+        testing.allocator.free(results);
+    }
+    // RED pre-fix: the empty index claims completeness, no rebuild runs, len == 0.
+    try testing.expect(results.len > 0);
+    try testing.expectEqualStrings("both.zig", results[0].path);
+}
