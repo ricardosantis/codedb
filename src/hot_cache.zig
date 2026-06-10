@@ -16,10 +16,22 @@ pub const ContentCache = struct {
     hits_: std.atomic.Value(u64),
     misses_: std.atomic.Value(u64),
     evictions_: std.atomic.Value(u64),
+    /// Total bytes of cache-owned values (borrowed values are exempt).
+    owned_bytes: usize,
+    /// CLOCK hand for the global budget sweep (window eviction has its own).
+    sweep_hand: u32,
+    /// Owned-value byte budget (#596); puts evict cold owned entries to stay under it.
+    byte_budget: usize,
+    /// Owned values larger than this are not cached at all — search re-reads
+    /// from disk on a miss, so refusing oversized values is safe.
+    max_entry_bytes: usize,
 
     // 8-way set-associative: at typical occupancy a full window (the only
     // eviction trigger) is vanishingly rare; probes stay short and contiguous.
     const PROBE_LIMIT: u32 = 8;
+
+    pub const DEFAULT_BYTE_BUDGET: usize = 256 * 1024 * 1024;
+    pub const DEFAULT_MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
 
     pub const Slot = struct {
         key_hash: u64,
@@ -47,8 +59,10 @@ pub const ContentCache = struct {
         evictions: u64,
         count: u32,
         capacity: u32,
+        owned_bytes: usize,
     };
 
+    /// capacity must be >= 1. Panics if the allocator cannot provide the slot array.
     /// capacity must be >= 1. Panics if the allocator cannot provide the slot array.
     pub fn init(allocator: std.mem.Allocator, capacity: u32) ContentCache {
         std.debug.assert(capacity >= 1);
@@ -63,6 +77,10 @@ pub const ContentCache = struct {
             .hits_ = std.atomic.Value(u64).init(0),
             .misses_ = std.atomic.Value(u64).init(0),
             .evictions_ = std.atomic.Value(u64).init(0),
+            .owned_bytes = 0,
+            .sweep_hand = 0,
+            .byte_budget = DEFAULT_BYTE_BUDGET,
+            .max_entry_bytes = DEFAULT_MAX_ENTRY_BYTES,
         };
     }
 
@@ -78,6 +96,10 @@ pub const ContentCache = struct {
             .hits_ = std.atomic.Value(u64).init(0),
             .misses_ = std.atomic.Value(u64).init(0),
             .evictions_ = std.atomic.Value(u64).init(0),
+            .owned_bytes = 0,
+            .sweep_hand = 0,
+            .byte_budget = DEFAULT_BYTE_BUDGET,
+            .max_entry_bytes = DEFAULT_MAX_ENTRY_BYTES,
         };
     }
 
@@ -110,6 +132,8 @@ pub const ContentCache = struct {
 
     /// Insert key/value, duping both into the cache allocator. On collision past
     /// the probe limit, evicts a cold slot via CLOCK sweep and frees its memory.
+    /// Insert key/value, duping both into the cache allocator. On collision past
+    /// the probe limit, evicts a cold slot via CLOCK sweep and frees its memory.
     pub fn put(self: *ContentCache, key: []const u8, value: []const u8) !void {
         return self.putImpl(key, value, true);
     }
@@ -119,11 +143,20 @@ pub const ContentCache = struct {
     /// stored as-is (no dupe) and is never freed by the cache; the key is still
     /// duped/owned as usual. The caller guarantees `value`'s backing stays valid
     /// for as long as the entry can live (until Explorer.deinit munmaps it).
+    /// Borrowed values are exempt from the byte budget.
     pub fn putBorrowed(self: *ContentCache, key: []const u8, value: []const u8) !void {
         return self.putImpl(key, value, false);
     }
 
     fn putImpl(self: *ContentCache, key: []const u8, value: []const u8, own: bool) !void {
+        if (own and (value.len > self.max_entry_bytes or value.len > self.byte_budget)) {
+            // Too large to cache; drop any stale entry for the key so get()
+            // cannot serve outdated content. Search re-reads from disk on miss.
+            self.remove(key);
+            return;
+        }
+        if (own) self.evictForBudget(value.len);
+
         const h = hashKey(key);
         const base = @as(u32, @truncate(h)) % self.capacity;
 
@@ -138,9 +171,13 @@ pub const ContentCache = struct {
                 if (slot.key_hash == h and std.mem.eql(u8, slot.key, key)) {
                     // Compute the new value first so a failed dupe leaves the slot intact.
                     const new_value = if (own) try self.allocator.dupe(u8, value) else value;
-                    if (slot.value_owned) self.allocator.free(slot.value);
+                    if (slot.value_owned) {
+                        self.owned_bytes -= slot.value.len;
+                        self.allocator.free(slot.value);
+                    }
                     slot.value = new_value;
                     slot.value_owned = own;
+                    if (own) self.owned_bytes += value.len;
                     slot.ref_bit = true;
                     return;
                 }
@@ -170,6 +207,7 @@ pub const ContentCache = struct {
                 victim = base;
             }
             const slot = &self.slots[victim.?];
+            if (slot.value_owned) self.owned_bytes -= slot.value.len;
             self.allocator.free(slot.key);
             if (slot.value_owned) self.allocator.free(slot.value);
             slot.* = empty_slot;
@@ -188,7 +226,39 @@ pub const ContentCache = struct {
         slot.value_owned = own;
         slot.ref_bit = true;
         slot.present = true;
+        if (own) self.owned_bytes += value.len;
         self.count_ += 1;
+    }
+
+    /// Evict cold owned entries (global second-chance sweep) until `incoming`
+    /// more owned bytes fit the byte budget. Borrowed entries are skipped —
+    /// evicting them frees no budget. Holes are safe: get() and putImpl()
+    /// always scan the full probe window. Stops when no owned victim remains.
+    fn evictForBudget(self: *ContentCache, incoming: usize) void {
+        while (self.owned_bytes + incoming > self.byte_budget) {
+            var victim: ?u32 = null;
+            var scanned: u32 = 0;
+            while (scanned < self.capacity * 2) : (scanned += 1) {
+                const idx = self.sweep_hand;
+                self.sweep_hand = (self.sweep_hand + 1) % self.capacity;
+                const slot = &self.slots[idx];
+                if (!slot.present or !slot.value_owned) continue;
+                if (slot.ref_bit) {
+                    slot.ref_bit = false;
+                    continue;
+                }
+                victim = idx;
+                break;
+            }
+            const idx = victim orelse return;
+            const slot = &self.slots[idx];
+            self.owned_bytes -= slot.value.len;
+            self.allocator.free(slot.key);
+            self.allocator.free(slot.value);
+            slot.* = empty_slot;
+            self.count_ -= 1;
+            _ = self.evictions_.fetchAdd(1, .monotonic);
+        }
     }
 
     pub fn remove(self: *ContentCache, key: []const u8) void {
@@ -200,7 +270,10 @@ pub const ContentCache = struct {
             const slot = &self.slots[slot_idx];
             if (slot.present and slot.key_hash == h and std.mem.eql(u8, slot.key, key)) {
                 self.allocator.free(slot.key);
-                if (slot.value_owned) self.allocator.free(slot.value);
+                if (slot.value_owned) {
+                    self.owned_bytes -= slot.value.len;
+                    self.allocator.free(slot.value);
+                }
                 slot.* = empty_slot;
                 self.count_ -= 1;
                 return;
@@ -217,6 +290,7 @@ pub const ContentCache = struct {
             }
         }
         self.count_ = 0;
+        self.owned_bytes = 0;
     }
 
     pub fn len(self: *const ContentCache) u32 {
@@ -238,6 +312,7 @@ pub const ContentCache = struct {
             .evictions = self.evictions_.load(.monotonic),
             .count = self.count_,
             .capacity = self.capacity,
+            .owned_bytes = self.owned_bytes,
         };
     }
 
@@ -390,4 +465,69 @@ test "ContentCache: mixed owned/borrowed — transitions and eviction free corre
     }
     try std.testing.expect(cache.len() <= 8);
     // No leak (DebugAllocator) and no bad free => the owned/borrowed split holds.
+}
+
+test "ContentCache: byte budget evicts owned values until the new value fits" {
+    var cache = try ContentCache.initAlloc(std.testing.allocator, 64);
+    defer cache.deinit();
+    cache.byte_budget = 1000;
+    cache.max_entry_bytes = 1000;
+
+    const v300 = "x" ** 300;
+    try cache.put("a", v300);
+    try cache.put("b", v300);
+    try cache.put("c", v300);
+    try std.testing.expectEqual(@as(usize, 900), cache.stats().owned_bytes);
+
+    try cache.put("d", v300);
+    const s = cache.stats();
+    try std.testing.expect(s.owned_bytes <= 1000);
+    try std.testing.expect(s.evictions >= 1);
+    try std.testing.expect(cache.get("d") != null);
+}
+
+test "ContentCache: per-entry ceiling refuses oversized values and drops the stale entry" {
+    var cache = try ContentCache.initAlloc(std.testing.allocator, 8);
+    defer cache.deinit();
+    cache.max_entry_bytes = 100;
+
+    try cache.put("k", "small");
+    try std.testing.expect(cache.get("k") != null);
+
+    const big = "y" ** 200;
+    try cache.put("k", big);
+    try std.testing.expect(cache.get("k") == null);
+    try std.testing.expectEqual(@as(usize, 0), cache.stats().owned_bytes);
+}
+
+test "ContentCache: borrowed values are exempt from the byte budget" {
+    var cache = try ContentCache.initAlloc(std.testing.allocator, 8);
+    defer cache.deinit();
+    cache.byte_budget = 10;
+
+    const big = "z" ** 1000;
+    try cache.putBorrowed("snap", big);
+    try std.testing.expect(cache.get("snap") != null);
+    try std.testing.expectEqual(@as(usize, 0), cache.stats().owned_bytes);
+    try std.testing.expectEqual(@as(u64, 0), cache.stats().evictions);
+
+    try cache.put("o", "abcdefgh");
+    try std.testing.expect(cache.get("o") != null);
+    try std.testing.expect(cache.get("snap") != null);
+}
+
+test "ContentCache: owned_bytes accounting tracks update, remove, and clear" {
+    var cache = try ContentCache.initAlloc(std.testing.allocator, 8);
+    defer cache.deinit();
+
+    try cache.put("k", "0123456789");
+    try std.testing.expectEqual(@as(usize, 10), cache.stats().owned_bytes);
+    try cache.put("k", "01234");
+    try std.testing.expectEqual(@as(usize, 5), cache.stats().owned_bytes);
+    try cache.put("j", "012");
+    try std.testing.expectEqual(@as(usize, 8), cache.stats().owned_bytes);
+    cache.remove("k");
+    try std.testing.expectEqual(@as(usize, 3), cache.stats().owned_bytes);
+    cache.clear();
+    try std.testing.expectEqual(@as(usize, 0), cache.stats().owned_bytes);
 }
