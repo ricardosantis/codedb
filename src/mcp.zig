@@ -4096,6 +4096,15 @@ fn handleLs(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std
     defer alloc.free(entries);
 
     if (entries.len == 0) {
+        // #576: an index only knows a directory through files under it, so an
+        // empty listing for a non-empty prefix means the path is not indexed —
+        // not that the directory is empty. The 'error:' prefix also gives the
+        // CLI bridge a non-zero exit via finishCli.
+        if (prefix.len > 0) {
+            const w = cio.listWriter(out, alloc);
+            w.print("error: no indexed files under '{s}' — check the path (codedb_tree shows the layout)", .{prefix}) catch {};
+            return;
+        }
         out.appendSlice(alloc, "no entries") catch {};
         return;
     }
