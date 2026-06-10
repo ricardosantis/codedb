@@ -2823,6 +2823,9 @@ pub const Explorer = struct {
 
         if (pathHasSegment(r.path, "tests") or pathHasSegment(r.path, "test")) score *= 0.6;
         if (pathHasSegment(r.path, "examples") or pathHasSegment(r.path, "example")) score *= 0.6;
+        if (pathHasSegment(r.path, "bench") or pathHasSegment(r.path, "benchmarks") or
+            pathHasSegment(r.path, "scripts") or pathHasSegment(r.path, "website") or
+            pathHasSegment(r.path, "install")) score *= 0.5;
         if (pathHasSegment(r.path, "vendor") or pathHasSegment(r.path, "node_modules") or
             pathHasSegment(r.path, "third_party")) score *= 0.4;
         // Doc-language penalty: markdown / data files (CHANGELOG.md, design
