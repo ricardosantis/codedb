@@ -219,7 +219,14 @@ pub const WordIndex = struct {
     ) !void {
         const gop = try self.index.getOrPut(token);
         if (!gop.found_existing) {
-            const duped = try self.allocator.dupe(u8, token);
+            // A failed dupe must take the fresh entry with it — the key still
+            // points at the tokenizer's stack buffer and the value is
+            // undefined; left in place, the next insert that lands on it
+            // dereferences garbage.
+            const duped = self.allocator.dupe(u8, token) catch |err| {
+                _ = self.index.remove(token);
+                return err;
+            };
             gop.key_ptr.* = duped;
             gop.value_ptr.* = .empty;
         }
@@ -376,7 +383,12 @@ pub const WordIndex = struct {
             const shard_hits = entry.value_ptr.items;
             const gop = try self.index.getOrPut(term);
             if (!gop.found_existing) {
-                const dterm = try self.allocator.dupe(u8, term);
+                // A failed dupe must take the fresh entry with it — the key
+                // still points at the shard's arena, freed after the merge.
+                const dterm = self.allocator.dupe(u8, term) catch |err| {
+                    _ = self.index.remove(term);
+                    return err;
+                };
                 gop.key_ptr.* = dterm;
                 gop.value_ptr.* = .empty;
             }
@@ -2399,8 +2411,26 @@ pub const AnyTrigramIndex = union(enum) {
     pub const MmapOverlay = struct {
         base: MmapTrigramIndex,
         overlay: TrigramIndex,
+        /// Paths whose base entries are superseded (re-indexed into the
+        /// overlay) or removed. Owns its keys; base answers for these paths
+        /// are filtered out everywhere.
+        masked: std.StringHashMap(void),
+        masked_in_base: u32 = 0,
+
+        fn mask(self: *MmapOverlay, path: []const u8) void {
+            if (self.masked.contains(path)) return;
+            const key = self.overlay.allocator.dupe(u8, path) catch return;
+            self.masked.put(key, {}) catch {
+                self.overlay.allocator.free(key);
+                return;
+            };
+            if (self.base.containsFile(path)) self.masked_in_base += 1;
+        }
 
         pub fn deinit(self: *MmapOverlay) void {
+            var it = self.masked.keyIterator();
+            while (it.next()) |k| self.overlay.allocator.free(k.*);
+            self.masked.deinit();
             self.base.deinit();
             self.overlay.deinit();
         }
@@ -2421,33 +2451,50 @@ pub const AnyTrigramIndex = union(enum) {
             .mmap_overlay => |*mo| blk: {
                 const base = mo.base.candidates(query, allocator);
                 const over = mo.overlay.candidates(query, allocator);
-                if (base == null and over == null) break :blk null;
-                if (base == null) break :blk over;
-                if (over == null) break :blk base;
-                // Merge and dedup — return null on alloc failure (triggers full scan fallback)
-                var merged = std.StringHashMap(void).init(allocator);
-                defer merged.deinit();
-                for (base.?) |p| merged.put(p, {}) catch {
-                    allocator.free(base.?);
-                    allocator.free(over.?);
-                    break :blk null;
-                };
-                for (over.?) |p| merged.put(p, {}) catch {
-                    allocator.free(base.?);
-                    allocator.free(over.?);
-                    break :blk null;
-                };
-                allocator.free(base.?);
-                allocator.free(over.?);
-                var result: std.ArrayList([]const u8) = .empty;
-                result.ensureTotalCapacity(allocator, merged.count()) catch break :blk null;
-                var it = merged.keyIterator();
-                while (it.next()) |k| result.appendAssumeCapacity(k.*);
-                break :blk result.toOwnedSlice(allocator) catch {
-                    result.deinit(allocator);
-                    break :blk null;
-                };
+                break :blk mergeOverlayCandidates(mo, base, over, allocator);
             },
+        };
+    }
+
+    /// Merge base + overlay candidate lists, dropping base hits for masked
+    /// (superseded or removed) paths. Returns null on alloc failure so callers
+    /// fall back to the full scan.
+    fn mergeOverlayCandidates(
+        mo: *const MmapOverlay,
+        base: ?[]const []const u8,
+        over: ?[]const []const u8,
+        allocator: std.mem.Allocator,
+    ) ?[]const []const u8 {
+        if (base == null and over == null) return null;
+        if (base == null) return over;
+        var merged = std.StringHashMap(void).init(allocator);
+        defer merged.deinit();
+        var failed = false;
+        for (base.?) |p| {
+            if (mo.masked.contains(p)) continue;
+            merged.put(p, {}) catch {
+                failed = true;
+                break;
+            };
+        }
+        if (!failed) if (over) |ov| {
+            for (ov) |p| {
+                merged.put(p, {}) catch {
+                    failed = true;
+                    break;
+                };
+            }
+        };
+        allocator.free(base.?);
+        if (over) |ov| allocator.free(ov);
+        if (failed) return null;
+        var result: std.ArrayList([]const u8) = .empty;
+        result.ensureTotalCapacity(allocator, merged.count()) catch return null;
+        var it = merged.keyIterator();
+        while (it.next()) |k| result.appendAssumeCapacity(k.*);
+        return result.toOwnedSlice(allocator) catch {
+            result.deinit(allocator);
+            return null;
         };
     }
 
@@ -2458,31 +2505,7 @@ pub const AnyTrigramIndex = union(enum) {
             .mmap_overlay => |*mo| blk: {
                 const base = mo.base.candidatesRegex(query, allocator);
                 const over = mo.overlay.candidatesRegex(query, allocator);
-                if (base == null and over == null) break :blk null;
-                if (base == null) break :blk over;
-                if (over == null) break :blk base;
-                var merged = std.StringHashMap(void).init(allocator);
-                defer merged.deinit();
-                for (base.?) |p| merged.put(p, {}) catch {
-                    allocator.free(base.?);
-                    allocator.free(over.?);
-                    break :blk null;
-                };
-                for (over.?) |p| merged.put(p, {}) catch {
-                    allocator.free(base.?);
-                    allocator.free(over.?);
-                    break :blk null;
-                };
-                allocator.free(base.?);
-                allocator.free(over.?);
-                var result: std.ArrayList([]const u8) = .empty;
-                result.ensureTotalCapacity(allocator, merged.count()) catch break :blk null;
-                var it = merged.keyIterator();
-                while (it.next()) |k| result.appendAssumeCapacity(k.*);
-                break :blk result.toOwnedSlice(allocator) catch {
-                    result.deinit(allocator);
-                    break :blk null;
-                };
+                break :blk mergeOverlayCandidates(mo, base, over, allocator);
             },
         };
     }
@@ -2491,7 +2514,8 @@ pub const AnyTrigramIndex = union(enum) {
         return switch (self.*) {
             .heap => |*h| h.file_trigrams.contains(path),
             .mmap => |*m| m.containsFile(path),
-            .mmap_overlay => |*mo| mo.base.containsFile(path) or mo.overlay.file_trigrams.contains(path),
+            .mmap_overlay => |*mo| (mo.base.containsFile(path) and !mo.masked.contains(path)) or
+                mo.overlay.file_trigrams.contains(path),
         };
     }
 
@@ -2505,18 +2529,37 @@ pub const AnyTrigramIndex = union(enum) {
                 self.* = .{ .mmap_overlay = .{
                     .base = base,
                     .overlay = TrigramIndex.init(alloc),
+                    .masked = std.StringHashMap(void).init(alloc),
                 } };
                 try self.mmap_overlay.overlay.indexFile(path, content);
+                self.mmap_overlay.mask(path);
             },
-            .mmap_overlay => |*mo| try mo.overlay.indexFile(path, content),
+            .mmap_overlay => |*mo| {
+                try mo.overlay.indexFile(path, content);
+                mo.mask(path);
+            },
         }
     }
 
     pub fn removeFile(self: *AnyTrigramIndex, path: []const u8) void {
         switch (self.*) {
             .heap => |*h| h.removeFile(path),
-            .mmap => {},
-            .mmap_overlay => |*mo| mo.overlay.removeFile(path),
+            .mmap => |*m| {
+                // A remove is a write: promote so the base entry can be masked.
+                if (!m.containsFile(path)) return;
+                const alloc = m.allocator;
+                const base = self.mmap;
+                self.* = .{ .mmap_overlay = .{
+                    .base = base,
+                    .overlay = TrigramIndex.init(alloc),
+                    .masked = std.StringHashMap(void).init(alloc),
+                } };
+                self.mmap_overlay.mask(path);
+            },
+            .mmap_overlay => |*mo| {
+                mo.overlay.removeFile(path);
+                mo.mask(path);
+            },
         }
     }
 
@@ -2532,7 +2575,7 @@ pub const AnyTrigramIndex = union(enum) {
         return switch (self.*) {
             .heap => |*h| h.fileCount(),
             .mmap => |*m| m.fileCount(),
-            .mmap_overlay => |*mo| mo.base.fileCount() + mo.overlay.fileCount(),
+            .mmap_overlay => |*mo| mo.base.fileCount() + mo.overlay.fileCount() - mo.masked_in_base,
         };
     }
 
