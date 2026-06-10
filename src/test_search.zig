@@ -1638,3 +1638,31 @@ test "issue-451: scope=true search surfaces skip-trigram files" {
     }
     try testing.expect(found_canonical);
 }
+
+
+test "issue-546: searchContent rerank penalizes non-source tooling paths (bench/install/scripts/website)" {
+    // Mirror of issue-429-b for first-party tooling directories. Five files,
+    // identical content and hit count — only a path prior can separate them.
+    // Pre-fix the path-asc tiebreaker puts bench/ first; the implementation
+    // under src/ must win.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("bench/sample.zig", "pub fn x() void { _ = coreTerm; }\n");
+    try explorer.indexFile("install/sample.zig", "pub fn x() void { _ = coreTerm; }\n");
+    try explorer.indexFile("scripts/sample.zig", "pub fn x() void { _ = coreTerm; }\n");
+    try explorer.indexFile("website/sample.zig", "pub fn x() void { _ = coreTerm; }\n");
+    try explorer.indexFile("src/sample.zig", "pub fn x() void { _ = coreTerm; }\n");
+
+    const results = try explorer.searchContent("coreTerm", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expect(results.len >= 5);
+    try testing.expectEqualStrings("src/sample.zig", results[0].path);
+}
