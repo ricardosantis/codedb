@@ -1459,6 +1459,17 @@ fn handleSymbol(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         return;
     }
 
+    // #573: an explicitly empty name is a usage error, not a lookup for ""
+    // (which rendered as 'no results for: '). Mirrors codedb_callers.
+    if (name != null and name.?.len == 0) {
+        if (json_fmt) {
+            writeJsonToolError(out, alloc, "codedb_symbol", "empty_name", "empty name — pass a non-empty symbol name");
+        } else {
+            out.appendSlice(alloc, "error: empty name — pass a non-empty symbol name") catch {};
+        }
+        return;
+    }
+
     const kind = if (kind_str) |k| Explorer.parseSymbolKind(k) else null;
     if (kind_str != null and kind == null) {
         if (json_fmt) {
@@ -1986,8 +1997,12 @@ fn handleCallers(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
         alloc.free(results);
     }
 
-    var shown: usize = 0;
-    for (results) |r| {
+    // #573: single filter pass — the header count and the printed entries come
+    // from the same accumulation, so a predicate edit cannot desync them (the
+    // previous count loop + print loop duplicated four predicates verbatim).
+    var kept: std.ArrayList(usize) = .empty;
+    defer kept.deinit(alloc);
+    for (results, 0..) |r, r_idx| {
         const lang = explore_mod.detectLanguage(r.path);
         if (!langHasCallSites(lang)) continue;
         // #562: a full-line comment mention is documentation, not a call site.
@@ -2001,25 +2016,13 @@ fn handleCallers(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
         }
         if (is_def) continue;
         if (!hasWholeWordMatch(r.line_text, name)) continue;
-        shown += 1;
+        kept.append(alloc, r_idx) catch {};
     }
 
     const w = cio.listWriter(out, alloc);
-    w.print("{d} call sites for '{s}':\n", .{ shown, name }) catch {};
-    for (results) |r| {
-        const lang = explore_mod.detectLanguage(r.path);
-        if (!langHasCallSites(lang)) continue;
-        // #562: a full-line comment mention is documentation, not a call site.
-        if (explore_mod.isCommentOrBlank(r.line_text, lang)) continue;
-        var is_def = false;
-        for (defs) |d| {
-            if (r.line_num == d.symbol.line_start and std.mem.eql(u8, r.path, d.path)) {
-                is_def = true;
-                break;
-            }
-        }
-        if (is_def) continue;
-        if (!hasWholeWordMatch(r.line_text, name)) continue;
+    w.print("{d} call sites for '{s}':\n", .{ kept.items.len, name }) catch {};
+    for (kept.items) |kept_idx| {
+        const r = results[kept_idx];
         if (r.scope_name) |sn| {
             w.print("  {s}:{d}: {s}  [in {s} ({s}, L{d}-L{d})]\n", .{
                 r.path, r.line_num, r.line_text, sn, @tagName(r.scope_kind.?), r.scope_start, r.scope_end,
@@ -4132,7 +4135,14 @@ pub fn runCliTool(
     cmd_args_start: usize,
     out: *std.ArrayList(u8),
 ) ?u8 {
-    const pos: ?[]const u8 = if (args.len > cmd_args_start) args[cmd_args_start] else null;
+    // First positional. A leading '-'-prefixed arg is NOT silently bound as
+    // the positional — `callers --max-results 3 foo` previously reported call
+    // sites for '--max-results' (#573). Commands here take <name>/<path>
+    // first, so a leading flag falls through to the command's usage error.
+    const pos: ?[]const u8 = if (args.len > cmd_args_start and !std.mem.startsWith(u8, args[cmd_args_start], "-"))
+        args[cmd_args_start]
+    else
+        null;
     const out_start = out.items.len;
 
     var m: std.json.ObjectMap = .empty;
