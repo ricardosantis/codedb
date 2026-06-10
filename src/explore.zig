@@ -724,10 +724,15 @@ pub const Explorer = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, content_cache_capacity: u32) Explorer {
+        return initFallible(allocator, content_cache_capacity) catch
+            std.debug.panic("Explorer.init: OOM allocating {d} content cache slots", .{content_cache_capacity});
+    }
+
+    fn initFallible(allocator: std.mem.Allocator, content_cache_capacity: u32) !Explorer {
         return .{
             .outlines = std.StringHashMap(FileOutline).init(allocator),
             .dep_graph = DependencyGraph.init(allocator),
-            .contents = ContentCache.init(allocator, content_cache_capacity),
+            .contents = try ContentCache.initAlloc(allocator, content_cache_capacity),
             .symbol_index = std.StringHashMap(std.ArrayList(SymbolLocation)).init(allocator),
             .symbol_index_complete = true,
             .word_index = WordIndex.init(allocator),
@@ -828,8 +833,12 @@ pub const Explorer = struct {
 
     pub fn commitParsedFileOwnedOutline(self: *Explorer, path: []const u8, content: []const u8, outline: FileOutline, full_index: bool, skip_trigram: bool) !void {
         var owned_outline = outline;
-        errdefer owned_outline.deinit();
-        var persistent_outline = try cloneOutline(&owned_outline, self.allocator);
+        // One deinit only: an errdefer here would stack with the defer below
+        // and double-free the parsed outline on any post-clone error.
+        var persistent_outline = cloneOutline(&owned_outline, self.allocator) catch |err| {
+            owned_outline.deinit();
+            return err;
+        };
         defer owned_outline.deinit();
         errdefer persistent_outline.deinit();
         if (persistent_outline.owns_path) {
@@ -861,7 +870,17 @@ pub const Explorer = struct {
         persistent_outline.path = stable_path;
 
         const prior_content = self.contents.get(stable_path);
-        try self.contents.put(stable_path, content);
+        // Any failure below must put the word index back the way it was —
+        // indexFile wipes the old postings before adding new ones, and search
+        // serves whatever the postings say. prior_content stays valid through
+        // every fallible step because contents.put runs last.
+        errdefer if (full_index and !self.defer_word_index) {
+            if (prior_content) |old| {
+                self.word_index.indexFile(stable_path, old) catch {};
+            } else {
+                self.word_index.removeFile(stable_path);
+            }
+        };
 
         if (full_index) {
             // A disabled word index (cold CLI scan keeps it off to save memory)
@@ -872,13 +891,6 @@ pub const Explorer = struct {
                 self.word_index_can_load_from_disk = false;
             }
             if (!self.defer_word_index) try self.word_index.indexFile(stable_path, content);
-            // If trigram indexing fails below, restore word_index to its previous state
-            // to prevent word_index and trigram_index from diverging.
-            errdefer if (prior_content) |old| {
-                self.word_index.indexFile(stable_path, old) catch {};
-            } else {
-                self.word_index.removeFile(stable_path);
-            };
             if (self.word_index_complete) {
                 self.word_index_generation +%= 1;
             }
@@ -911,6 +923,10 @@ pub const Explorer = struct {
 
         try self.rebuildDepsFor(stable_path, &persistent_outline);
         self.rebuildSymbolIndexFor(stable_path, &persistent_outline, !is_new);
+
+        // Last fallible step: put frees the prior cache value in place, so it
+        // must run only once nothing after it can still need prior_content.
+        try self.contents.put(stable_path, content);
 
         outline_gop.value_ptr.* = persistent_outline;
         if (prior_outline) |*old_outline| old_outline.deinit();
@@ -1304,7 +1320,10 @@ pub const Explorer = struct {
     }
 
     pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, content: []const u8) !ParsedFile {
-        var parser = Explorer.init(allocator, DEFAULT_CONTENT_CACHE_CAPACITY);
+        // A parser shell only carries the allocator into the parse methods: a
+        // 1-slot cache keeps the per-file cost flat, and OOM here must surface
+        // as an error, not ContentCache.init's daemon-killing panic.
+        var parser = try Explorer.initFallible(allocator, 1);
         defer parser.deinit();
         var parsed_outline = try parseOutlineWithParser(&parser, path, content);
         defer parsed_outline.deinit();
@@ -5116,12 +5135,16 @@ pub const Explorer = struct {
                 }
             }
             if (list.items.len == 0) {
-                list.deinit(self.allocator);
+                // Deinit only at actual removal below: ArrayList.deinit poisons
+                // the in-map value, so a failed append here must leave a VALID
+                // (empty) list behind, not a landmine for the next iteration.
                 to_remove.append(self.allocator, entry.key_ptr.*) catch {};
             }
         }
         for (to_remove.items) |key| {
             if (self.symbol_index.fetchRemove(key)) |kv| {
+                var hits = kv.value;
+                hits.deinit(self.allocator);
                 self.allocator.free(kv.key);
             }
         }
