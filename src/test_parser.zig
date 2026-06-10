@@ -1944,3 +1944,43 @@ test "audit: Python comma import records all modules" {
     try expectOutlineImport(&outline, "alpha.py");
     try expectOutlineImport(&outline, "beta.py");
 }
+
+
+// renderImportedBy (the MCP codedb_deps reverse path) kept the unconditional
+// basename fallback when getImportedBy gained the ambiguity guard — the same
+// bare import is still attributed to every same-basename file through the
+// main deps tool.
+test "issue-588: renderImportedBy suppresses the ambiguous basename fallback" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("a/conf.py", "x = 1\n");
+    try explorer.indexFile("b/conf.py", "y = 2\n");
+    try explorer.indexFile("importer.py", "import conf\n");
+
+    var a_out: std.ArrayList(u8) = .empty;
+    defer a_out.deinit(testing.allocator);
+    _ = try explorer.renderImportedBy("a/conf.py", testing.allocator, &a_out);
+    var b_out: std.ArrayList(u8) = .empty;
+    defer b_out.deinit(testing.allocator);
+    _ = try explorer.renderImportedBy("b/conf.py", testing.allocator, &b_out);
+
+    const a_attached = std.mem.indexOf(u8, a_out.items, "importer.py") != null;
+    const b_attached = std.mem.indexOf(u8, b_out.items, "importer.py") != null;
+    // The ambiguous bare import must not be attributed to both files.
+    try testing.expect(!(a_attached and b_attached));
+
+    // Single-basename case keeps the fallback: with exactly one conf.py the
+    // importer is still listed.
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    var explorer2 = Explorer.init(arena2.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try explorer2.indexFile("a/conf.py", "x = 1\n");
+    try explorer2.indexFile("importer.py", "import conf\n");
+
+    var solo_out: std.ArrayList(u8) = .empty;
+    defer solo_out.deinit(testing.allocator);
+    _ = try explorer2.renderImportedBy("a/conf.py", testing.allocator, &solo_out);
+    try testing.expect(std.mem.indexOf(u8, solo_out.items, "importer.py") != null);
+}
