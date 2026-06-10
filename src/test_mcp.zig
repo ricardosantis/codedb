@@ -2137,3 +2137,28 @@ test "issue-589: isSensitivePath blocks all OpenSSH default private key names" {
     try testing.expect(!watcher.isSensitivePath("id_map.zig"));
     try testing.expect(!watcher.isSensitivePath("identity.ts"));
 }
+
+test "issue-592: cli-daemon spawn lock is exclusive per project" {
+    // Concurrent cold CLI calls used to fork a cli-daemon EACH (no mutual
+    // exclusion), every duplicate re-scanned the index, and the stale-socket
+    // unlink let late arrivals steal the winner's socket — orphan daemons
+    // churned CPU long after the calls exited. The per-project flock makes
+    // spawn mutually exclusive: holders win, probes report unavailable, and
+    // the kernel releases the lock on any exit.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_len];
+
+    const held = main_mod.daemonLockTryAcquire(dir_path);
+    try testing.expect(held != null);
+    // A second acquire (the would-be duplicate daemon) must lose...
+    try testing.expect(main_mod.daemonLockTryAcquire(dir_path) == null);
+    // ...and the CLI spawn probe must report the lock as taken.
+    try testing.expect(!main_mod.daemonLockAvailable(dir_path));
+
+    _ = std.c.flock(held.?, std.c.LOCK.UN);
+    _ = std.c.close(held.?);
+    try testing.expect(main_mod.daemonLockAvailable(dir_path));
+}

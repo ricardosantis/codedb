@@ -322,7 +322,7 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
             for (results) |r| {
                 if (paths_only) {
                     out.p("  {s}{s}{s}:{s}{d}{s}\n", .{
-                        s.cyan, r.path, s.reset,
+                        s.cyan, r.path,     s.reset,
                         s.dim,  r.line_num, s.reset,
                     });
                 } else {
@@ -482,11 +482,11 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
             const unbounded = end == std.math.maxInt(u32);
             if (unbounded) {
                 out.p("{s}\xe2\x9c\x93{s} {s}{s}{s}  {s}{s}{s}  L{d}-EOF  {s}{s}{s}\n", .{
-                    s.green,                       s.reset,
-                    s.bold,                        path,
-                    s.reset,                       s.langColor(@tagName(lang)),
-                    @tagName(lang),                s.reset,
-                    start,                         sty.durationColor(s, elapsed),
+                    s.green,                               s.reset,
+                    s.bold,                                path,
+                    s.reset,                               s.langColor(@tagName(lang)),
+                    @tagName(lang),                        s.reset,
+                    start,                                 sty.durationColor(s, elapsed),
                     sty.formatDuration(&dur_buf, elapsed), s.reset,
                 });
             } else {
@@ -690,6 +690,32 @@ fn cliIsQueryCmd(cmd: []const u8) bool {
 /// keeps working and clients simply fall back to the cold path.
 /// Daemon side. Bind a per-project Unix socket and serve framed query requests
 /// against the warm `explorer`/`store`. Runs on its own detached thread so it
+/// #592: per-project cli-daemon spawn lock. Open-or-create
+/// `<data_dir>/cli-daemon.lock` and take an exclusive non-blocking flock.
+/// Returns the fd on success — callers keep it open for the process lifetime
+/// (the kernel releases flocks on exit, so crashes never leave a stale lock).
+/// Returns null when another process holds the lock or the file can't be
+/// opened.
+pub fn daemonLockTryAcquire(data_dir: []const u8) ?c_int {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const p = std.fmt.bufPrintZ(&buf, "{s}/cli-daemon.lock", .{data_dir}) catch return null;
+    const fd = std.c.open(p.ptr, .{ .ACCMODE = .RDWR, .CREAT = true }, @as(c_uint, 0o600));
+    if (fd < 0) return null;
+    if (std.c.flock(fd, std.c.LOCK.EX | std.c.LOCK.NB) != 0) {
+        _ = std.c.close(fd);
+        return null;
+    }
+    return fd;
+}
+
+/// Probe whether the spawn lock is free without keeping it: used by the CLI
+/// auto-spawn path so racing cold calls don't fork duplicate daemons.
+pub fn daemonLockAvailable(data_dir: []const u8) bool {
+    const fd = daemonLockTryAcquire(data_dir) orelse return false;
+    _ = std.c.flock(fd, std.c.LOCK.UN);
+    _ = std.c.close(fd);
+    return true;
+}
 /// never blocks the daemon's primary loop. Connections are handled sequentially
 /// (CLI calls are infrequent and runQuery already tolerates concurrent reads
 /// from the watcher).
@@ -1017,12 +1043,13 @@ fn mainImpl() !void {
             }
             if (!isValidMcpFlag(a)) {
                 out.p("{s}\xe2\x9c\x97{s} unknown flag for {s}mcp{s}: {s}{s}{s}\n  valid: {s}--no-telemetry{s}, {s}--help{s}, {s}--config-file=<path>{s}\n", .{
-                    s.red,  s.reset,
-                    s.bold, s.reset,
-                    s.bold, a,      s.reset,
-                    s.bold, s.reset,
-                    s.bold, s.reset,
-                    s.bold, s.reset,
+                    s.red,   s.reset,
+                    s.bold,  s.reset,
+                    s.bold,  a,
+                    s.reset, s.bold,
+                    s.reset, s.bold,
+                    s.reset, s.bold,
+                    s.reset,
                 });
                 out.exitWithFlush(1);
             }
@@ -1138,17 +1165,35 @@ fn mainImpl() !void {
         // `codedb <abs_root> cli-daemon`, with stdio redirected to /dev/null and
         // no waitpid (fire-and-forget). Skipped for an empty root. cli-daemon is
         // not a query command, so the spawned process won't recurse into this path.
+        // #592: also skipped while another daemon holds the per-project spawn
+        // lock — concurrent cold calls otherwise fork a daemon EACH, every
+        // duplicate rescans the index, and the stampede leaves orphans churning
+        // CPU. Losers of this probe simply cold-serve their one call.
         if (abs_root.len > 0) {
-            if (std.process.executablePathAlloc(io, allocator)) |self_exe| {
-                defer allocator.free(self_exe);
-                const daemon_argv = [_][]const u8{ self_exe, abs_root, "cli-daemon" };
-                cio.spawnDetached(allocator, &daemon_argv);
-            } else |_| {}
+            const probe_dir = getDataDir(io, allocator, abs_root) catch null;
+            defer if (probe_dir) |d| allocator.free(d);
+            const lock_free = if (probe_dir) |d| daemonLockAvailable(d) else true;
+            if (lock_free) {
+                if (std.process.executablePathAlloc(io, allocator)) |self_exe| {
+                    defer allocator.free(self_exe);
+                    const daemon_argv = [_][]const u8{ self_exe, abs_root, "cli-daemon" };
+                    cio.spawnDetached(allocator, &daemon_argv);
+                } else |_| {}
+            }
         }
     }
 
     const data_dir = try getDataDir(io, allocator, abs_root);
     defer allocator.free(data_dir);
+
+    // #592: exactly one cli-daemon per project. Take the per-project flock
+    // BEFORE the expensive load below so a duplicate exits without paying a
+    // full rescan (or stealing the winner's socket via the stale-path unlink
+    // in cliDaemonListen). The fd is held for the process lifetime; the
+    // kernel drops the lock on any exit, so a crash never leaves it stale.
+    if (std.mem.eql(u8, cmd, "cli-daemon")) {
+        if (daemonLockTryAcquire(data_dir) == null) return;
+    }
 
     // Load user config (.codedbrc). Resolution: --config-file=<path>, then
     // $CWD/.codedbrc, then <binary_dir>/.codedbrc. Silently falls back to
@@ -1424,7 +1469,10 @@ fn mainImpl() !void {
         } else if (std.mem.eql(u8, op, "search") or std.mem.eql(u8, op, "search-fmt")) {
             const warm = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
             defer {
-                for (warm) |r| { allocator.free(r.path); allocator.free(r.line_text); }
+                for (warm) |r| {
+                    allocator.free(r.path);
+                    allocator.free(r.line_text);
+                }
                 allocator.free(warm);
             }
         }
@@ -1464,13 +1512,19 @@ fn mainImpl() !void {
             } else if (std.mem.eql(u8, op, "search")) {
                 const r = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
                 hits_seen = r.len;
-                for (r) |item| { allocator.free(item.path); allocator.free(item.line_text); }
+                for (r) |item| {
+                    allocator.free(item.path);
+                    allocator.free(item.line_text);
+                }
                 allocator.free(r);
             } else if (std.mem.eql(u8, op, "search-fmt")) {
                 const r = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
                 hits_seen = r.len;
                 defer {
-                    for (r) |item| { allocator.free(item.path); allocator.free(item.line_text); }
+                    for (r) |item| {
+                        allocator.free(item.path);
+                        allocator.free(item.line_text);
+                    }
                     allocator.free(r);
                 }
                 var scratch: std.ArrayList(u8) = .empty;
@@ -1488,7 +1542,10 @@ fn mainImpl() !void {
                 const r = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
                 hits_seen = r.len;
                 defer {
-                    for (r) |item| { allocator.free(item.path); allocator.free(item.line_text); }
+                    for (r) |item| {
+                        allocator.free(item.path);
+                        allocator.free(item.line_text);
+                    }
                     allocator.free(r);
                 }
                 var seen = std.StringHashMap(void).init(allocator);
