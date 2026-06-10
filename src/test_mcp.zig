@@ -2018,3 +2018,45 @@ test "issue-570: codedb_context falls back to plain words for all-lowercase task
     // …its longest meaningful word ('ranking') must drive the composer.
     try testing.expect(std.mem.indexOf(u8, out.items, "ranking") != null);
 }
+
+
+test "issue-572: cli bridge must not bind a leading flag as the positional name" {
+    // Live repro: `codedb callers --max-results 3 indexFile` reported
+    // "1 call sites for '--max-results'" — the bridge takes args[cmd_args_start]
+    // blindly, so a leading flag silently becomes the name. It must fall
+    // through to the command's usage error instead.
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/a.zig", "pub fn indexFile() void {}\npub fn caller() void {\n    indexFile();\n}\n");
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    const argv = [_][]const u8{ "--max-results", "3", "indexFile" };
+    const code = mcp_mod.runCliTool(io, testing.allocator, &explorer, ".", "callers", &argv, 0, &out);
+    try testing.expect(code != null);
+    // The flag must not be reported as the function name…
+    try testing.expect(std.mem.indexOf(u8, out.items, "call sites for '--max-results'") == null);
+    // …the command fails to its usage line instead.
+    try testing.expect(std.mem.indexOf(u8, out.items, "callers <name>") != null);
+
+    // Companion UX defect, same audit: an explicitly empty symbol name must be
+    // a usage error (mirrors codedb_callers), not "no results for: ".
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const sargs_json =
+        \\{"name":""}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, sargs_json, .{});
+    defer parsed.deinit();
+
+    var sout: std.ArrayList(u8) = .empty;
+    defer sout.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_symbol, &parsed.value.object, &sout, &store, &explorer, &agents);
+    try testing.expect(std.mem.indexOf(u8, sout.items, "error: empty name") != null);
+}
