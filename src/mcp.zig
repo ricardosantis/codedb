@@ -2197,6 +2197,59 @@ fn extractContextCandidates(task: []const u8, alloc: std.mem.Allocator, out: *st
     }
 }
 
+// #570: fallback for tasks with no identifier-shaped token. Plain words
+// (≥4 chars, glue/generic words dropped) sorted longest-first — longer words
+// are more specific ("ranking" beats "fix") — capped like the identifier pass.
+fn extractContextFallbackWords(task: []const u8, alloc: std.mem.Allocator, out: *std.ArrayList([]const u8)) void {
+    const stop = [_][]const u8{
+        "that",  "this",  "with",    "from",      "into",   "when",   "where",
+        "what",  "which", "then",    "them",      "they",   "have",   "will",
+        "should", "would", "could",  "make",      "makes",  "using",  "used",
+        "does",  "like",  "also",    "than",      "each",   "more",   "most",
+        "some",  "such",  "very",    "just",      "been",   "being",  "about",
+        "after", "before", "while",  "there",     "their",  "other",  "only",
+        "over",  "under", "between", "improve",   "implement", "ensure", "change",
+        "update",
+    };
+    var words: std.ArrayList([]const u8) = .empty;
+    defer words.deinit(alloc);
+    var seen = std.StringHashMap(void).init(alloc);
+    defer seen.deinit();
+    var i: usize = 0;
+    while (i < task.len) {
+        if (isContextIdentStart(task[i])) {
+            const start = i;
+            while (i < task.len and isContextIdentCont(task[i])) : (i += 1) {}
+            const tok = task[start..i];
+            if (tok.len >= 4 and tok.len <= 64 and !seen.contains(tok)) {
+                var is_stop = false;
+                for (stop) |s| {
+                    if (std.ascii.eqlIgnoreCase(tok, s)) {
+                        is_stop = true;
+                        break;
+                    }
+                }
+                if (!is_stop) {
+                    seen.put(tok, {}) catch {};
+                    words.append(alloc, tok) catch {};
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    std.sort.block([]const u8, words.items, {}, struct {
+        pub fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            if (a.len != b.len) return a.len > b.len;
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+    for (words.items) |w| {
+        out.append(alloc, w) catch {};
+        if (out.items.len >= CONTEXT_MAX_CANDIDATES) return;
+    }
+}
+
 fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer, project_root: []const u8) void {
     const task = getStr(args, "task") orelse {
         out.appendSlice(alloc, "error: missing 'task' argument") catch {};
@@ -2253,6 +2306,13 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
 
     var candidates: std.ArrayList([]const u8) = .empty;
     extractContextCandidates(task, A, &candidates);
+    if (candidates.items.len == 0) {
+        // #570: all-lowercase tasks ("fix search ranking") carry no
+        // identifier-shaped token. Fall back to the task's plain words so the
+        // composer orients instead of dead-ending — natural language is the
+        // documented input shape.
+        extractContextFallbackWords(task, A, &candidates);
+    }
     if (candidates.items.len == 0) {
         out.appendSlice(alloc, "no candidate identifiers found in task — include symbol names (camelCase or snake_case) or \"quoted strings\" so the composer can extract keywords") catch {};
         return;
