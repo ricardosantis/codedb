@@ -3187,3 +3187,57 @@ test "mmap word index: zero-copy load matches heap load and promotes on write" {
     try testing.expectEqual(@as(usize, 1), g.len);
     try testing.expect(mm.search("alphaToken").len >= 1); // pre-promote postings survived
 }
+
+test "issue-600: mmap_overlay writeToDisk persists overlay edits" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp_dir.dir.realPathFile(io, ".", &path_buf);
+    const tmp_path = path_buf[0..tmp_path_len];
+
+    // Seed the on-disk index with two files.
+    {
+        var seed = TrigramIndex.init(testing.allocator);
+        defer seed.deinit();
+        try seed.indexFile("keep.zig", "const keeper_token_alpha = 1;");
+        try seed.indexFile("gone.zig", "const goner_token_beta = 2;");
+        try seed.writeToDisk(io, tmp_path, null);
+    }
+
+    // Cold-load as mmap, then take edits: one new file, one removal.
+    var any = AnyTrigramIndex{ .mmap = MmapTrigramIndex.initFromDisk(io, tmp_path, testing.allocator) orelse
+        return error.MmapInitFailed };
+    defer any.deinit();
+    try any.indexFile("fresh.zig", "const fresh_token_gamma = 3;");
+    any.removeFile("gone.zig");
+    try testing.expect(any == .mmap_overlay);
+
+    // writeToDisk reports success, so a cold start must see the edits.
+    try any.writeToDisk(io, tmp_path, null);
+
+    var reloaded = TrigramIndex.readFromDisk(io, tmp_path, testing.allocator) orelse
+        return error.ReadBackFailed;
+    defer reloaded.deinit();
+
+    try testing.expect(reloaded.file_trigrams.contains("keep.zig"));
+    try testing.expect(reloaded.file_trigrams.contains("fresh.zig"));
+    try testing.expect(!reloaded.file_trigrams.contains("gone.zig"));
+
+    const fresh = reloaded.candidates("fresh_token_gamma", allocator) orelse
+        return error.NoCandidates;
+    try testing.expectEqual(@as(usize, 1), fresh.len);
+    try testing.expectEqualStrings("fresh.zig", fresh[0]);
+
+    const keep = reloaded.candidates("keeper_token_alpha", allocator) orelse
+        return error.NoCandidates;
+    try testing.expectEqual(@as(usize, 1), keep.len);
+
+    const gone = reloaded.candidates("goner_token_beta", allocator);
+    if (gone) |g| {
+        try testing.expectEqual(@as(usize, 0), g.len);
+    }
+}
