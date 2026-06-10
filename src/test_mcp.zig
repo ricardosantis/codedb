@@ -2120,3 +2120,20 @@ test "issue-568: deps empty list prints a (0 files) summary" {
     try testing.expect(std.mem.indexOf(u8, fwd_out.items, "(none)") != null);
     try testing.expect(std.mem.indexOf(u8, fwd_out.items, "(0 files)") != null);
 }
+
+test "issue-589: isSensitivePath blocks all OpenSSH default private key names" {
+    // The exact-name list covers id_rsa and id_ed25519 but misses the other
+    // ssh-keygen defaults: id_ecdsa, id_dsa, and the FIDO variants
+    // id_ecdsa_sk / id_ed25519_sk. Outside ~/.ssh (which the directory rule
+    // catches), a key copied into a repo — deploy/id_ecdsa — was indexed and
+    // readable while deploy/id_rsa was blocked.
+    const keys = [_][]const u8{ "id_ecdsa", "id_dsa", "id_ecdsa_sk", "id_ed25519_sk" };
+    for (keys) |k| {
+        try testing.expect(watcher.isSensitivePath(k));
+        try testing.expect(snapshot_mod.isSensitivePath(k));
+    }
+    try testing.expect(watcher.isSensitivePath("deploy/id_ecdsa"));
+    // negatives — names that merely start like a key must stay indexable
+    try testing.expect(!watcher.isSensitivePath("id_map.zig"));
+    try testing.expect(!watcher.isSensitivePath("identity.ts"));
+}
