@@ -1231,3 +1231,45 @@ test "issue-539b: search recall ranks a relevant restored file above quota (inde
     };
     try testing.expect(found_canonical);
 }
+
+
+test "issue-564: snapshot fast-load defers the symbol index until first symbol use" {
+    // Pre-#564 the fast-load eagerly rebuilt the global symbol index for every
+    // restored file (~symbols-per-file map inserts and their heap) even though
+    // plain content search never reads it. The load now defers it; the first
+    // symbol/caller/callpath use builds it from outlines and answers the same.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try exp.indexFile("util_564.zig", "pub fn uniqueSym564() void {}\n");
+    try exp.indexFile("main_564.zig", "pub fn caller564() void {\n    uniqueSym564();\n}\n");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/lazy564.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const aa2 = arena2.allocator();
+    var exp2 = Explorer.init(aa2, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    try testing.expect(snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, aa2));
+
+    // The fast-load must NOT have materialized the symbol index — the deferral
+    // is the point: one-shot search pays neither the inserts nor their heap.
+    try testing.expectEqual(@as(usize, 0), exp2.symbol_index.count());
+
+    // First symbol use builds it on demand and answers correctly.
+    const results = try exp2.findAllSymbols("uniqueSym564", aa2);
+    try testing.expect(results.len >= 1);
+    try testing.expect(std.mem.eql(u8, results[0].path, "util_564.zig"));
+    try testing.expect(exp2.symbol_index.count() > 0);
+}
