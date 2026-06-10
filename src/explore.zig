@@ -749,6 +749,7 @@ pub const Explorer = struct {
 
         var sym_iter = self.symbol_index.iterator();
         while (sym_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
             entry.value_ptr.deinit(self.allocator);
         }
         self.symbol_index.deinit();
@@ -1504,6 +1505,7 @@ pub const Explorer = struct {
         }
         self.dep_graph.remove(path);
         self.removeSymbolIndexFor(path);
+        _ = self.skip_trigram_files.remove(path);
         self.contents.remove(path);
         self.word_index.removeFile(path);
         self.trigram_index.removeFile(path);
@@ -2252,16 +2254,16 @@ pub const Explorer = struct {
     /// name-only resolution. Conservative: only the highest-collision names.
     fn isUbiquitousName(name: []const u8) bool {
         const common = [_][]const u8{
-            "init",        "deinit",   "append",   "get",       "set",
-            "put",         "getOrPut", "remove",   "contains",  "has",
-            "count",       "len",      "items",    "alloc",     "free",
-            "create",      "destroy",  "lock",     "unlock",    "tryLock",
-            "next",        "iterator", "clone",    "dupe",      "slice",
-            "reset",       "clear",    "format",   "hash",      "eql",
-            "write",       "writeAll", "print",    "read",      "close",
-            "open",        "value",    "key",      "toOwnedSlice", "pop",
-            "push",        "find",     "add",      "new",       "build",
-            "run",         "deinit",   "toString", "valueOf",   "of",
+            "init",   "deinit",   "append",   "get",          "set",
+            "put",    "getOrPut", "remove",   "contains",     "has",
+            "count",  "len",      "items",    "alloc",        "free",
+            "create", "destroy",  "lock",     "unlock",       "tryLock",
+            "next",   "iterator", "clone",    "dupe",         "slice",
+            "reset",  "clear",    "format",   "hash",         "eql",
+            "write",  "writeAll", "print",    "read",         "close",
+            "open",   "value",    "key",      "toOwnedSlice", "pop",
+            "push",   "find",     "add",      "new",          "build",
+            "run",    "deinit",   "toString", "valueOf",      "of",
         };
         for (common) |c| if (std.mem.eql(u8, name, c)) return true;
         return false;
@@ -4132,7 +4134,7 @@ pub const Explorer = struct {
                 try appendOutlineSymbol(a, outline, name, kind, line_num, line);
             }
         }
-        if (startsWith(line, "import ") or containsAny(line, &.{ "require(" })) {
+        if (startsWith(line, "import ") or containsAny(line, &.{"require("})) {
             try appendOutlineSymbol(a, outline, line, .import, line_num, null);
             if (extractStringLiteral(line)) |path| {
                 try appendImportPath(a, outline, path);
@@ -5080,6 +5082,13 @@ pub const Explorer = struct {
         for (outline.symbols.items) |sym| {
             const gop = self.symbol_index.getOrPut(sym.name) catch continue;
             if (!gop.found_existing) {
+                // The map owns its keys: sym.name belongs to the outline and
+                // dies with it on re-index, while shared-name entries survive.
+                const owned = self.allocator.dupe(u8, sym.name) catch {
+                    _ = self.symbol_index.remove(sym.name);
+                    continue;
+                };
+                gop.key_ptr.* = owned;
                 gop.value_ptr.* = std.ArrayList(SymbolLocation).empty;
             }
             gop.value_ptr.append(self.allocator, .{
@@ -5112,7 +5121,9 @@ pub const Explorer = struct {
             }
         }
         for (to_remove.items) |key| {
-            _ = self.symbol_index.remove(key);
+            if (self.symbol_index.fetchRemove(key)) |kv| {
+                self.allocator.free(kv.key);
+            }
         }
     }
 
