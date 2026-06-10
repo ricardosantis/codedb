@@ -1987,3 +1987,48 @@ test "issue-569: multi-word word query falls back to per-token matching" {
     try testing.expect(std.mem.indexOf(u8, out.items, "src/both.zig") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "(tokenized)") != null);
 }
+
+
+test "issue-598: mention-dense tooling files cannot saturate past the path prior" {
+    // A bench script repeating the term six times per line scores 6.0×0.5=3.0
+    // and shrugs off the tooling-path prior, beating the implementation's 2.0
+    // (live: 'capture' put benchmarks/search-shootout/shootout.py in every
+    // top-8 slot). Cap the occurrence base for tooling paths BEFORE the
+    // stem/symbol boosts so density cannot dominate.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("bench/shootout.py", "captureTerm captureTerm captureTerm captureTerm captureTerm captureTerm\n");
+    try explorer.indexFile("src/owner.zig", "pub fn x() void { _ = captureTerm; _ = captureTerm; }\n");
+
+    const results = try explorer.searchContent("captureTerm", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expect(results.len >= 2);
+    try testing.expectEqualStrings("src/owner.zig", results[0].path);
+
+    // Eponymy must survive the cap: a query that IS the tooling file's stem
+    // still ranks that file first (the stem boost applies after the cap).
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    var explorer2 = Explorer.init(arena2.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try explorer2.indexFile("install/install.sh", "echo install install install\n");
+    try explorer2.indexFile("src/setup.zig", "pub fn x() void { _ = install; }\n");
+
+    const results2 = try explorer2.searchContent("install", testing.allocator, 10);
+    defer {
+        for (results2) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results2);
+    }
+    try testing.expect(results2.len >= 2);
+    try testing.expectEqualStrings("install/install.sh", results2[0].path);
+}
