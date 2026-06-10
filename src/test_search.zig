@@ -1956,3 +1956,34 @@ test "issue-546: cold CLI scan (word index disabled) still ranks multi-word quer
     try testing.expect(results.len > 0);
     try testing.expectEqualStrings("both.zig", results[0].path);
 }
+
+// ─── #569: multi-word `word` queries dead-end — no per-token fallback ───
+// `word` looked up the literal phrase in the inverted index, so an agent-shaped
+// query like "gateway websocket reconnect" returned zero hits even when every
+// token had plentiful hits. Multi-word queries must fall back to per-token
+// lookup, ranking files that hit more distinct tokens first.
+test "issue-569: multi-word word query falls back to per-token matching" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/both.zig", "const gateway = 1;\nconst websocket = 2;\n");
+    try explorer.indexFile("src/one.zig", "const gateway = 9;\n");
+
+    // searchWord powers the CLI `word` cmd.
+    const hits = try explorer.searchWord("gateway websocket", testing.allocator);
+    defer testing.allocator.free(hits);
+    try testing.expect(hits.len > 0);
+    explorer.mu.lockShared();
+    const top = explorer.word_index.hitPath(hits[0]);
+    explorer.mu.unlockShared();
+    // the file hitting BOTH tokens must outrank the single-token file
+    try testing.expectEqualStrings("src/both.zig", top);
+
+    // renderWord powers MCP codedb_word — same files, with the mode noted.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try explorer.renderWord("gateway websocket", testing.allocator, &out);
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/both.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "(tokenized)") != null);
+}
