@@ -623,7 +623,7 @@ pub const tools_list =
     \\{"name":"codedb_word","description":"Exact-identifier lookup via inverted index — every occurrence of one word, O(1). Use for single identifiers; use codedb_search for substrings or phrases.","inputSchema":{"type":"object","properties":{"word":{"type":"string","description":"Exact word/identifier to look up"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["word"]}},
     \\{"name":"codedb_callers","description":"Find every call site of a named symbol — fuses word-index occurrences with outline scope info. One round-trip vs codedb_word + codedb_outline-per-file. Returns {path, line, snippet, scope_name, scope_kind, scope_lines}. Excludes the symbol's own definition site.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (exact identifier match)"},"max_results":{"type":"integer","description":"Maximum call sites to return (default: 30, raise for hot symbols)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
     \\{"name":"codedb_callpath","description":"Shortest resolved call chain between two symbols via the local call graph (A→…→B). Use after codedb_callers when you need how execution reaches a callee. Returns each hop as path:name@line.","inputSchema":{"type":"object","properties":{"from":{"type":"string","description":"Source symbol name (exact identifier)"},"to":{"type":"string","description":"Target symbol name (exact identifier)"},"max_hops":{"type":"integer","description":"Max call hops to search (default: 12)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["from","to"]}},
-    \\{"name":"codedb_context","description":"Task-shaped composer: pass a natural-language task; returns ONE tight block (keywords used + symbol definitions + ranked files + top file:line snippets). Replaces 3-5 sequential search/word/symbol calls — use for first-touch orientation on a new task. For narrow follow-ups stick with codedb_search/codedb_symbol.","inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Natural-language task description (3-1024 chars). Include candidate identifiers (camelCase / snake_case) or \"quoted strings\" so the composer can extract keywords."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["task"]}},
+    \\{"name":"codedb_context","description":"Task-shaped composer: pass a natural-language task; returns ONE tight block (keywords used + symbol definitions + ranked files + top file:line snippets). Replaces 3-5 sequential search/word/symbol calls — use for first-touch orientation on a new task. For narrow follow-ups stick with codedb_search/codedb_symbol.","inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Natural-language task description (3-1024 chars). Include candidate identifiers (camelCase / snake_case) or \"quoted strings\" so the composer can extract keywords."},"max_tokens":{"type":"integer","description":"Approximate response token budget (~4 chars/token, min 256). Sections are packed by value — files, symbol definitions, callers, calls, snippets — and omitted ones leave a one-line marker."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["task"]}},
     \\{"name":"codedb_diagnostics","description":"Fetch the latest linter diagnostics for a file, produced off the edit path (ruff/biome/etc.) after a recent codedb_edit. Call right after an edit to surface real errors the change may have introduced (undefined names, type/lint issues) on top of codedb's built-in checks. Returns 'no diagnostics available yet' when none are cached or external linters are disabled.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to fetch diagnostics for"}},"required":["path"]}},
     \\{"name":"codedb_hot","description":"Most recently modified files in the project, newest first.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","description":"Number of files to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_deps","description":"Dependency graph: who imports a file (default) or what a file imports (direction=depends_on). Set transitive=true for the full BFS blast radius.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to check dependencies for"},"direction":{"type":"string","enum":["imported_by","depends_on"],"description":"imported_by (default): who imports this file. depends_on: what this file imports."},"transitive":{"type":"boolean","description":"Follow dependency chain transitively (default: false)"},"max_depth":{"type":"integer","description":"Max traversal depth for transitive queries (default: unlimited)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
@@ -759,7 +759,6 @@ pub fn buildAugmentedToolsList(alloc: std.mem.Allocator) ![]u8 {
     const augmented_in_arena = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
     return try alloc.dupe(u8, augmented_in_arena);
 }
-
 
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
@@ -2198,13 +2197,13 @@ fn extractContextCandidates(task: []const u8, alloc: std.mem.Allocator, out: *st
 // are more specific ("ranking" beats "fix") — capped like the identifier pass.
 fn extractContextFallbackWords(task: []const u8, alloc: std.mem.Allocator, out: *std.ArrayList([]const u8)) void {
     const stop = [_][]const u8{
-        "that",  "this",  "with",    "from",      "into",   "when",   "where",
-        "what",  "which", "then",    "them",      "they",   "have",   "will",
-        "should", "would", "could",  "make",      "makes",  "using",  "used",
-        "does",  "like",  "also",    "than",      "each",   "more",   "most",
-        "some",  "such",  "very",    "just",      "been",   "being",  "about",
-        "after", "before", "while",  "there",     "their",  "other",  "only",
-        "over",  "under", "between", "improve",   "implement", "ensure", "change",
+        "that",   "this",   "with",    "from",    "into",      "when",   "where",
+        "what",   "which",  "then",    "them",    "they",      "have",   "will",
+        "should", "would",  "could",   "make",    "makes",     "using",  "used",
+        "does",   "like",   "also",    "than",    "each",      "more",   "most",
+        "some",   "such",   "very",    "just",    "been",      "being",  "about",
+        "after",  "before", "while",   "there",   "their",     "other",  "only",
+        "over",   "under",  "between", "improve", "implement", "ensure", "change",
         "update",
     };
     var words: std.ArrayList([]const u8) = .empty;
@@ -2257,6 +2256,29 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
         return;
     }
 
+    const max_tokens: ?u32 = if (getInt(args, "max_tokens")) |n| @intCast(@max(256, @min(n, 1_000_000))) else null;
+
+    // Arena: every transient string in this handler lives here, no per-result
+    // free bookkeeping. Released at function exit.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const A = arena.allocator();
+
+    // #531 pick 5 — two-step packing: step 1 renders every section into its
+    // own arena buffer; step 2 admits sections by VALUE order under the byte
+    // budget (max_tokens × 4, the ~4-chars-per-token estimate) and emits the
+    // admitted ones in DOCUMENT order, leaving a one-line marker per omitted
+    // section. Without max_tokens everything is admitted, so the output is
+    // unchanged.
+    var sec_reader: std.ArrayList(u8) = .empty;
+    var sec_head: std.ArrayList(u8) = .empty;
+    var sec_syms_rich: std.ArrayList(u8) = .empty;
+    var sec_syms_lean: std.ArrayList(u8) = .empty;
+    var sec_callers: std.ArrayList(u8) = .empty;
+    var sec_calls: std.ArrayList(u8) = .empty;
+    var sec_files: std.ArrayList(u8) = .empty;
+    var sec_sites: std.ArrayList(u8) = .empty;
+
     // reader.md prepend (experimental): if .codedb/reader.md exists and its
     // declared source_hash matches the current source files, prepend its body
     // to the response. Gives the agent one-shot orientation without paying
@@ -2277,16 +2299,15 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
         var reader_state = reader_md.load(io, alloc, project_root) catch null;
         if (reader_state) |*r| {
             defer r.free(alloc);
+            const wr = cio.listWriter(&sec_reader, A);
             switch (r.state) {
                 .ready => {
                     if (r.body) |b| {
-                        out.appendSlice(alloc, "<!-- reader.md (hash-verified): -->\n") catch {};
-                        out.appendSlice(alloc, b) catch {};
-                        out.appendSlice(alloc, "\n<!-- end reader.md -->\n\n") catch {};
+                        wr.print("<!-- reader.md (hash-verified): -->\n{s}\n<!-- end reader.md -->\n\n", .{b}) catch {};
                     }
                 },
                 .stale => {
-                    out.appendSlice(alloc, "<!-- reader.md is stale (source_hash drifted). Regenerate by writing a new .codedb/reader.md with current source_hash. -->\n\n") catch {};
+                    wr.print("<!-- reader.md is stale (source_hash drifted). Regenerate by writing a new .codedb/reader.md with current source_hash. -->\n\n", .{}) catch {};
                 },
                 .malformed, .missing => {
                     // Silent — reader.md is optional.
@@ -2294,11 +2315,6 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
             }
         }
     }
-    // Arena: every transient string in this handler lives here, no per-result
-    // free bookkeeping. Released at function exit.
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const A = arena.allocator();
 
     var candidates: std.ArrayList([]const u8) = .empty;
     extractContextCandidates(task, A, &candidates);
@@ -2310,6 +2326,7 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
         extractContextFallbackWords(task, A, &candidates);
     }
     if (candidates.items.len == 0) {
+        out.appendSlice(alloc, sec_reader.items) catch {};
         out.appendSlice(alloc, "no candidate identifiers found in task — include symbol names (camelCase or snake_case) or \"quoted strings\" so the composer can extract keywords") catch {};
         return;
     }
@@ -2390,19 +2407,26 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
     }.lt);
     const top_n = @min(ranked.items.len, CONTEXT_TOP_FILES);
 
-    const w = cio.listWriter(out, alloc);
-    w.print("# Task\n{s}\n\n## Keywords used\n", .{task}) catch {};
-    for (candidates.items) |k| w.print("- {s}\n", .{k}) catch {};
+    {
+        const wh = cio.listWriter(&sec_head, A);
+        wh.print("# Task\n{s}\n\n## Keywords used\n", .{task}) catch {};
+        for (candidates.items) |k| wh.print("- {s}\n", .{k}) catch {};
+    }
 
     if (sym_refs.items.len > 0) {
-        w.print("\n## Symbol definitions\n", .{}) catch {};
+        const wsr = cio.listWriter(&sec_syms_rich, A);
+        const wsl = cio.listWriter(&sec_syms_lean, A);
+        wsr.print("\n## Symbol definitions\n", .{}) catch {};
+        wsl.print("\n## Symbol definitions\n", .{}) catch {};
         // Enhancement (closes T1 flask variance gap): when there are ≤3
         // symbol definitions, inline each symbol's FULL body (capped at 40
         // lines) so the agent doesn't need a follow-up `codedb_read`. For wider
-        // result sets this would bloat the response, so cap at 3.
+        // result sets this would bloat the response, so cap at 3. The lean
+        // variant (def lines only) is the budget fallback.
         const inline_bodies = sym_refs.items.len <= 3;
         for (sym_refs.items) |sr| {
-            w.print("- {s} ({s}) — {s}:{d}\n", .{ sr.kw, sr.kind, sr.path, sr.line }) catch {};
+            wsr.print("- {s} ({s}) — {s}:{d}\n", .{ sr.kw, sr.kind, sr.path, sr.line }) catch {};
+            wsl.print("- {s} ({s}) — {s}:{d}\n", .{ sr.kw, sr.kind, sr.path, sr.line }) catch {};
             if (inline_bodies) {
                 if (explorer.getContent(sr.path, A) catch null) |content| {
                     var cur_line: u32 = 1;
@@ -2416,7 +2440,7 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                         if (content[i] == '\n') {
                             if (line_start) |ls| {
                                 const line_end = i;
-                                w.print("       {d:>5} | {s}\n", .{ cur_line, content[ls..line_end] }) catch {};
+                                wsr.print("       {d:>5} | {s}\n", .{ cur_line, content[ls..line_end] }) catch {};
                                 captured += 1;
                             }
                             cur_line += 1;
@@ -2429,21 +2453,13 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                     }
                     if (line_start) |ls| {
                         if (captured < max_lines) {
-                            w.print("       {d:>5} | {s}\n", .{ cur_line, content[ls..] }) catch {};
+                            wsr.print("       {d:>5} | {s}\n", .{ cur_line, content[ls..] }) catch {};
                         }
                     }
                 }
             }
         }
 
-        // Callers section (closes the T1 flask agent-mean gap):
-        // For each ≤3 symbol_definitions, surface up to 2 non-definition,
-        // non-test call sites with their enclosing scope. The whole point of
-        // this section is to pre-resolve "where is this called from" so the
-        // agent doesn't need codedb_callers / outline / read follow-ups.
-        // Examples this targets directly:
-        //   T1 flask: before_request → preprocess_request in app.py
-        //   T2 regex: Builder::build → meta::Regex::new in regex.rs
         // Callers section (closes the T1 flask agent-mean gap):
         // For each ≤3 symbol_definitions, surface up to 2 non-definition,
         // non-test, non-import call sites with their enclosing scope. The
@@ -2453,6 +2469,7 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
         //   T1 flask: before_request → preprocess_request in app.py
         //   T2 regex: Builder::build → meta::Regex::new in regex.rs
         if (inline_bodies) {
+            const wc = cio.listWriter(&sec_callers, A);
             var any_callers = false;
             var seen_caller = std.StringHashMap(void).init(A);
             var total_shown: u32 = 0;
@@ -2489,15 +2506,15 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                     if (seen_caller.contains(dedup_key)) continue;
                     seen_caller.put(dedup_key, {}) catch {};
                     if (!any_callers) {
-                        w.print("\n## Callers (top non-test, non-import usages of these symbols)\n", .{}) catch {};
+                        wc.print("\n## Callers (top non-test, non-import usages of these symbols)\n", .{}) catch {};
                         any_callers = true;
                     }
                     if (r.scope_name) |sn| {
-                        w.print("- {s}:{d}: {s}  [in {s} ({s}, L{d}-L{d})]\n", .{
+                        wc.print("- {s}:{d}: {s}  [in {s} ({s}, L{d}-L{d})]\n", .{
                             r.path, r.line_num, r.line_text, sn, @tagName(r.scope_kind.?), r.scope_start, r.scope_end,
                         }) catch {};
                     } else {
-                        w.print("- {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
+                        wc.print("- {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
                     }
                     shown_for_sym += 1;
                     total_shown += 1;
@@ -2511,6 +2528,7 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
         // the Callers section above so the agent sees both who calls a symbol and
         // what it calls, without a follow-up codedb_outline/read on the callees.
         if (inline_bodies) {
+            const wcal = cio.listWriter(&sec_calls, A);
             var any_callees = false;
             var done_sym = std.StringHashMap(void).init(A);
             for (sym_refs.items) |sr| {
@@ -2520,74 +2538,136 @@ fn handleContext(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Obj
                 const callees = explorer.resolveCallees(sr.path, sr.line, sr.line_end, A, 6) catch continue;
                 if (callees.len == 0) continue;
                 if (!any_callees) {
-                    w.print("\n## Calls (graph-resolved callees of these symbols)\n", .{}) catch {};
+                    wcal.print("\n## Calls (graph-resolved callees of these symbols)\n", .{}) catch {};
                     any_callees = true;
                 }
-                w.print("- {s} ({s}) calls:\n", .{ sr.kw, sr.kind }) catch {};
+                wcal.print("- {s} ({s}) calls:\n", .{ sr.kw, sr.kind }) catch {};
                 for (callees) |c| {
-                    w.print("    \xe2\x86\x92 {s} ({s})  {s}:{d}\n", .{ c.name, @tagName(c.kind), c.path, c.line }) catch {};
+                    wcal.print("    \xe2\x86\x92 {s} ({s})  {s}:{d}\n", .{ c.name, @tagName(c.kind), c.path, c.line }) catch {};
                 }
             }
         }
     }
 
-    if (top_n == 0) {
-        out.appendSlice(alloc, "\n(no content matches — try codedb_search or codedb_word for narrower queries)\n") catch {};
-        return;
-    }
-    w.print("\n## Most-relevant files\n", .{}) catch {};
-    for (ranked.items[0..top_n]) |f| {
-        w.print("- {s}  ({d} matches)\n", .{ f.path, f.hits }) catch {};
-    }
-    w.print("\n## Top sites (with ±2 lines of context)\n", .{}) catch {};
-    explorer.mu.lockShared();
-    defer explorer.mu.unlockShared();
-    for (ranked.items[0..top_n]) |f| {
-        // Fetch full file content once per file, then slice ±2 lines around
-        // each hit. Indexed cache hits common files in ~µs; arena owns the
-        // dupe so we don't leak.
-        const file_content: ?[]const u8 = blk: {
-            const got = explorer.getContent(f.path, A) catch break :blk null;
-            break :blk got;
-        };
-        for (f.top) |h| {
-            if (file_content) |content| {
-                // Find the start/end byte offsets of [line-2 .. line+2].
-                const want_start: u32 = if (h.line > 2) h.line - 2 else 1;
-                const want_end: u32 = h.line + 2;
-                var cur_line: u32 = 1;
-                var i: usize = 0;
-                var captured_start: ?usize = null;
-                var captured_end: ?usize = null;
-                if (cur_line == want_start) captured_start = 0;
-                while (i < content.len) : (i += 1) {
-                    if (content[i] == '\n') {
-                        cur_line += 1;
-                        if (cur_line == want_start and captured_start == null) {
-                            captured_start = i + 1;
-                        }
-                        if (cur_line > want_end) {
-                            captured_end = i;
-                            break;
+    if (top_n > 0) {
+        const wf = cio.listWriter(&sec_files, A);
+        wf.print("\n## Most-relevant files\n", .{}) catch {};
+        for (ranked.items[0..top_n]) |f| {
+            wf.print("- {s}  ({d} matches)\n", .{ f.path, f.hits }) catch {};
+        }
+        const wts = cio.listWriter(&sec_sites, A);
+        wts.print("\n## Top sites (with ±2 lines of context)\n", .{}) catch {};
+        explorer.mu.lockShared();
+        defer explorer.mu.unlockShared();
+        for (ranked.items[0..top_n]) |f| {
+            // Fetch full file content once per file, then slice ±2 lines around
+            // each hit. Indexed cache hits common files in ~µs; arena owns the
+            // dupe so we don't leak.
+            const file_content: ?[]const u8 = blk: {
+                const got = explorer.getContent(f.path, A) catch break :blk null;
+                break :blk got;
+            };
+            for (f.top) |h| {
+                if (file_content) |content| {
+                    // Find the start/end byte offsets of [line-2 .. line+2].
+                    const want_start: u32 = if (h.line > 2) h.line - 2 else 1;
+                    const want_end: u32 = h.line + 2;
+                    var cur_line: u32 = 1;
+                    var i: usize = 0;
+                    var captured_start: ?usize = null;
+                    var captured_end: ?usize = null;
+                    if (cur_line == want_start) captured_start = 0;
+                    while (i < content.len) : (i += 1) {
+                        if (content[i] == '\n') {
+                            cur_line += 1;
+                            if (cur_line == want_start and captured_start == null) {
+                                captured_start = i + 1;
+                            }
+                            if (cur_line > want_end) {
+                                captured_end = i;
+                                break;
+                            }
                         }
                     }
+                    if (captured_end == null) captured_end = content.len;
+                    if (captured_start) |start_off| {
+                        const end_off = captured_end.?;
+                        const slice = content[start_off..end_off];
+                        // Cap per-snippet length to keep output bounded.
+                        const cap = @min(slice.len, 480);
+                        wts.print("\n{s}:{d}\n```\n{s}\n```\n", .{ f.path, h.line, slice[0..cap] }) catch {};
+                        continue;
+                    }
                 }
-                if (captured_end == null) captured_end = content.len;
-                if (captured_start) |start_off| {
-                    const end_off = captured_end.?;
-                    const slice = content[start_off..end_off];
-                    // Cap per-snippet length to keep output bounded.
-                    const cap = @min(slice.len, 480);
-                    w.print("\n{s}:{d}\n```\n{s}\n```\n", .{ f.path, h.line, slice[0..cap] }) catch {};
-                    continue;
-                }
+                // Fallback: single-line hit when we couldn't expand.
+                wts.print("{s}:{d}  {s}\n", .{ f.path, h.line, h.text }) catch {};
             }
-            // Fallback: single-line hit when we couldn't expand.
-            w.print("{s}:{d}  {s}\n", .{ f.path, h.line, h.text }) catch {};
         }
     }
-}
 
+    // Step 2: admit by value order — head (always), files, symbols
+    // (rich, falling back to lean), reader.md, callers, calls, snippets —
+    // then emit admitted sections in document order.
+    const budget: ?usize = if (max_tokens) |mt| @as(usize, mt) * 4 else null;
+    var spent: usize = sec_head.items.len;
+    const fits = struct {
+        fn f(lim: ?usize, spent_: *usize, cost: usize) bool {
+            const b = lim orelse return true;
+            if (cost == 0) return true;
+            if (spent_.* + cost > b) return false;
+            spent_.* += cost;
+            return true;
+        }
+    }.f;
+    const inc_files = fits(budget, &spent, sec_files.items.len);
+    var syms: []const u8 = &.{};
+    var syms_lean_fallback = false;
+    if (fits(budget, &spent, sec_syms_rich.items.len)) {
+        syms = sec_syms_rich.items;
+    } else if (fits(budget, &spent, sec_syms_lean.items.len)) {
+        syms = sec_syms_lean.items;
+        syms_lean_fallback = true;
+    }
+    const inc_reader = fits(budget, &spent, sec_reader.items.len);
+    const inc_callers = fits(budget, &spent, sec_callers.items.len);
+    const inc_calls = fits(budget, &spent, sec_calls.items.len);
+    const inc_sites = fits(budget, &spent, sec_sites.items.len);
+
+    const w = cio.listWriter(out, alloc);
+    if (inc_reader) out.appendSlice(alloc, sec_reader.items) catch {};
+    out.appendSlice(alloc, sec_head.items) catch {};
+    if (syms.len > 0) {
+        out.appendSlice(alloc, syms) catch {};
+        if (syms_lean_fallback) {
+            w.print("\n[max_tokens: symbol bodies omitted (~{d} tokens) — raise max_tokens or codedb_read the definitions]\n", .{(sec_syms_rich.items.len - sec_syms_lean.items.len) / 4}) catch {};
+        }
+    } else if (sec_syms_rich.items.len > 0) {
+        w.print("\n[max_tokens: omitted Symbol definitions (~{d} tokens)]\n", .{sec_syms_rich.items.len / 4}) catch {};
+    }
+    if (inc_callers) {
+        out.appendSlice(alloc, sec_callers.items) catch {};
+    } else if (sec_callers.items.len > 0) {
+        w.print("\n[max_tokens: omitted Callers (~{d} tokens)]\n", .{sec_callers.items.len / 4}) catch {};
+    }
+    if (inc_calls) {
+        out.appendSlice(alloc, sec_calls.items) catch {};
+    } else if (sec_calls.items.len > 0) {
+        w.print("\n[max_tokens: omitted Calls (~{d} tokens)]\n", .{sec_calls.items.len / 4}) catch {};
+    }
+    if (inc_files) {
+        out.appendSlice(alloc, sec_files.items) catch {};
+    } else if (sec_files.items.len > 0) {
+        w.print("\n[max_tokens: omitted Most-relevant files (~{d} tokens)]\n", .{sec_files.items.len / 4}) catch {};
+    }
+    if (inc_sites) {
+        out.appendSlice(alloc, sec_sites.items) catch {};
+    } else if (sec_sites.items.len > 0) {
+        w.print("\n[max_tokens: omitted Top sites (~{d} tokens)]\n", .{sec_sites.items.len / 4}) catch {};
+    }
+    if (top_n == 0) {
+        out.appendSlice(alloc, "\n(no content matches — try codedb_search or codedb_word for narrower queries)\n") catch {};
+    }
+}
 
 fn handleHot(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer) void {
     const limit: usize = if (getInt(args, "limit")) |n| @intCast(@min(@max(1, n), 1000)) else 10;
@@ -3135,7 +3215,6 @@ fn handleSnapshot(alloc: std.mem.Allocator, out: *std.ArrayList(u8), explorer: *
     };
     cache.putAndAppend(alloc, out, seq, snap);
 }
-
 
 /// When a bundled op produces a missing-arg error, append a `received keys`
 /// line listing the keys actually present in the op's args. Helps callers
@@ -4430,8 +4509,8 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
             // Auto-detect op when 'op' key is missing.
             // query → search, word → word, name → symbol
             if (getStr(step, "query") != null) break :blk "search";
-            if (getStr(step, "word") != null)   break :blk "word";
-            if (getStr(step, "name") != null)   break :blk "symbol";
+            if (getStr(step, "word") != null) break :blk "word";
+            if (getStr(step, "name") != null) break :blk "symbol";
             w.print("error: step {d} missing 'op'\n", .{step_i}) catch {};
             finishQueryWithFailure(alloc, out, step_i, "missing 'op'", step, file_set.items);
             return;
@@ -4790,8 +4869,14 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                     w.print("  {s}:{d}\n", .{ hp, h.line_num }) catch {};
                     if (!seen.contains(hp)) {
                         const duped = alloc.dupe(u8, hp) catch continue;
-                        seen.put(duped, {}) catch { alloc.free(duped); continue; };
-                        file_set.append(alloc, duped) catch { alloc.free(duped); continue; };
+                        seen.put(duped, {}) catch {
+                            alloc.free(duped);
+                            continue;
+                        };
+                        file_set.append(alloc, duped) catch {
+                            alloc.free(duped);
+                            continue;
+                        };
                     }
                 }
                 have_set = true;
@@ -4825,8 +4910,14 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                 for (results) |r| {
                     if (!seen.contains(r.path)) {
                         const duped = alloc.dupe(u8, r.path) catch continue;
-                        seen.put(duped, {}) catch { alloc.free(duped); continue; };
-                        file_set.append(alloc, duped) catch { alloc.free(duped); continue; };
+                        seen.put(duped, {}) catch {
+                            alloc.free(duped);
+                            continue;
+                        };
+                        file_set.append(alloc, duped) catch {
+                            alloc.free(duped);
+                            continue;
+                        };
                     }
                 }
                 have_set = true;
