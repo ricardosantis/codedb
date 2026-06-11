@@ -1172,3 +1172,13 @@ test "issue-597: data log compacts orphaned diff ranges and fixes offsets" {
     _ = try log_file.readPositionalAll(io, &buf, 5);
     try testing.expectEqualStrings("DDDDD", &buf);
 }
+
+
+test "issue-603: appendVersion failed key dupe leaves a poisoned files entry" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    var store = Store.init(failing.allocator());
+
+    try testing.expectError(error.OutOfMemory, store.recordSnapshot("src/a.zig", 10, 0x1));
+    try testing.expectEqual(@as(usize, 0), store.files.count());
+    store.deinit();
+}
