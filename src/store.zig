@@ -85,6 +85,7 @@ pub const Store = struct {
 
         const entry = try self.files.getOrPut(path);
         if (!entry.found_existing) {
+            errdefer self.files.removeByPtr(entry.key_ptr);
             const duped = try self.allocator.dupe(u8, path);
             entry.key_ptr.* = duped;
             entry.value_ptr.* = FileVersions.init(self.allocator, duped);
