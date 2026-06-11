@@ -1134,3 +1134,41 @@ test "issue-584: ContentCache probe-window — overflow inserts, holes, and dupl
         try testing.expectEqual(@as(u32, 2), cache.len());
     }
 }
+
+test "issue-597: data log compacts orphaned diff ranges and fixes offsets" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp_dir.dir.realPathFile(io, ".", &dir_buf);
+    const dir_path = dir_buf[0..dir_path_len];
+    const log_path = try std.fmt.allocPrint(testing.allocator, "{s}/data.log", .{dir_path});
+    defer testing.allocator.free(log_path);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    try store.openDataLog(io, log_path);
+    store.max_versions = 2;
+    store.compact_min = 1;
+
+    _ = try store.recordEdit("f.zig", 1, .replace, 0x1, 5, "AAAAA");
+    _ = try store.recordEdit("f.zig", 1, .replace, 0x2, 5, "BBBBB");
+    _ = try store.recordEdit("f.zig", 1, .replace, 0x3, 5, "CCCCC");
+    _ = try store.recordEdit("f.zig", 1, .replace, 0x4, 5, "DDDDD");
+    // max_versions=2 keeps C and D; A and B are orphaned (10 of 20 bytes),
+    // so the post-append check compacts: C -> 0, D -> 5, file truncated to 10.
+
+    const latest = store.getLatest("f.zig").?;
+    try testing.expectEqual(@as(?u64, 5), latest.data_offset);
+    const prev = store.getAtCursor("f.zig", 3).?;
+    try testing.expectEqual(@as(?u64, 0), prev.data_offset);
+
+    const log_file = try std.Io.Dir.cwd().openFile(io, log_path, .{});
+    defer log_file.close(io);
+    try testing.expectEqual(@as(u64, 10), try log_file.length(io));
+    var buf: [5]u8 = undefined;
+    _ = try log_file.readPositionalAll(io, &buf, 0);
+    try testing.expectEqualStrings("CCCCC", &buf);
+    _ = try log_file.readPositionalAll(io, &buf, 5);
+    try testing.expectEqualStrings("DDDDD", &buf);
+}
