@@ -1171,51 +1171,10 @@ fn shouldSkipFile(path: []const u8) bool {
 }
 
 /// Check if a path refers to a sensitive file (secrets, keys, credentials).
-/// Replicates the filter from snapshot.zig so live indexing and snapshots
-/// apply the same exclusion rules. Optimized: basename check + early exit.
+/// Delegates to snapshot.zig so live indexing and snapshots apply the same
+/// exclusion rules from a single implementation.
 pub fn isSensitivePath(path: []const u8) bool {
-    const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| path[sep + 1 ..] else path;
-    // Fast path: most source files have extensions like .zig, .ts, .py — none start with '.'
-    // or match sensitive patterns. Skip the full check for common cases.
-    if (basename.len == 0) return false;
-    const first = basename[0];
-    // Only check sensitive names if basename starts with '.', 'c', 's', 'i' or has key/cert extension
-    if (first != '.' and first != 'c' and first != 's' and first != 'i') {
-        // Still need to check extensions and directory patterns
-        if (std.mem.endsWith(u8, basename, ".env") or
-            std.mem.endsWith(u8, basename, ".pem") or
-            std.mem.endsWith(u8, basename, ".key") or
-            std.mem.endsWith(u8, basename, ".p12") or
-            std.mem.endsWith(u8, basename, ".pfx") or
-            std.mem.endsWith(u8, basename, ".jks")) return true;
-        if (std.mem.indexOf(u8, path, ".ssh/") != null or
-            std.mem.indexOf(u8, path, ".gnupg/") != null or
-            std.mem.indexOf(u8, path, ".aws/") != null) return true;
-        return false;
-    }
-    // .env, .env.<token>; do NOT match .envoy, .envrc, .environment, etc.
-    if (basename.len >= 4 and std.mem.eql(u8, basename[0..4], ".env") and
-        (basename.len == 4 or basename[4] == '.' or basename[4] == '-' or basename[4] == '_')) return true;
-    // Exact matches
-    const sensitive_names = [_][]const u8{
-        ".dev.vars",        ".npmrc",               ".pypirc",      ".netrc",
-        "credentials.json", "service-account.json", "secrets.json", "secrets.yaml",
-        "secrets.yml",      "id_rsa",               "id_ed25519",   ".git-credentials",
-        "id_ecdsa",         "id_dsa",               "id_ecdsa_sk",  "id_ed25519_sk",
-    };
-    for (sensitive_names) |name| {
-        if (std.mem.eql(u8, basename, name)) return true;
-    }
-    if (std.mem.endsWith(u8, basename, ".env") or
-        std.mem.endsWith(u8, basename, ".pem") or
-        std.mem.endsWith(u8, basename, ".key") or
-        std.mem.endsWith(u8, basename, ".p12") or
-        std.mem.endsWith(u8, basename, ".pfx") or
-        std.mem.endsWith(u8, basename, ".jks")) return true;
-    if (std.mem.indexOf(u8, path, ".ssh/") != null or
-        std.mem.indexOf(u8, path, ".gnupg/") != null or
-        std.mem.indexOf(u8, path, ".aws/") != null) return true;
-    return false;
+    return @import("snapshot.zig").isSensitivePath(path);
 }
 
 fn indexFileContent(io: std.Io, explorer: *Explorer, dir: std.Io.Dir, path: []const u8, allocator: std.mem.Allocator, skip_trigram: bool) !void {
