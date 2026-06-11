@@ -10,6 +10,7 @@ const MmapTrigramIndex = idx.MmapTrigramIndex;
 const AnyTrigramIndex = idx.AnyTrigramIndex;
 const SparseNgramIndex = idx.SparseNgramIndex;
 const codegraph = @import("codegraph.zig");
+const git = @import("git.zig");
 
 /// Fast hash context for u32-keyed maps on hot paths (ranked search aggregation).
 /// Zig's AutoHashMap runs the 4 key bytes through Wyhash even for an integer key;
@@ -775,6 +776,16 @@ pub const Explorer = struct {
     call_graph: ?CallGraph = null,
     centrality_build_mu: cio.Mutex = .{},
     root_dir: ?std.Io.Dir = null,
+    /// Absolute project root path (duped in setRoot) — needed to shell out to
+    /// git for the co-change map (#550).
+    root_path: ?[]const u8 = null,
+    /// file → strongest git co-change partners (#550). Built lazily from
+    /// `git log --name-only`; null until built (or unavailable: no root, not
+    /// a repo). Guarded by cochange_build_mu; attempted-flag stops re-shelling
+    /// when git is absent.
+    co_change: ?std.StringHashMap([]git.CoChangePartner) = null,
+    co_change_attempted: bool = false,
+    cochange_build_mu: cio.Mutex = .{},
     io: ?std.Io = null,
     /// When non-null, append one JSON line per searchContent invocation
     /// to this path (v0 rerank-trace experiment). Borrowed; caller owns
@@ -807,6 +818,8 @@ pub const Explorer = struct {
     pub fn setRoot(self: *Explorer, io: std.Io, root_path: []const u8) void {
         self.io = io;
         self.root_dir = std.Io.Dir.cwd().openDir(io, root_path, .{}) catch null;
+        if (self.root_path) |old| self.allocator.free(old);
+        self.root_path = self.allocator.dupe(u8, root_path) catch null;
     }
 
     pub fn init(allocator: std.mem.Allocator, content_cache_capacity: u32) Explorer {
@@ -848,6 +861,8 @@ pub const Explorer = struct {
         self.contents.deinit();
         if (self.call_centrality) |*c| c.deinit();
         if (self.call_graph) |*cg| cg.deinit(self.allocator);
+        if (self.co_change) |*cc| git.freeCoChange(cc, self.allocator);
+        if (self.root_path) |p| self.allocator.free(p);
 
         self.word_index.deinit();
         self.trigram_index.deinit();
@@ -2520,17 +2535,7 @@ pub const Explorer = struct {
                 const gop = tier0_files_by_path.getOrPut(hit_path) catch continue;
                 if (!gop.found_existing) {
                     const is_doc = isDocLanguage(detectLanguage(hit_path));
-                    var defines = false;
-                    if (!is_doc) {
-                        if (self.outlines.get(hit_path)) |outline| {
-                            for (outline.symbols.items) |sym| {
-                                if (asciiEqlIgnoreCase(sym.name, query)) {
-                                    defines = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                    const defines = !is_doc and self.fileDefinesSymbol(hit_path, query);
                     gop.value_ptr.* = .{
                         .path = hit_path,
                         .count = 0,
@@ -3007,9 +3012,23 @@ pub const Explorer = struct {
             graph_dist = self.queryGraphDistances(&gd_terms, ga);
         }
 
+        // #550 signal 2: git co-change. Seeds are the result files that
+        // DEFINE the queried symbol, so plain word queries never trigger the
+        // one-time `git log` shell-out.
+        var cc_seeds = std.StringHashMap(void).init(allocator);
+        defer cc_seeds.deinit();
+        if (cio.posixGetenv("CODEDB_NO_COCHANGE") == null) {
+            for (result_list.items) |r| {
+                if (cc_seeds.contains(r.path)) continue;
+                if (self.fileDefinesSymbol(r.path, query)) cc_seeds.put(r.path, {}) catch {};
+            }
+            if (cc_seeds.count() > 0) self.ensureCoChange();
+        }
+
         for (result_list.items) |*r| {
             r.score = self.rerankSignalScore(r.*, query);
             r.score *= graphDistanceBoost(graph_dist, r.path);
+            r.score *= self.coChangeBoost(&cc_seeds, r.path);
             if (lfp.enabled) r.score *= lfp.multiplier(file_hit_counts.get(r.path) orelse 1, max_file_hits);
             if (sp.enabled) r.score *= sp.multiplier(self, r.path);
         }
@@ -3306,6 +3325,54 @@ pub const Explorer = struct {
             if (c == '_' or (c >= 'A' and c <= 'Z')) return true;
         }
         return false;
+    }
+
+    /// True when `path`'s outline defines a symbol named `name` (any kind,
+    /// case-insensitive). Outline-based so it works on snapshot fast-loads
+    /// where symbol_index is deferred (#564).
+    fn fileDefinesSymbol(self: *const Explorer, path: []const u8, name: []const u8) bool {
+        const outline = self.outlines.get(path) orelse return false;
+        for (outline.symbols.items) |sym| {
+            if (asciiEqlIgnoreCase(sym.name, name)) return true;
+        }
+        return false;
+    }
+
+    /// Build the git co-change map once (#550): `git log --name-only` over
+    /// the last 500 commits, mega-commits (>32 files) skipped, top 8 partners
+    /// per file. Needs root_path (setRoot); silently unavailable outside a
+    /// git repo — the attempted flag stops re-shelling. Mirrors
+    /// ensureCallGraph: call while holding at least a shared lock on `mu`.
+    fn ensureCoChange(self: *Explorer) void {
+        if (self.co_change != null or self.co_change_attempted) return;
+        self.cochange_build_mu.lock();
+        defer self.cochange_build_mu.unlock();
+        if (self.co_change != null or self.co_change_attempted) return;
+        self.co_change_attempted = true;
+        const root = self.root_path orelse return;
+        self.co_change = git.buildCoChange(self.allocator, root, 500, 32, 8);
+    }
+
+    /// Boost for files that historically change together with the files
+    /// defining the queried symbol — git co-change, the temporal sibling of
+    /// graphDistanceBoost (#550). Always ≥ 1, never a filter; 1.0 when the
+    /// map or seeds are absent. Two shared commits is the noise floor;
+    /// strength saturates at eight (×1.25).
+    fn coChangeBoost(self: *const Explorer, seeds: *const std.StringHashMap(void), path: []const u8) f32 {
+        const cc = self.co_change orelse return 1.0;
+        if (seeds.count() == 0) return 1.0;
+        if (seeds.contains(path)) return 1.0;
+        var best: u32 = 0;
+        var it = seeds.keyIterator();
+        while (it.next()) |s| {
+            const partners = cc.get(s.*) orelse continue;
+            for (partners) |p| {
+                if (p.count > best and std.mem.eql(u8, p.path, path)) best = p.count;
+            }
+        }
+        if (best < 2) return 1.0;
+        const strength = @min(@as(f32, @floatFromInt(best)) / 8.0, 1.0);
+        return 1.0 + 0.25 * strength;
     }
 
     /// Public, lock-acquiring entry point for single-threaded callers (the
@@ -3694,6 +3761,27 @@ pub const Explorer = struct {
         }
         if (per_doc.count() == 0) return try allocator.alloc(SearchResult, 0);
 
+        // #550 signal 2: git co-change. Seeds are the candidate files that
+        // DEFINE a query-named symbol; without seeds the one-time `git log`
+        // shell-out never happens.
+        var cc_seeds = std.StringHashMap(void).init(ta);
+        if (cio.posixGetenv("CODEDB_NO_COCHANGE") == null) {
+            var seed_iter = per_doc.iterator();
+            while (seed_iter.next()) |entry| {
+                const doc_id = entry.key_ptr.*;
+                const p = if (doc_id < self.word_index.id_to_path.items.len) self.word_index.id_to_path.items[doc_id] else "";
+                if (p.len == 0 or cc_seeds.contains(p)) continue;
+                var t_it = terms_set.keyIterator();
+                while (t_it.next()) |t| {
+                    if (self.fileDefinesSymbol(p, t.*)) {
+                        cc_seeds.put(p, {}) catch {};
+                        break;
+                    }
+                }
+            }
+            if (cc_seeds.count() > 0) self.ensureCoChange();
+        }
+
         const Cand = struct { doc_id: u32, score: f32, best_line: u32 };
         var cands: std.ArrayList(Cand) = .empty;
         defer cands.deinit(ta);
@@ -3707,7 +3795,8 @@ pub const Explorer = struct {
                 .score = entry.value_ptr.score *
                     pathRelevanceMultiplier(cand_path, &terms_set) *
                     self.centralityBoost(cand_path) *
-                    graphDistanceBoost(graph_dist, cand_path),
+                    graphDistanceBoost(graph_dist, cand_path) *
+                    self.coChangeBoost(&cc_seeds, cand_path),
                 .best_line = entry.value_ptr.best_line,
             });
         }
