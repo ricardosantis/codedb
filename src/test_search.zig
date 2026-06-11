@@ -10,6 +10,7 @@ const TrigramIndex = @import("index.zig").TrigramIndex;
 const SparseNgramIndex = @import("index.zig").SparseNgramIndex;
 const explore = @import("explore.zig");
 const Language = explore.Language;
+const git = @import("git.zig");
 const SymbolKind = explore.SymbolKind;
 const DependencyGraph = explore.DependencyGraph;
 const SymbolLocation = explore.SymbolLocation;
@@ -2244,4 +2245,56 @@ test "issue-550: call-graph distance ranks structurally-near files above equal-l
     try testing.expect(helper_score > 0);
     try testing.expect(noise_score > 0);
     try testing.expect(helper_score > noise_score);
+}
+
+test "issue-550: co-change partner of the defining file outranks an unrelated equal-lexical file" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var explorer = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/def.zig",
+        \\pub fn frobnicate() void {}
+    );
+    // partner and stranger mention the term identically; only the injected
+    // co-change history distinguishes them.
+    try explorer.indexFile("src/partner.zig",
+        \\pub fn helper() void {
+        \\    // frobnicate mention
+        \\}
+    );
+    try explorer.indexFile("src/stranger.zig",
+        \\pub fn other() void {
+        \\    // frobnicate mention
+        \\}
+    );
+
+    const partners = try aa.alloc(git.CoChangePartner, 1);
+    partners[0] = .{ .path = "src/partner.zig", .count = 8 };
+    var cc = std.StringHashMap([]git.CoChangePartner).init(aa);
+    try cc.put("src/def.zig", partners);
+    explorer.co_change = cc;
+    explorer.co_change_attempted = true;
+
+    const results = try explorer.searchContent("frobnicate", testing.allocator, 8);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.line_text);
+            testing.allocator.free(r.path);
+        }
+        testing.allocator.free(results);
+    }
+
+    try testing.expect(results.len >= 3);
+    try testing.expectEqualStrings("src/def.zig", results[0].path);
+
+    var partner_score: f32 = -1.0;
+    var stranger_score: f32 = -1.0;
+    for (results) |r| {
+        if (partner_score < 0 and std.mem.eql(u8, r.path, "src/partner.zig")) partner_score = r.score;
+        if (stranger_score < 0 and std.mem.eql(u8, r.path, "src/stranger.zig")) stranger_score = r.score;
+    }
+    try testing.expect(partner_score > 0);
+    try testing.expect(stranger_score > 0);
+    try testing.expect(partner_score > stranger_score);
 }

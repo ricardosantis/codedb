@@ -12,7 +12,7 @@ const Explorer = explore.Explorer;
 const linter = @import("linter.zig");
 const linter_pref = @import("linter_pref.zig");
 const ContentCache = @import("hot_cache.zig").ContentCache;
-
+const git = @import("git.zig");
 
 test "store: record and retrieve snapshots" {
     var store = Store.init(testing.allocator);
@@ -25,7 +25,6 @@ test "store: record and retrieve snapshots" {
     try testing.expect(seq2 == 2);
     try testing.expect(store.currentSeq() == 2);
 }
-
 
 test "store: getLatest returns most recent version" {
     var store = Store.init(testing.allocator);
@@ -40,14 +39,12 @@ test "store: getLatest returns most recent version" {
     try testing.expect(latest.hash == 0x222);
 }
 
-
 test "store: getLatest returns null for unknown file" {
     var store = Store.init(testing.allocator);
     defer store.deinit();
 
     try testing.expect(store.getLatest("nope.zig") == null);
 }
-
 
 test "store: changesSince counts correctly" {
     var store = Store.init(testing.allocator);
@@ -61,7 +58,6 @@ test "store: changesSince counts correctly" {
     try testing.expect(store.changesSince(1) == 2);
     try testing.expect(store.changesSince(3) == 0);
 }
-
 
 test "store: changesSinceDetailed" {
     var store = Store.init(testing.allocator);
@@ -77,7 +73,6 @@ test "store: changesSinceDetailed" {
     try testing.expect(changes.len == 2); // a.zig and b.zig both changed
 }
 
-
 test "store: recordDelete creates tombstone" {
     var store = Store.init(testing.allocator);
     defer store.deinit();
@@ -89,7 +84,6 @@ test "store: recordDelete creates tombstone" {
     try testing.expect(latest.op == .tombstone);
     try testing.expect(latest.size == 0);
 }
-
 
 test "store: getAtCursor" {
     var store = Store.init(testing.allocator);
@@ -108,7 +102,6 @@ test "store: getAtCursor" {
     const at3 = store.getAtCursor("f.zig", 99).?;
     try testing.expect(at3.size == 30);
 }
-
 
 test "store: recordEdit persists diff data to data log" {
     var tmp_dir = testing.tmpDir(.{});
@@ -142,7 +135,6 @@ test "store: recordEdit persists diff data to data log" {
     try testing.expectEqualStrings(diff, buf[0..diff.len]);
 }
 
-
 test "agent: register and heartbeat" {
     var agents = AgentRegistry.init(testing.allocator);
     defer agents.deinit();
@@ -154,7 +146,6 @@ test "agent: register and heartbeat" {
     // No crash = success
 }
 
-
 test "agent: register multiple agents" {
     var agents = AgentRegistry.init(testing.allocator);
     defer agents.deinit();
@@ -164,7 +155,6 @@ test "agent: register multiple agents" {
     try testing.expect(a == 1);
     try testing.expect(b == 2);
 }
-
 
 test "agent: lock and unlock" {
     var agents = AgentRegistry.init(testing.allocator);
@@ -177,7 +167,6 @@ test "agent: lock and unlock" {
 
     agents.releaseLock(id, "file.zig");
 }
-
 
 test "agent: lock contention between agents" {
     var agents = AgentRegistry.init(testing.allocator);
@@ -202,7 +191,6 @@ test "agent: lock contention between agents" {
     try testing.expect(got_b2 == true);
 }
 
-
 test "agent: same-agent relock does not duplicate lock key" {
     var agents = AgentRegistry.init(testing.allocator);
     defer agents.deinit();
@@ -219,7 +207,6 @@ test "agent: same-agent relock does not duplicate lock key" {
     try testing.expect(agent.locked_paths.count() == 0);
 }
 
-
 test "agent: reapStale frees lock keys and clears map" {
     var agents = AgentRegistry.init(testing.allocator);
     defer agents.deinit();
@@ -235,7 +222,6 @@ test "agent: reapStale frees lock keys and clears map" {
     try testing.expect(agent.state == .crashed);
     try testing.expect(agent.locked_paths.count() == 0);
 }
-
 
 test "issue-411: tryLock grants new locks to a crashed agent" {
     var agents = AgentRegistry.init(testing.allocator);
@@ -282,7 +268,6 @@ test "issue-528: each MCP session registers a distinct edit-lock owner (not shar
     try testing.expect(try agents.tryLock(session_b, "x.zig", 60_000));
 }
 
-
 test "issue-401: insert with after=null is a no-op but consumes seq and writes file" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -318,7 +303,6 @@ test "issue-401: insert with after=null is a no-op but consumes seq and writes f
         try testing.expectEqual(@as(u64, 0), store.currentSeq());
     }
 }
-
 
 test "issue-404: applyEdit corrupts CRLF line endings into mixed LF/CRLF" {
     var tmp = testing.tmpDir(.{});
@@ -366,7 +350,6 @@ test "issue-404: applyEdit corrupts CRLF line endings into mixed LF/CRLF" {
     }
 }
 
-
 test "issue-409: replacing whole file with empty content leaves a stray newline" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -406,7 +389,6 @@ test "issue-409: replacing whole file with empty content leaves a stray newline"
     try testing.expectEqual(@as(usize, 0), after.len);
     try testing.expectEqual(@as(u64, 0), result.new_size);
 }
-
 
 // ── Post-edit syntax health (trial/graph-based-codedb) ────────────────────
 
@@ -582,7 +564,6 @@ test "edit-health: a name re-imported from another module is not flagged" {
     try testing.expect(msg == null);
 }
 
-
 // ── Anchor-based str_replace (P2, trial/graph-based-codedb) ───────────────
 
 test "edit-str_replace: anchored replace updates the unique occurrence exactly" {
@@ -699,7 +680,6 @@ test "edit-str_replace: health check still runs on an anchored edit that breaks 
     try testing.expect(std.mem.indexOf(u8, result.health.?, "never closed") != null);
 }
 
-
 // ── op=create: author new files (trial/graph-based-codedb) ────────────────
 
 test "edit-create: op=create authors a new file that did not exist" {
@@ -757,7 +737,6 @@ test "edit-create: op=create refuses to clobber an existing file" {
     defer testing.allocator.free(after);
     try testing.expectEqualStrings("keep = 1\n", after);
 }
-
 
 // ── Tier-1 linter registry + session policy (trial/graph-based-codedb) ────
 
@@ -823,7 +802,6 @@ test "linter: toolOnPath returns false for a non-existent executable" {
     try testing.expect(!linter.toolOnPath(testing.allocator, "codedb_definitely_not_a_real_tool_zzz"));
 }
 
-
 // ── Linter opt-in preference persistence (trial/graph-based-codedb) ───────
 
 test "linter-pref: parseBody maps tokens to the three states" {
@@ -856,7 +834,6 @@ test "linter-pref: write then read round-trips on/off; missing file is unset" {
     linter_pref.writeAt(io, path, .unset);
     try testing.expectEqual(linter_pref.Pref.off, linter_pref.readAt(io, path));
 }
-
 
 // ── Linter execution + output parsing (trial/graph-based-codedb) ──────────
 
@@ -933,7 +910,6 @@ test "linter: the interactive prompt entrypoint compiles (analysis guard)" {
     _ = &cio.readLine;
 }
 
-
 // ── Diagnostics cache (trial/graph-based-codedb) ──────────────────────────
 
 test "diag-cache: store + appendIfFresh matches on (path,hash), misses otherwise" {
@@ -994,7 +970,6 @@ test "diag-cache: eviction stays bounded and leak-free past MAX entries" {
     try testing.expect(c.appendLatest(testing.allocator, &out, last)); // newest retained
 }
 
-
 test "issue-101: Store.max_versions is configurable (caps per-file history)" {
     // Default cap is 100. After setting max_versions = 3, writing 5 versions
     // of the same file must leave exactly 3 in-memory.
@@ -1015,7 +990,6 @@ test "issue-101: Store.max_versions is configurable (caps per-file history)" {
     try testing.expectEqual(@as(u64, 0x555), entry.versions.items[2].hash);
 }
 
-
 test "issue-102: Explorer.init capacity flows to ContentCache" {
     // Verifies that the capacity arg to Explorer.init actually sets the
     // ContentCache capacity — the bug that issue-102 was filed for.
@@ -1024,7 +998,6 @@ test "issue-102: Explorer.init capacity flows to ContentCache" {
 
     try testing.expectEqual(@as(u32, 8), explorer.contents.capacity);
 }
-
 
 test "issue-101+102: .codedbrc max_cached threads through to ContentCache capacity" {
     // End-to-end: parse a .codedbrc body, construct Explorer with the parsed
@@ -1049,7 +1022,6 @@ test "issue-101+102: .codedbrc max_cached threads through to ContentCache capaci
     try testing.expectEqual(@as(usize, 7), store.max_versions);
     try testing.expectEqual(@as(u32, 32), explorer.contents.capacity);
 }
-
 
 test "issue-584: ContentCache probe-window — overflow inserts, holes, and duplicate keys" {
     // putImpl's overflow path evicts via a global CLOCK hand, so the new entry
@@ -1173,7 +1145,6 @@ test "issue-597: data log compacts orphaned diff ranges and fixes offsets" {
     try testing.expectEqualStrings("DDDDD", &buf);
 }
 
-
 test "issue-603: appendVersion failed key dupe leaves a poisoned files entry" {
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
     var store = Store.init(failing.allocator());
@@ -1181,4 +1152,46 @@ test "issue-603: appendVersion failed key dupe leaves a poisoned files entry" {
     try testing.expectError(error.OutOfMemory, store.recordSnapshot("src/a.zig", 10, 0x1));
     try testing.expectEqual(@as(usize, 0), store.files.count());
     store.deinit();
+}
+
+test "issue-550: parseCoChange builds bounded per-file partner lists" {
+    const alloc = testing.allocator;
+    const log =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n" ++
+        "\n" ++
+        "src/a.zig\n" ++
+        "src/b.zig\n" ++
+        "\n" ++
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n" ++
+        "\n" ++
+        "src/a.zig\n" ++
+        "src/b.zig\n" ++
+        "src/c.zig\n" ++
+        "\n" ++
+        "cccccccccccccccccccccccccccccccccccccccc\n" ++
+        "\n" ++
+        "src/mega1.zig\n" ++
+        "src/mega2.zig\n" ++
+        "src/mega3.zig\n" ++
+        "src/mega4.zig\n";
+
+    var map = try git.parseCoChange(alloc, log, 3, 8);
+    defer git.freeCoChange(&map, alloc);
+
+    const a_partners = map.get("src/a.zig") orelse return testing.expect(false);
+    try testing.expectEqual(@as(usize, 2), a_partners.len);
+    try testing.expectEqualStrings("src/b.zig", a_partners[0].path);
+    try testing.expectEqual(@as(u32, 2), a_partners[0].count);
+    try testing.expectEqualStrings("src/c.zig", a_partners[1].path);
+    try testing.expectEqual(@as(u32, 1), a_partners[1].count);
+
+    // The 4-file commit exceeds max_files_per_commit=3 — contributes nothing.
+    try testing.expect(map.get("src/mega1.zig") == null);
+
+    // max_partners truncates after the count-descending sort.
+    var capped = try git.parseCoChange(alloc, log, 3, 1);
+    defer git.freeCoChange(&capped, alloc);
+    const a_capped = capped.get("src/a.zig") orelse return testing.expect(false);
+    try testing.expectEqual(@as(usize, 1), a_capped.len);
+    try testing.expectEqualStrings("src/b.zig", a_capped[0].path);
 }
