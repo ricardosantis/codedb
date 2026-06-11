@@ -1090,6 +1090,63 @@ test "issue-429-c: searchContent rerank boosts lines that are symbol definitions
     try testing.expectEqualStrings("zzz_def.zig", results[0].path);
 }
 
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "lex-freq-penalty: CODEDB_LEX_FREQ_PENALTY demotes files the query saturates" {
+    // engram's learned ranker down-weights pure lexical frequency (LEARNED_W
+    // lexical = -2): a file the query matches on MANY lines is usually a
+    // dispatcher/registry, not the implementation the searcher wants. Two
+    // non-eponymous files tie on per-line score, so the path-asc tiebreaker puts
+    // "dispatcher.zig" first by default; with CODEDB_LEX_FREQ_PENALTY on, the
+    // query-saturated dispatcher.zig (6 match lines) is pushed below the focused
+    // handler.zig (1 match line).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/dispatcher.zig", "pub fn a() void { _ = evt; }\n" ++
+        "pub fn b() void { _ = evt; }\n" ++
+        "pub fn c() void { _ = evt; }\n" ++
+        "pub fn d() void { _ = evt; }\n" ++
+        "pub fn e() void { _ = evt; }\n" ++
+        "pub fn f() void { _ = evt; }\n");
+    try explorer.indexFile("src/handler.zig", "pub fn g() void { _ = evt; }\n");
+
+    // Disabled (CODEDB_LEX_FREQ_PENALTY=0): equal per-line scores → path-asc tie → dispatcher leads.
+    _ = setenv("CODEDB_LEX_FREQ_PENALTY", "0", 1);
+    defer _ = unsetenv("CODEDB_LEX_FREQ_PENALTY");
+    {
+        const results = try explorer.searchContent("evt", testing.allocator, 50);
+        defer {
+            for (results) |r| {
+                testing.allocator.free(r.path);
+                testing.allocator.free(r.line_text);
+            }
+            testing.allocator.free(results);
+        }
+        try testing.expect(results.len >= 2);
+        try testing.expectEqualStrings("src/dispatcher.zig", results[0].path);
+    }
+
+    // Default (on): dispatcher.zig saturates the query → demoted below handler.zig.
+    _ = unsetenv("CODEDB_LEX_FREQ_PENALTY");
+    {
+        const results = try explorer.searchContent("evt", testing.allocator, 50);
+        defer {
+            for (results) |r| {
+                testing.allocator.free(r.path);
+                testing.allocator.free(r.line_text);
+            }
+            testing.allocator.free(results);
+        }
+        try testing.expect(results.len >= 2);
+        try testing.expectEqualStrings("src/handler.zig", results[0].path);
+    }
+}
+
+
 test "issue-430: Tier 0 markdown dominance starves canonical source file" {
     // Tier 0 of searchContent (explore.zig:1525-1554) iterates the word
     // index posting list in insertion order with a per-file cap of

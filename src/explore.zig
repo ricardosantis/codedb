@@ -656,6 +656,92 @@ pub const CallPathStep = struct {
     line: u32,
 };
 
+/// rVSM file-size prior (BugLocator — Zhou et al., ICSE 2012). IR-based fault
+/// localization shows the file a commit / bug report targets skews LARGE (core
+/// files), yet codedb's ranking penalizes long docs. This is an opt-in EXPERIMENT
+/// (research.md / todo.md P0): favor big *code* files via a multiplier on the
+/// rerank score. Off unless CODEDB_RVSM_SIZE_PRIOR is set; amp/slope tunable via
+/// CODEDB_RVSM_AMP (default 0.5) and CODEDB_RVSM_K (default 1.0). Size is the
+/// file's line_count (always present on the search path; word-index doc lengths
+/// are not — `search` runs with the word index disabled), normalized to the
+/// corpus average over code files. Doc-language files are excluded (multiplier
+/// 1.0) so a giant CHANGELOG can't ride the prior over the real code gold.
+const RvsmSizePrior = struct {
+    enabled: bool = false,
+    amp: f32 = 0.5,
+    k: f32 = 1.0,
+    avg_lines: f32 = 1.0,
+
+    fn envF32(name: []const u8, default_val: f32) f32 {
+        const v = cio.posixGetenv(name) orelse return default_val;
+        return std.fmt.parseFloat(f32, std.mem.trim(u8, v, " \t\r\n")) catch default_val;
+    }
+
+    fn fromEnv(ex: *const Explorer) RvsmSizePrior {
+        if (cio.posixGetenv("CODEDB_RVSM_SIZE_PRIOR") == null) return .{};
+        var total: u64 = 0;
+        var n: u64 = 0;
+        var it = ex.outlines.valueIterator();
+        while (it.next()) |o| {
+            if (o.line_count > 0 and !isDocLanguage(o.language)) {
+                total += o.line_count;
+                n += 1;
+            }
+        }
+        const avg: f32 = if (n == 0) 1.0 else @as(f32, @floatFromInt(total)) / @as(f32, @floatFromInt(n));
+        return .{
+            .enabled = true,
+            .amp = envF32("CODEDB_RVSM_AMP", 0.5),
+            .k = envF32("CODEDB_RVSM_K", 1.0),
+            .avg_lines = avg,
+        };
+    }
+
+    /// Multiplier centered at 1.0 for an average-length code file:
+    /// 1 + amp·tanh(k·(line_count/avg − 1)), in (1−amp, 1+amp). Monotonic in size.
+    fn multiplier(self: RvsmSizePrior, ex: *const Explorer, path: []const u8) f32 {
+        if (!self.enabled) return 1.0;
+        const o = ex.outlines.get(path) orelse return 1.0;
+        if (o.line_count == 0 or isDocLanguage(o.language)) return 1.0;
+        const x = @as(f32, @floatFromInt(o.line_count)) / self.avg_lines;
+        return 1.0 + self.amp * std.math.tanh(self.k * (x - 1.0));
+    }
+};
+
+/// File-frequency lexical penalty: down-weight files the query matches on MANY
+/// lines. A file the query saturates is usually a dispatcher, registry,
+/// re-export, or changelog — not the implementation the searcher wants, which is
+/// typically the file *named* after the concept (already lifted by the
+/// eponymy/stem boost in rerankSignalScore). This is codedb's analog of engram's
+/// learned negative-lexical weight (LEARNED_W lexical = -2). ON by default at amp
+/// 0.8 (tuned on the swe-lite retrieval sweep: 0.8 lifted a buried gold with no
+/// regressions, 0.95 over-penalized symbol-owner files whose gold is legitimately
+/// saturated). Disable with CODEDB_LEX_FREQ_PENALTY=0; override strength with
+/// CODEDB_LEX_FREQ_AMP. The multiplier is 1.0 for the least-matched file and
+/// 1-amp for the most-matched, linear in normalized match-line count — it only
+/// reorders among comparably-scored files and rarely overturns a strong
+/// eponymy/symbol hit.
+const LexFreqPenalty = struct {
+    enabled: bool = true,
+    amp: f32 = 0.8,
+
+    fn fromEnv() LexFreqPenalty {
+        if (cio.posixGetenv("CODEDB_LEX_FREQ_PENALTY")) |v| {
+            if (std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "off"))
+                return .{ .enabled = false };
+        }
+        return .{ .enabled = true, .amp = RvsmSizePrior.envF32("CODEDB_LEX_FREQ_AMP", 0.8) };
+    }
+
+    /// cnt = match-line count for this file; max_count = the largest such count
+    /// in the result set. Returns 1.0 when disabled or when every file ties
+    /// (max_count <= 1) — nothing to discriminate.
+    fn multiplier(self: LexFreqPenalty, cnt: u32, max_count: u32) f32 {
+        if (!self.enabled or max_count <= 1) return 1.0;
+        const norm = @as(f32, @floatFromInt(cnt - 1)) / @as(f32, @floatFromInt(max_count - 1));
+        return 1.0 - self.amp * norm;
+    }
+};
 pub const Explorer = struct {
     outlines: std.StringHashMap(FileOutline),
     dep_graph: DependencyGraph,
@@ -2859,8 +2945,27 @@ pub const Explorer = struct {
         query: []const u8,
         allocator: std.mem.Allocator,
     ) ![]const SearchResult {
+        const sp = RvsmSizePrior.fromEnv(self);
+        const lfp = LexFreqPenalty.fromEnv();
+
+        // The file-frequency penalty (engram's negative-lexical signal) needs the
+        // per-file match-line count across the whole result set, so tally it up
+        // front. Built only when the experiment is enabled — zero cost otherwise.
+        var file_hit_counts = std.StringHashMap(u32).init(allocator);
+        defer file_hit_counts.deinit();
+        var max_file_hits: u32 = 0;
+        if (lfp.enabled) {
+            for (result_list.items) |r| {
+                const gop = try file_hit_counts.getOrPut(r.path);
+                gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+                if (gop.value_ptr.* > max_file_hits) max_file_hits = gop.value_ptr.*;
+            }
+        }
+
         for (result_list.items) |*r| {
             r.score = self.rerankSignalScore(r.*, query);
+            if (lfp.enabled) r.score *= lfp.multiplier(file_hit_counts.get(r.path) orelse 1, max_file_hits);
+            if (sp.enabled) r.score *= sp.multiplier(self, r.path);
         }
         if (result_list.items.len > 1) {
             std.sort.block(SearchResult, result_list.items, {}, struct {
