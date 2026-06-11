@@ -2208,3 +2208,91 @@ test "cli-mcp-parity: runCliTool bridges navigation commands to MCP handlers" {
         try testing.expect(std.mem.indexOf(u8, out.items, "usage") != null);
     }
 }
+
+test "issue-531: codedb_context max_tokens packs sections by value under the budget" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    // A defined symbol with a fat body (inlined when unbudgeted) plus several
+    // mention files so the snippets section is large too.
+    try explorer.indexFile("src/widget.zig",
+        \\pub fn widgetFrobnicate() void {
+        \\    const filler_line_01: u64 = 1;
+        \\    const filler_line_02: u64 = 2;
+        \\    const filler_line_03: u64 = 3;
+        \\    const filler_line_04: u64 = 4;
+        \\    const filler_line_05: u64 = 5;
+        \\    const filler_line_06: u64 = 6;
+        \\    const filler_line_07: u64 = 7;
+        \\    const filler_line_08: u64 = 8;
+        \\    const filler_line_09: u64 = 9;
+        \\    const filler_line_10: u64 = 10;
+        \\    const filler_line_11: u64 = 11;
+        \\    const filler_line_12: u64 = 12;
+        \\    const filler_line_13: u64 = 13;
+        \\    const filler_line_14: u64 = 14;
+        \\    const filler_line_15: u64 = 15;
+        \\    const filler_line_16: u64 = 16;
+        \\    const filler_line_17: u64 = 17;
+        \\    const filler_line_18: u64 = 18;
+        \\    const filler_line_19: u64 = 19;
+        \\    const filler_line_20: u64 = 20;
+        \\    _ = filler_line_01;
+        \\}
+    );
+    var name_buf: [32]u8 = undefined;
+    var content_buf: [512]u8 = undefined;
+    for (0..5) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "src/mention_{d}.zig", .{i});
+        const content = try std.fmt.bufPrint(&content_buf,
+            \\pub fn helper_{d}() void {{
+            \\    widgetFrobnicate();
+            \\    widgetFrobnicate();
+            \\    widgetFrobnicate();
+            \\}}
+        , .{i});
+        try explorer.indexFile(name, content);
+    }
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const args_full =
+        \\{"task":"investigate widgetFrobnicate"}
+    ;
+    const parsed_full = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_full, .{});
+    defer parsed_full.deinit();
+    var out_full: std.ArrayList(u8) = .empty;
+    defer out_full.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_context, &parsed_full.value.object, &out_full, &store, &explorer, &agents);
+
+    const args_budget =
+        \\{"task":"investigate widgetFrobnicate","max_tokens":256}
+    ;
+    const parsed_budget = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_budget, .{});
+    defer parsed_budget.deinit();
+    var out_budget: std.ArrayList(u8) = .empty;
+    defer out_budget.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_context, &parsed_budget.value.object, &out_budget, &store, &explorer, &agents);
+
+    // Unbudgeted output is unchanged (no markers) and bigger.
+    try testing.expect(std.mem.indexOf(u8, out_full.items, "[max_tokens") == null);
+    try testing.expect(out_full.items.len > out_budget.items.len);
+
+    // Budgeted output respects ~4 chars/token, with a small allowance for
+    // the omission markers themselves.
+    try testing.expect(out_budget.items.len <= 256 * 4 + 512);
+    try testing.expect(std.mem.indexOf(u8, out_budget.items, "[max_tokens") != null);
+
+    // Value order: the head and the file list survive; the fat snippet
+    // section is what gets dropped.
+    try testing.expect(std.mem.indexOf(u8, out_budget.items, "# Task") != null);
+    try testing.expect(std.mem.indexOf(u8, out_budget.items, "## Most-relevant files") != null);
+    try testing.expect(std.mem.indexOf(u8, out_budget.items, "## Top sites") == null);
+}
