@@ -3254,3 +3254,68 @@ test "issue-600: mmap_overlay writeToDisk persists overlay edits" {
         try testing.expectEqual(@as(usize, 0), g.len);
     }
 }
+
+test "issue-606: word index reuses doc_id slots freed by removeFile" {
+    var wi = WordIndex.init(testing.allocator);
+    defer wi.deinit();
+
+    try wi.indexFile("a.zig", "const alpha = 1;\n");
+    wi.removeFile("a.zig");
+    try wi.indexFile("b.zig", "const beta = 2;\n");
+
+    try testing.expectEqual(@as(usize, 1), wi.id_to_path.items.len);
+
+    const beta_hits = try wi.searchDeduped("beta", testing.allocator);
+    defer testing.allocator.free(beta_hits);
+    try testing.expectEqual(@as(usize, 1), beta_hits.len);
+    try testing.expectEqualStrings("b.zig", wi.hitPath(beta_hits[0]));
+
+    const alpha_hits = try wi.searchDeduped("alpha", testing.allocator);
+    defer testing.allocator.free(alpha_hits);
+    try testing.expectEqual(@as(usize, 0), alpha_hits.len);
+}
+
+test "issue-606: doc_id reuse survives a persist/reload round-trip" {
+    const alloc = testing.allocator;
+    var wi = WordIndex.init(alloc);
+    defer wi.deinit();
+
+    try wi.indexFile("a.zig", "const alpha = 1;\n");
+    try wi.indexFile("keep.zig", "const kappa = 3;\n");
+    wi.removeFile("a.zig");
+    // Reuses a.zig's freed slot; a stale posting resolving to the recycled id
+    // would attribute alpha hits to c.zig after reload.
+    try wi.indexFile("c.zig", "const gamma = 4;\n");
+
+    try testing.expectEqual(@as(usize, 2), wi.id_to_path.items.len);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+
+    try wi.writeToDisk(io, dir_path, null);
+
+    const maybe_loaded = WordIndex.readFromDisk(io, dir_path, alloc);
+    try testing.expect(maybe_loaded != null);
+    var loaded = maybe_loaded.?;
+    defer loaded.deinit();
+
+    try testing.expectEqual(@as(usize, 2), loaded.id_to_path.items.len);
+    try testing.expect(loaded.path_to_id.get("a.zig") == null);
+
+    const gamma_hits = try loaded.searchDeduped("gamma", alloc);
+    defer alloc.free(gamma_hits);
+    try testing.expectEqual(@as(usize, 1), gamma_hits.len);
+    try testing.expectEqualStrings("c.zig", loaded.hitPath(gamma_hits[0]));
+
+    const kappa_hits = try loaded.searchDeduped("kappa", alloc);
+    defer alloc.free(kappa_hits);
+    try testing.expectEqual(@as(usize, 1), kappa_hits.len);
+    try testing.expectEqualStrings("keep.zig", loaded.hitPath(kappa_hits[0]));
+
+    const alpha_hits = try loaded.searchDeduped("alpha", alloc);
+    defer alloc.free(alpha_hits);
+    try testing.expectEqual(@as(usize, 0), alpha_hits.len);
+}
