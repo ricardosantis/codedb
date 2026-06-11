@@ -21,6 +21,8 @@ pub const WordIndex = struct {
     enabled: bool = true,
     path_to_id: std.StringHashMap(u32),
     id_to_path: std.ArrayList([]const u8),
+    /// freed doc_id slots available for reuse by getOrCreateDocId
+    free_ids: std.ArrayList(u32) = .empty,
     /// doc_id → number of tokens indexed for that doc (BM25 length normalization).
     doc_lengths: std.AutoHashMap(u32, u32),
     /// Sum of all values in doc_lengths.
@@ -41,9 +43,20 @@ pub const WordIndex = struct {
 
     fn getOrCreateDocId(self: *WordIndex, path: []const u8) !u32 {
         if (self.path_to_id.get(path)) |id| return id;
+        if (self.free_ids.items.len > 0) {
+            const freed = self.free_ids.items[self.free_ids.items.len - 1];
+            // put first: a failed put must leave the free list and slot untouched
+            try self.path_to_id.put(path, freed);
+            _ = self.free_ids.pop();
+            self.id_to_path.items[@as(usize, freed)] = path;
+            return freed;
+        }
         const id: u32 = @intCast(self.id_to_path.items.len);
         try self.id_to_path.append(self.allocator, path);
-        try self.path_to_id.put(path, id);
+        self.path_to_id.put(path, id) catch |err| {
+            _ = self.id_to_path.pop();
+            return err;
+        };
         return id;
     }
 
@@ -71,6 +84,7 @@ pub const WordIndex = struct {
                 if (path.len > 0) self.allocator.free(path);
             }
             self.id_to_path.deinit(self.allocator);
+            self.free_ids.deinit(self.allocator);
             self.doc_lengths.deinit();
             self.allocator.free(self.word_dir);
             std.posix.munmap(m);
@@ -100,6 +114,7 @@ pub const WordIndex = struct {
 
         self.path_to_id.deinit();
         self.id_to_path.deinit(self.allocator);
+        self.free_ids.deinit(self.allocator);
         self.doc_lengths.deinit();
     }
 
@@ -136,6 +151,7 @@ pub const WordIndex = struct {
                 // otherwise the slot aliases stable_path, freed below.
                 if (self.skip_file_words and old_path.len > 0) self.allocator.free(old_path);
                 self.id_to_path.items[doc_id] = "";
+                self.free_ids.append(self.allocator, doc_id) catch {};
             }
             if (self.doc_lengths.fetchRemove(doc_id)) |kv| {
                 self.total_tokens -= kv.value;
@@ -184,6 +200,7 @@ pub const WordIndex = struct {
             const old_path = self.id_to_path.items[doc_id];
             if (self.skip_file_words and old_path.len > 0) self.allocator.free(old_path);
             self.id_to_path.items[doc_id] = "";
+            self.free_ids.append(self.allocator, doc_id) catch {};
         }
         var empty_words: std.ArrayList([]const u8) = .empty;
         defer empty_words.deinit(self.allocator);
