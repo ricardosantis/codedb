@@ -11,6 +11,7 @@ const explore = @import("explore.zig");
 const Explorer = explore.Explorer;
 const linter = @import("linter.zig");
 const linter_pref = @import("linter_pref.zig");
+const ContentCache = @import("hot_cache.zig").ContentCache;
 
 
 test "store: record and retrieve snapshots" {
@@ -1049,3 +1050,125 @@ test "issue-101+102: .codedbrc max_cached threads through to ContentCache capaci
     try testing.expectEqual(@as(u32, 32), explorer.contents.capacity);
 }
 
+
+test "issue-584: ContentCache probe-window — overflow inserts, holes, and duplicate keys" {
+    // putImpl's overflow path evicts via a global CLOCK hand, so the new entry
+    // lands OUTSIDE the key's 4-slot probe window: get() can never find it.
+    // The entry's bytes (file contents, up to 64MB each) sit stranded in the
+    // cache while every lookup for that key re-reads from disk. Holes left by
+    // remove() also break lookups for in-window entries (`key_hash == 0`
+    // early-break) and let put() insert a duplicate copy of a key it already
+    // holds. All three violate the probe-window invariant.
+    const fnvBase = struct {
+        fn base(key: []const u8, cap: u32) u32 {
+            var h: u64 = 14695981039346656037;
+            for (key) |b| {
+                h ^= b;
+                h *%= 1099511628211;
+            }
+            if (h == 0) h = 1;
+            return @as(u32, @truncate(h)) % cap;
+        }
+    }.base;
+
+    // Collect 5 keys sharing one probe-window base in [1, 60] (slot 0 stays
+    // outside the window, no wraparound).
+    var bufs: [5][16]u8 = undefined;
+    var lens: [5]usize = undefined;
+    var nkeys: usize = 0;
+    var counts = [_]u8{0} ** 64;
+    var pick: u32 = 0;
+    var i: usize = 0;
+    while (i < 4096) : (i += 1) {
+        var tmp: [16]u8 = undefined;
+        const k = std.fmt.bufPrint(&tmp, "k{d}", .{i}) catch unreachable;
+        const b = fnvBase(k, 64);
+        if (b < 1 or b > 60) continue;
+        counts[b] += 1;
+        if (counts[b] >= 5) {
+            pick = b;
+            break;
+        }
+    }
+    try testing.expect(pick != 0);
+    i = 0;
+    while (i < 4096 and nkeys < 5) : (i += 1) {
+        var tmp: [16]u8 = undefined;
+        const k = std.fmt.bufPrint(&tmp, "k{d}", .{i}) catch unreachable;
+        if (fnvBase(k, 64) == pick) {
+            @memcpy(bufs[nkeys][0..k.len], k);
+            lens[nkeys] = k.len;
+            nkeys += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 5), nkeys);
+    const k0 = bufs[0][0..lens[0]];
+    const k1 = bufs[1][0..lens[1]];
+    const k2 = bufs[2][0..lens[2]];
+    const k3 = bufs[3][0..lens[3]];
+    const k4 = bufs[4][0..lens[4]];
+
+    // 1) Overflow insert must stay retrievable from its own probe window.
+    {
+        var cache = try ContentCache.initAlloc(testing.allocator, 64);
+        defer cache.deinit();
+        try cache.put(k0, "v0");
+        try cache.put(k1, "v1");
+        try cache.put(k2, "v2");
+        try cache.put(k3, "v3");
+        try cache.put(k4, "v4"); // window full -> eviction path
+        try testing.expect(cache.get(k4) != null);
+    }
+
+    // 2) A hole left by remove() must not hide in-window entries behind it.
+    // 3) Re-putting such an entry must not create a duplicate copy.
+    {
+        var cache = try ContentCache.initAlloc(testing.allocator, 64);
+        defer cache.deinit();
+        try cache.put(k0, "v0");
+        try cache.put(k1, "v1");
+        try cache.put(k2, "v2");
+        cache.remove(k1); // hole between k0 and k2
+        try testing.expect(cache.get(k2) != null);
+        try cache.put(k2, "v2b");
+        try testing.expectEqual(@as(u32, 2), cache.len());
+    }
+}
+
+test "issue-597: data log compacts orphaned diff ranges and fixes offsets" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp_dir.dir.realPathFile(io, ".", &dir_buf);
+    const dir_path = dir_buf[0..dir_path_len];
+    const log_path = try std.fmt.allocPrint(testing.allocator, "{s}/data.log", .{dir_path});
+    defer testing.allocator.free(log_path);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    try store.openDataLog(io, log_path);
+    store.max_versions = 2;
+    store.compact_min = 1;
+
+    _ = try store.recordEdit("f.zig", 1, .replace, 0x1, 5, "AAAAA");
+    _ = try store.recordEdit("f.zig", 1, .replace, 0x2, 5, "BBBBB");
+    _ = try store.recordEdit("f.zig", 1, .replace, 0x3, 5, "CCCCC");
+    _ = try store.recordEdit("f.zig", 1, .replace, 0x4, 5, "DDDDD");
+    // max_versions=2 keeps C and D; A and B are orphaned (10 of 20 bytes),
+    // so the post-append check compacts: C -> 0, D -> 5, file truncated to 10.
+
+    const latest = store.getLatest("f.zig").?;
+    try testing.expectEqual(@as(?u64, 5), latest.data_offset);
+    const prev = store.getAtCursor("f.zig", 3).?;
+    try testing.expectEqual(@as(?u64, 0), prev.data_offset);
+
+    const log_file = try std.Io.Dir.cwd().openFile(io, log_path, .{});
+    defer log_file.close(io);
+    try testing.expectEqual(@as(u64, 10), try log_file.length(io));
+    var buf: [5]u8 = undefined;
+    _ = try log_file.readPositionalAll(io, &buf, 0);
+    try testing.expectEqualStrings("CCCCC", &buf);
+    _ = try log_file.readPositionalAll(io, &buf, 5);
+    try testing.expectEqualStrings("DDDDD", &buf);
+}
