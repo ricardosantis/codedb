@@ -1988,6 +1988,115 @@ test "issue-569: multi-word word query falls back to per-token matching" {
     try testing.expect(std.mem.indexOf(u8, out.items, "(tokenized)") != null);
 }
 
+test "fuzzy SIMD batch scorer matches scalar fuzzyScore exactly" {
+    // fuzzyFindFiles routes single-part queries through the SIMD-across-files
+    // scorer (fuzzyScoreBatch); it must produce results identical to the scalar
+    // fuzzyScore. All DP values are sums of exactly-representable small integers,
+    // so the comparison is bit-exact. FZL must equal explore.FZ_LANES.
+    const FZL = 8;
+    const paths = [_][]const u8{
+        "src/main.zig",
+        "extensions/codex/provider.ts",
+        "README.md",
+        "src/agents/getTokenProvider.test.ts",
+        "lib/auth/token.go",
+        "a",
+        "src/index.ts",
+        "very/deep/nested/path/to/some/TokenProvider.tsx",
+        "Provider.tsx",
+        "tokenprovider.js",
+        "ui/src/components/handle-request.tsx",
+        "x",
+        "config/settings.yaml",
+        "GETtokenPROVIDER",
+        "no_zzz_qqq.bin",
+        "pi/embedded/subscribe-session.ts",
+    };
+    const queries = [_][]const u8{
+        "getTokenProvider", "TokenProvider", "handleRequest", "token",
+        "provider.ts",      "x",             "main",          "session",
+        "PROVIDER",         "abcxyz",        "index",         "subscribe",
+    };
+
+    // Per-path: scalar fuzzyScore vs a single-element SIMD batch (mirrors the
+    // guards + presence prefilter fuzzyFindFiles applies before batching).
+    for (queries) |q| {
+        for (paths) |p| {
+            const expected = explore.fuzzyScore(q, p);
+            var got: ?f32 = null;
+            if (p.len != 0 and p.len <= 512 and q.len <= 128 and !explore.fuzzyPresenceReject(q, p)) {
+                var best: [FZL]f32 = undefined;
+                var matched: [FZL]u32 = undefined;
+                const one = [_][]const u8{p};
+                explore.fuzzyScoreBatch(q, &one, &best, &matched);
+                got = explore.fuzzyFinalize(q, p, best[0], matched[0]);
+            }
+            if (expected) |e| {
+                try testing.expect(got != null);
+                try testing.expectEqual(e, got.?);
+            } else {
+                try testing.expect(got == null);
+            }
+        }
+    }
+
+    // Full FZ_LANES-wide batch (all lanes active, mixed path lengths) exercises
+    // the per-lane length masking — every lane must still match scalar.
+    {
+        const q = "provider";
+        const batch = paths[0..FZL];
+        var best: [FZL]f32 = undefined;
+        var matched: [FZL]u32 = undefined;
+        explore.fuzzyScoreBatch(q, batch, &best, &matched);
+        for (batch, 0..) |p, l| {
+            const expected = explore.fuzzyScore(q, p);
+            const got: ?f32 = if (explore.fuzzyPresenceReject(q, p)) null else explore.fuzzyFinalize(q, p, best[l], matched[l]);
+            if (expected) |e| {
+                try testing.expect(got != null);
+                try testing.expectEqual(e, got.?);
+            } else {
+                try testing.expect(got == null);
+            }
+        }
+    }
+}
+
+test "find: symbol fast-path classifier + lookup" {
+    const mcp = @import("mcp.zig");
+    // Classifier: compound identifiers (camelCase / snake_case) route to symbols;
+    // filenames, single words, ALL-CAPS, and multi-part queries do not.
+    try testing.expect(mcp.looksLikeCompoundIdentifier("getTokenProvider"));
+    try testing.expect(mcp.looksLikeCompoundIdentifier("TokenProvider"));
+    try testing.expect(mcp.looksLikeCompoundIdentifier("handle_request"));
+    try testing.expect(mcp.looksLikeCompoundIdentifier("abortChatRunById"));
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("auth")); // single lowercase word
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("config"));
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("README")); // ALL-CAPS
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("provider.ts")); // dot -> filename
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("src/main")); // path separator
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("auth provider")); // space -> multi-part
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("abc")); // too short
+
+    // renderSymbolDefsFast resolves a real symbol to its definition (def kinds
+    // ranked above import usages), and returns false WITHOUT writing for a miss.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try explorer.indexFile("src/auth.zig", "pub fn getTokenProvider() void {}\n");
+    try explorer.indexFile("src/use.zig", "const getTokenProvider = @import(\"auth.zig\").getTokenProvider;\n");
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try testing.expect(explorer.renderSymbolDefsFast("getTokenProvider", alloc, &out, 10));
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/auth.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "(function)") != null);
+
+    var miss: std.ArrayList(u8) = .empty;
+    defer miss.deinit(alloc);
+    try testing.expect(!explorer.renderSymbolDefsFast("nonexistentSymbolXyz", alloc, &miss, 10));
+    try testing.expectEqual(@as(usize, 0), miss.items.len);
+}
 
 test "issue-598: mention-dense tooling files cannot saturate past the path prior" {
     // A bench script repeating the term six times per line scores 6.0×0.5=3.0

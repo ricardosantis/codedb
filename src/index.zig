@@ -2172,6 +2172,15 @@ pub const MmapTrigramIndex = struct {
         return null;
     }
 
+    fn lookupEntryAt(self: *const MmapTrigramIndex, idx: usize) TrigramIndex.LookupEntry {
+        const entry_off = 12 + idx * @sizeOf(TrigramIndex.LookupEntry);
+        return .{
+            .trigram = std.mem.readInt(u32, self.lookup_data[entry_off..][0..4], .little),
+            .offset = std.mem.readInt(u32, self.lookup_data[entry_off + 4 ..][0..4], .little),
+            .count = std.mem.readInt(u32, self.lookup_data[entry_off + 8 ..][0..4], .little),
+        };
+    }
+
     fn readPosting(self: *const MmapTrigramIndex, index: usize) ?struct { file_id: u32, next_mask: u8, loc_mask: u8 } {
         const posting_size: usize = if (self.post_version >= 3) @sizeOf(TrigramIndex.DiskPosting) else @sizeOf(TrigramIndex.OldDiskPosting);
         const pb_off = self.postings_start + index * posting_size;
@@ -2566,8 +2575,82 @@ pub const AnyTrigramIndex = union(enum) {
     pub fn writeToDisk(self: *AnyTrigramIndex, io: std.Io, dir_path: []const u8, git_head: ?[40]u8) !void {
         switch (self.*) {
             .heap => |*h| try h.writeToDisk(io, dir_path, git_head),
+            // A pure mmap view holds no in-memory changes — the disk files
+            // already are the index.
             .mmap => {},
-            .mmap_overlay => {},
+            .mmap_overlay => |*mo| {
+                var merged = try materializeOverlay(mo);
+                defer merged.deinit();
+                try merged.writeToDisk(io, dir_path, git_head);
+            },
+        }
+    }
+
+    /// Rebuild the merged logical state (base minus masked paths, plus
+    /// overlay) as a heap TrigramIndex so the heap serializer can persist
+    /// it. That serializer is tmp+rename atomic, so writing over the very
+    /// directory the live base is mmapped from is safe — the mapping keeps
+    /// the old inode alive.
+    fn materializeOverlay(mo: *const MmapOverlay) !TrigramIndex {
+        const alloc = mo.overlay.allocator;
+        var merged = TrigramIndex.init(alloc);
+        merged.owns_paths = true;
+        errdefer merged.deinit();
+
+        for (mo.base.file_table) |path| {
+            if (mo.masked.contains(path)) continue;
+            try mergedAddFile(&merged, path);
+        }
+        var overlay_files = mo.overlay.file_trigrams.keyIterator();
+        while (overlay_files.next()) |path_ptr| {
+            try mergedAddFile(&merged, path_ptr.*);
+        }
+
+        for (0..mo.base.lookup_entries) |e| {
+            const entry = mo.base.lookupEntryAt(e);
+            const tri: Trigram = @intCast(entry.trigram);
+            for (0..entry.count) |pi| {
+                const p = mo.base.readPosting(entry.offset + pi) orelse continue;
+                if (p.file_id >= mo.base.file_table.len) continue;
+                const path = mo.base.file_table[p.file_id];
+                if (mo.masked.contains(path)) continue;
+                try mergedInsert(&merged, tri, path, p.next_mask, p.loc_mask);
+            }
+        }
+
+        var overlay_tris = mo.overlay.index.iterator();
+        while (overlay_tris.next()) |te| {
+            for (te.value_ptr.items.items) |p| {
+                if (p.doc_id >= mo.overlay.id_to_path.items.len) continue;
+                const path = mo.overlay.id_to_path.items[p.doc_id];
+                if (path.len == 0) continue;
+                try mergedInsert(&merged, te.key_ptr.*, path, p.next_mask, p.loc_mask);
+            }
+        }
+        return merged;
+    }
+
+    fn mergedAddFile(merged: *TrigramIndex, path: []const u8) !void {
+        const doc_id = try merged.getOrCreateDocId(path);
+        const stable = merged.id_to_path.items[doc_id];
+        if (!merged.file_trigrams.contains(stable)) {
+            try merged.file_trigrams.put(stable, .empty);
+        }
+    }
+
+    fn mergedInsert(merged: *TrigramIndex, tri: Trigram, path: []const u8, next_mask: u8, loc_mask: u8) !void {
+        const doc_id = merged.path_to_id.get(path) orelse return;
+        const gop = try merged.index.getOrPut(tri);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .path_to_id = &merged.path_to_id };
+        }
+        const posting = try gop.value_ptr.getOrAddPosting(merged.allocator, doc_id);
+        posting.next_mask |= next_mask;
+        posting.loc_mask |= loc_mask;
+        const stable = merged.id_to_path.items[doc_id];
+        const tri_list = merged.file_trigrams.getPtr(stable) orelse return;
+        if (tri_list.items.len == 0 or tri_list.items[tri_list.items.len - 1] != tri) {
+            try tri_list.append(merged.allocator, tri);
         }
     }
 

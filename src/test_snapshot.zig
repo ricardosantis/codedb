@@ -1314,3 +1314,35 @@ test "audit: long import specifier round-trips on fast-restore (borrow path pres
     // borrows_strings is the only discriminator: false on main (re-parse fallback), true after fix
     try testing.expect(outline.borrows_strings);
 }
+
+test "p0: writeSnapshot tolerates over-long symbol names (u16 length overflow)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    // An identifier longer than u16 max (65535) — minified/generated files produce
+    // these, and the old code paniced casting the length to u16 in writeSnapshot.
+    const long = try aa.alloc(u8, 70000);
+    @memset(long, 'a');
+    const content = try std.fmt.allocPrint(aa, "pub const {s} = 1;\n", .{long});
+    try exp.indexFile("src/min.zig", content);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = pb[0..try tmp.dir.realPathFile(io, ".", &pb)];
+    const snap = try std.fmt.allocPrint(testing.allocator, "{s}/min.codedb", .{dir});
+    defer testing.allocator.free(snap);
+
+    // Pre-fix: this paniced ("integer does not fit in destination type").
+    try snapshot_mod.writeSnapshot(io, &exp, dir, snap, testing.allocator);
+
+    // And the truncated record must round-trip back without crashing.
+    var exp2 = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer exp2.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    try testing.expect(snapshot_mod.loadSnapshot(io, snap, &exp2, &store, testing.allocator));
+    try testing.expectEqual(@as(usize, 1), exp2.outlines.count());
+}
