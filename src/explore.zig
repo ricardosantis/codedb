@@ -2466,6 +2466,16 @@ pub const Explorer = struct {
             self.mu.unlockShared();
             if (needs_rebuild) try self.rebuildWordIndex();
         }
+        // #550: the graph-distance gate in rerankAndFinalize reads
+        // symbol_index, which a snapshot fast-load defers (#564). Identifier-
+        // shaped queries ensure it here, pre-shared-lock — ensureSymbolIndex
+        // takes the exclusive lock itself.
+        if (max_results > 0 and queryNamesIdentifier(query) and
+            cio.posixGetenv("CODEDB_NO_CENTRALITY") == null and
+            cio.posixGetenv("CODEDB_NO_GRAPH_DISTANCE") == null)
+        {
+            self.ensureSymbolIndex();
+        }
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
@@ -2484,10 +2494,12 @@ pub const Explorer = struct {
 
         // Tier 0: word index direct lookup — O(1) hash lookup plus bounded
         // content extraction. A per-file cap forces diversity so a single hot
-        // file cannot saturate the quota. Code files are considered before
-        // docs, and files with more exact word hits are considered first so
-        // popular identifiers and skip-trigram canonical files are not hidden
-        // behind earlier low-signal posting-list entries.
+        // file cannot saturate the quota. Files that DEFINE a symbol named by
+        // the query are considered first (#546: mention-dense test files used
+        // to eat the whole file budget, so the defining file never even became
+        // a candidate for the reranker), then code before docs, then files
+        // with more exact word hits so popular identifiers and skip-trigram
+        // canonical files are not hidden behind low-signal posting entries.
         const t0_start = cio.nanoTimestamp();
         const word_hits = self.word_index.search(query);
         if (word_hits.len > 0) {
@@ -2496,6 +2508,7 @@ pub const Explorer = struct {
                 count: u32,
                 first_seen: usize,
                 is_doc: bool,
+                defines: bool,
             };
 
             var tier0_files_by_path = std.StringHashMap(Tier0File).init(allocator);
@@ -2506,11 +2519,24 @@ pub const Explorer = struct {
                 if (hit_path.len == 0) continue;
                 const gop = tier0_files_by_path.getOrPut(hit_path) catch continue;
                 if (!gop.found_existing) {
+                    const is_doc = isDocLanguage(detectLanguage(hit_path));
+                    var defines = false;
+                    if (!is_doc) {
+                        if (self.outlines.get(hit_path)) |outline| {
+                            for (outline.symbols.items) |sym| {
+                                if (asciiEqlIgnoreCase(sym.name, query)) {
+                                    defines = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     gop.value_ptr.* = .{
                         .path = hit_path,
                         .count = 0,
                         .first_seen = ordinal,
-                        .is_doc = isDocLanguage(detectLanguage(hit_path)),
+                        .is_doc = is_doc,
+                        .defines = defines,
                     };
                 }
                 gop.value_ptr.count +|= 1;
@@ -2528,6 +2554,7 @@ pub const Explorer = struct {
                 std.sort.block(Tier0File, tier0_files.items, {}, struct {
                     pub fn lessThan(_: void, a: Tier0File, b: Tier0File) bool {
                         if (a.is_doc != b.is_doc) return !a.is_doc;
+                        if (a.defines != b.defines) return a.defines;
                         if (a.count != b.count) return a.count > b.count;
                         if (a.first_seen != b.first_seen) return a.first_seen < b.first_seen;
                         return std.mem.lessThan(u8, a.path, b.path);
@@ -2940,7 +2967,7 @@ pub const Explorer = struct {
     /// final return) gets the same ranking — pre-fix only the fall-through
     /// path applied multi-signal scoring.
     fn rerankAndFinalize(
-        self: *const Explorer,
+        self: *Explorer,
         result_list: *std.ArrayList(SearchResult),
         query: []const u8,
         allocator: std.mem.Allocator,
@@ -2962,8 +2989,27 @@ pub const Explorer = struct {
             }
         }
 
+        // #550: a single-token query that exactly names a known symbol gets the
+        // call-graph distance boost here too (the multi-word BM25 path applies
+        // it in searchContentRanked). The symbol_index gate keeps plain word
+        // queries from ever paying for a graph build.
+        var gd_arena = std.heap.ArenaAllocator.init(allocator);
+        defer gd_arena.deinit();
+        var graph_dist: ?std.StringHashMap(u8) = null;
+        if (cio.posixGetenv("CODEDB_NO_CENTRALITY") == null and
+            cio.posixGetenv("CODEDB_NO_GRAPH_DISTANCE") == null and
+            (self.call_graph != null or self.symbol_index.contains(query)))
+        {
+            self.ensureCallGraph(allocator);
+            const ga = gd_arena.allocator();
+            var gd_terms = std.StringHashMap(void).init(ga);
+            gd_terms.put(query, {}) catch {};
+            graph_dist = self.queryGraphDistances(&gd_terms, ga);
+        }
+
         for (result_list.items) |*r| {
             r.score = self.rerankSignalScore(r.*, query);
+            r.score *= graphDistanceBoost(graph_dist, r.path);
             if (lfp.enabled) r.score *= lfp.multiplier(file_hit_counts.get(r.path) orelse 1, max_file_hits);
             if (sp.enabled) r.score *= sp.multiplier(self, r.path);
         }
@@ -3177,6 +3223,89 @@ pub const Explorer = struct {
         const c = cm.get(path) orelse return 1.0;
         const alpha: f32 = 0.15;
         return 1.0 + alpha * @log(1.0 + c);
+    }
+
+    /// Query-specific call-graph distance (#550): BFS outward — callers and
+    /// callees — from every function whose name equals a query term, recording
+    /// each reached file's minimum hop distance. Arena-allocated; null when no
+    /// graph is built or no term names a symbol, so ranking is unchanged.
+    fn queryGraphDistances(self: *Explorer, terms: *const std.StringHashMap(void), ta: std.mem.Allocator) ?std.StringHashMap(u8) {
+        const cg = self.call_graph orelse return null;
+        const n = cg.node_name.len;
+        if (n == 0) return null;
+        const max_hops: u8 = 3;
+        const unseen: u8 = std.math.maxInt(u8);
+
+        const dist = ta.alloc(u8, n) catch return null;
+        @memset(dist, unseen);
+
+        var queue: std.ArrayList(codegraph.NodeId) = .empty;
+        for (cg.node_name, 0..) |name, nid| {
+            if (name.len < 3) continue;
+            var it = terms.keyIterator();
+            while (it.next()) |t| {
+                if (asciiEqlIgnoreCase(name, t.*)) {
+                    dist[nid] = 0;
+                    queue.append(ta, @intCast(nid)) catch return null;
+                    break;
+                }
+            }
+        }
+        if (queue.items.len == 0) return null;
+
+        // adj is forward-only (callees); a reverse copy makes the walk
+        // undirected so callers of a matched symbol count as near too.
+        const radj = ta.alloc(std.ArrayList(codegraph.NodeId), n) catch return null;
+        for (radj) |*l| l.* = .empty;
+        for (cg.edges) |e| {
+            if (e.from < n and e.to < n) radj[e.to].append(ta, e.from) catch return null;
+        }
+
+        var head: usize = 0;
+        while (head < queue.items.len) : (head += 1) {
+            const nid = queue.items[head];
+            const d = dist[nid];
+            if (d >= max_hops) continue;
+            for (cg.adj[nid].items) |nb| {
+                if (dist[nb] != unseen) continue;
+                dist[nb] = d + 1;
+                queue.append(ta, nb) catch return null;
+            }
+            for (radj[nid].items) |nb| {
+                if (dist[nb] != unseen) continue;
+                dist[nb] = d + 1;
+                queue.append(ta, nb) catch return null;
+            }
+        }
+
+        var file_dist = std.StringHashMap(u8).init(ta);
+        for (queue.items) |nid| {
+            const gop = file_dist.getOrPut(cg.node_path[nid]) catch return null;
+            if (!gop.found_existing or gop.value_ptr.* > dist[nid]) gop.value_ptr.* = dist[nid];
+        }
+        return file_dist;
+    }
+
+    /// Boost for files within a few call hops of a symbol the query names,
+    /// halving per hop: 0 hops ×1.5, 1 ×1.25, 2 ×1.125, 3 ×1.0625. Like
+    /// centralityBoost it is always ≥ 1 — never a filter — and 1.0 whenever
+    /// the distance signal is off, so ranking degrades to the status quo.
+    fn graphDistanceBoost(file_dist: ?std.StringHashMap(u8), path: []const u8) f32 {
+        const m = file_dist orelse return 1.0;
+        const d = m.get(path) orelse return 1.0;
+        const gamma: f32 = 0.5;
+        return 1.0 + gamma / @as(f32, @floatFromInt(@as(u32, 1) << @intCast(d)));
+    }
+
+    /// True when a query token looks like a code identifier (camelCase or
+    /// snake_case) — the same shape heuristic the ranked tokenizer uses to
+    /// split identifiers. Gates symbol-index and call-graph work so plain
+    /// natural-language words never pay for either.
+    fn queryNamesIdentifier(query: []const u8) bool {
+        for (query) |c| {
+            if (c == '_' or (c >= 'A' and c <= 'Z')) return true;
+        }
+        return false;
     }
 
     /// Public, lock-acquiring entry point for single-threaded callers (the
@@ -3393,6 +3522,15 @@ pub const Explorer = struct {
             self.mu.unlockShared();
             if (needs_rebuild) try self.rebuildWordIndex();
         }
+        // #550: the graph-distance gate below reads symbol_index, which a
+        // snapshot fast-load defers (#564). Identifier-shaped queries ensure it
+        // here, pre-shared-lock — ensureSymbolIndex takes the exclusive lock.
+        if (max_results > 0 and queryNamesIdentifier(query) and
+            cio.posixGetenv("CODEDB_NO_CENTRALITY") == null and
+            cio.posixGetenv("CODEDB_NO_GRAPH_DISTANCE") == null)
+        {
+            self.ensureSymbolIndex();
+        }
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
@@ -3439,6 +3577,29 @@ pub const Explorer = struct {
             }
         }
         if (terms_set.count() == 0) return try allocator.alloc(SearchResult, 0);
+
+        // #550: query-specific call-graph distance — boost files within a few
+        // call hops of the symbols the query names. Build the graph only when a
+        // raw query token exactly names a known symbol, so NL-only queries on a
+        // cold CLI never pay for it; once built (warm daemon, callpath, or a
+        // prior symbol-shaped query) the distances are computed from any seed.
+        // CODEDB_NO_CENTRALITY disables both graph signals (ensureCallGraph
+        // would repopulate call_centrality); CODEDB_NO_GRAPH_DISTANCE just this one.
+        var graph_dist: ?std.StringHashMap(u8) = null;
+        if (cio.posixGetenv("CODEDB_NO_CENTRALITY") == null and
+            cio.posixGetenv("CODEDB_NO_GRAPH_DISTANCE") == null)
+        {
+            if (self.call_graph == null) {
+                var gate_tok = idx.WordTokenizer{ .buf = query };
+                while (gate_tok.next()) |w| {
+                    if (self.symbol_index.contains(w)) {
+                        self.ensureCallGraph(allocator);
+                        break;
+                    }
+                }
+            }
+            graph_dist = self.queryGraphDistances(&terms_set, ta);
+        }
 
         // BM25 constants.
         const k1: f32 = 1.2;
@@ -3543,7 +3704,10 @@ pub const Explorer = struct {
             const cand_path = if (cand_doc_id < self.word_index.id_to_path.items.len) self.word_index.id_to_path.items[cand_doc_id] else "";
             cands.appendAssumeCapacity(.{
                 .doc_id = cand_doc_id,
-                .score = entry.value_ptr.score * pathRelevanceMultiplier(cand_path, &terms_set) * self.centralityBoost(cand_path),
+                .score = entry.value_ptr.score *
+                    pathRelevanceMultiplier(cand_path, &terms_set) *
+                    self.centralityBoost(cand_path) *
+                    graphDistanceBoost(graph_dist, cand_path),
                 .best_line = entry.value_ptr.best_line,
             });
         }

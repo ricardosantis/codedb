@@ -1090,7 +1090,6 @@ test "issue-429-c: searchContent rerank boosts lines that are symbol definitions
     try testing.expectEqualStrings("zzz_def.zig", results[0].path);
 }
 
-
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
@@ -1145,7 +1144,6 @@ test "lex-freq-penalty: CODEDB_LEX_FREQ_PENALTY demotes files the query saturate
         try testing.expectEqualStrings("src/handler.zig", results[0].path);
     }
 }
-
 
 test "issue-430: Tier 0 markdown dominance starves canonical source file" {
     // Tier 0 of searchContent (explore.zig:1525-1554) iterates the word
@@ -2197,4 +2195,53 @@ test "issue-598: mention-dense tooling files cannot saturate past the path prior
     }
     try testing.expect(results2.len >= 2);
     try testing.expectEqualStrings("install/install.sh", results2[0].path);
+}
+
+test "issue-550: call-graph distance ranks structurally-near files above equal-lexical noise" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    // target defines frobnicate (0 hops); helper only CALLS it (1 hop, reached
+    // through the reverse edge — pins the undirected walk); noise mentions it
+    // just as often with no call-graph relation.
+    try explorer.indexFile("src/target.zig",
+        \\pub fn frobnicate() void {
+        \\    frobnicate();
+        \\}
+    );
+    try explorer.indexFile("src/helper.zig",
+        \\pub fn run() void {
+        \\    frobnicate();
+        \\    frobnicate();
+        \\}
+    );
+    try explorer.indexFile("src/noise.zig",
+        \\pub fn unrelated() void {
+        \\    // frobnicate mention
+        \\    // frobnicate mention
+        \\}
+    );
+
+    const results = try explorer.searchContentRanked("frobnicate", testing.allocator, 8);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.line_text);
+            testing.allocator.free(r.path);
+        }
+        testing.allocator.free(results);
+    }
+
+    try testing.expect(results.len >= 3);
+    try testing.expectEqualStrings("src/target.zig", results[0].path);
+
+    var helper_score: f32 = -1.0;
+    var noise_score: f32 = -1.0;
+    for (results) |r| {
+        if (helper_score < 0 and std.mem.eql(u8, r.path, "src/helper.zig")) helper_score = r.score;
+        if (noise_score < 0 and std.mem.eql(u8, r.path, "src/noise.zig")) noise_score = r.score;
+    }
+    try testing.expect(helper_score > 0);
+    try testing.expect(noise_score > 0);
+    try testing.expect(helper_score > noise_score);
 }
