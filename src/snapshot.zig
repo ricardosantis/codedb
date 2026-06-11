@@ -1298,9 +1298,9 @@ fn parseJsonU64(json: []const u8, key: []const u8) ?u64 {
 }
 
 /// Returns true for secret/credential paths that must never be persisted to a
-/// snapshot or live-indexed. Kept in lockstep with `watcher.isSensitivePath`;
-/// the two are parity-tested in test_snapshot.zig ("issue-528: isSensitivePath
-/// parity") so any future drift in this security filter fails CI.
+/// snapshot or live-indexed. Single implementation of this security filter;
+/// `watcher.isSensitivePath` delegates here (parity-tested in test_snapshot.zig
+/// "issue-528: isSensitivePath parity").
 pub fn isSensitivePath(path: []const u8) bool {
     const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| path[sep + 1 ..] else path;
     // Fast path: most source files have extensions like .zig, .ts, .py — none start with '.'
