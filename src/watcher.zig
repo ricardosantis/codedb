@@ -178,9 +178,7 @@ fn shouldSkip(path: []const u8) bool {
 }
 
 fn shouldSkipDir(name: []const u8) bool {
-    for (skip_dirs) |skip| {
-        if (std.mem.eql(u8, name, skip)) return true;
-    }
+    for (skip_dirs) |skip| if (std.mem.eql(u8, name, skip)) return true;
     return false;
 }
 
@@ -410,6 +408,17 @@ const FilteredWalker = struct {
     }
 };
 
+/// Files beyond this count are indexed without trigrams and land in
+/// skip_trigram_files, which tier 3 of searchContent linearly content-scans
+/// on every query that falls through the earlier tiers — on a corpus well
+/// past the cap that scan dominates zero-hit query latency. The cap bounds
+/// trigram-index RSS; CODEDB_TRIGRAM_CAP overrides it for corpora where the
+/// memory trade is worth it.
+pub fn trigramFileCap() usize {
+    const raw = cio.posixGetenv("CODEDB_TRIGRAM_CAP") orelse return 15_000;
+    return std.fmt.parseInt(usize, raw, 10) catch 15_000;
+}
+
 fn collectInitialScanEntries(io: std.Io, store: *Store, dir: std.Io.Dir, allocator: std.mem.Allocator, skip_trigram: bool) !std.ArrayList(InitialScanEntry) {
     var walker = try FilteredWalker.init(io, dir, allocator);
     defer walker.deinit();
@@ -420,7 +429,7 @@ fn collectInitialScanEntries(io: std.Io, store: *Store, dir: std.Io.Dir, allocat
         entries.deinit(allocator);
     }
 
-    const max_trigram_files: usize = 15_000;
+    const max_trigram_files = trigramFileCap();
     var file_count: usize = 0;
     while (try walker.next()) |entry| {
         const stat = dir.statFile(io, entry.path, .{}) catch continue;
@@ -1024,7 +1033,7 @@ pub fn incrementalLoop(io: std.Io, store: *Store, explorer: *Explorer, queue: *E
             defer dir.close(io);
             var walker = FilteredWalker.init(io, dir, tmp) catch continue;
             defer walker.deinit();
-            const max_trigram_files: usize = 15_000;
+            const max_trigram_files = trigramFileCap();
             var file_count: usize = 0;
             while (walker.next() catch null) |entry| {
                 const stat = dir.statFile(io, entry.path, .{}) catch continue;
@@ -1173,48 +1182,10 @@ fn shouldSkipFile(path: []const u8) bool {
 }
 
 /// Check if a path refers to a sensitive file (secrets, keys, credentials).
-/// Replicates the filter from snapshot.zig so live indexing and snapshots
-/// apply the same exclusion rules. Optimized: basename check + early exit.
+/// Delegates to snapshot.zig so live indexing and snapshots apply the same
+/// exclusion rules from a single implementation.
 pub fn isSensitivePath(path: []const u8) bool {
-    const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| path[sep + 1 ..] else path;
-    // Fast path: most source files have extensions like .zig, .ts, .py — none start with '.'
-    // or match sensitive patterns. Skip the full check for common cases.
-    if (basename.len == 0) return false;
-    const first = basename[0];
-    // Only check sensitive names if basename starts with '.', 'c', 's', 'i' or has key/cert extension
-    if (first != '.' and first != 'c' and first != 's' and first != 'i') {
-        // Still need to check extensions and directory patterns
-        if (std.mem.endsWith(u8, basename, ".pem") or
-            std.mem.endsWith(u8, basename, ".key") or
-            std.mem.endsWith(u8, basename, ".p12") or
-            std.mem.endsWith(u8, basename, ".pfx") or
-            std.mem.endsWith(u8, basename, ".jks")) return true;
-        if (std.mem.indexOf(u8, path, ".ssh/") != null or
-            std.mem.indexOf(u8, path, ".gnupg/") != null or
-            std.mem.indexOf(u8, path, ".aws/") != null) return true;
-        return false;
-    }
-    // .env, .env.<token>; do NOT match .envoy, .envrc, .environment, etc.
-    if (basename.len >= 4 and std.mem.eql(u8, basename[0..4], ".env") and
-        (basename.len == 4 or basename[4] == '.' or basename[4] == '-' or basename[4] == '_')) return true;
-    // Exact matches
-    const sensitive_names = [_][]const u8{
-        ".dev.vars",        ".npmrc",               ".pypirc",      ".netrc",
-        "credentials.json", "service-account.json", "secrets.json", "secrets.yaml",
-        "secrets.yml",      "id_rsa",               "id_ed25519",
-    };
-    for (sensitive_names) |name| {
-        if (std.mem.eql(u8, basename, name)) return true;
-    }
-    if (std.mem.endsWith(u8, basename, ".pem") or
-        std.mem.endsWith(u8, basename, ".key") or
-        std.mem.endsWith(u8, basename, ".p12") or
-        std.mem.endsWith(u8, basename, ".pfx") or
-        std.mem.endsWith(u8, basename, ".jks")) return true;
-    if (std.mem.indexOf(u8, path, ".ssh/") != null or
-        std.mem.indexOf(u8, path, ".gnupg/") != null or
-        std.mem.indexOf(u8, path, ".aws/") != null) return true;
-    return false;
+    return @import("snapshot.zig").isSensitivePath(path);
 }
 
 fn indexFileContent(io: std.Io, explorer: *Explorer, dir: std.Io.Dir, path: []const u8, allocator: std.mem.Allocator, skip_trigram: bool) !void {

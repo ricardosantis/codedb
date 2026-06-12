@@ -19,6 +19,7 @@ const snapshot_mod = @import("snapshot.zig");
 const telemetry = @import("telemetry.zig");
 const root_policy = @import("root_policy.zig");
 const nuke_mod = @import("nuke.zig");
+const warmup_mod = @import("warmup.zig");
 const update_mod = @import("update.zig");
 const release_info = @import("release_info.zig");
 const Config = @import("config.zig").Config;
@@ -163,6 +164,12 @@ fn mainInner() void {
 fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store: *Store, root: []const u8, cmd: []const u8, args: []const []const u8, cmd_args_start: usize, out: *Out, s: sty.Style) u8 {
     const use_color = s.reset.len != 0;
     if (std.mem.eql(u8, cmd, "tree")) {
+        if (hasExtraCliArgs(args, cmd_args_start)) {
+            out.p("{s}\xe2\x9c\x97{s} unexpected extra argument: {s}{s}{s}  (usage: codedb [root] {s}tree{s})\n", .{
+                s.red, s.reset, s.bold, args[cmd_args_start], s.reset, s.cyan, s.reset,
+            });
+            return 1;
+        }
         const t0 = cio.nanoTimestamp();
         const tree = explorer.getTree(allocator, use_color) catch return 1;
         defer allocator.free(tree);
@@ -284,7 +291,7 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
                 return 1;
             }
         else
-            explorer.searchContent(query, allocator, sa.max_results) catch return 1;
+            explorer.searchContentAuto(query, allocator, sa.max_results) catch return 1;
         defer {
             for (results) |r| {
                 allocator.free(r.path);
@@ -316,7 +323,7 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
             for (results) |r| {
                 if (paths_only) {
                     out.p("  {s}{s}{s}:{s}{d}{s}\n", .{
-                        s.cyan, r.path, s.reset,
+                        s.cyan, r.path,     s.reset,
                         s.dim,  r.line_num, s.reset,
                     });
                 } else {
@@ -476,11 +483,11 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
             const unbounded = end == std.math.maxInt(u32);
             if (unbounded) {
                 out.p("{s}\xe2\x9c\x93{s} {s}{s}{s}  {s}{s}{s}  L{d}-EOF  {s}{s}{s}\n", .{
-                    s.green,                       s.reset,
-                    s.bold,                        path,
-                    s.reset,                       s.langColor(@tagName(lang)),
-                    @tagName(lang),                s.reset,
-                    start,                         sty.durationColor(s, elapsed),
+                    s.green,                               s.reset,
+                    s.bold,                                path,
+                    s.reset,                               s.langColor(@tagName(lang)),
+                    @tagName(lang),                        s.reset,
+                    start,                                 sty.durationColor(s, elapsed),
                     sty.formatDuration(&dur_buf, elapsed), s.reset,
                 });
             } else {
@@ -512,6 +519,12 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
             }
         }
     } else if (std.mem.eql(u8, cmd, "hot")) {
+        if (hasExtraCliArgs(args, cmd_args_start)) {
+            out.p("{s}\xe2\x9c\x97{s} unexpected extra argument: {s}{s}{s}  (usage: codedb [root] {s}hot{s})\n", .{
+                s.red, s.reset, s.bold, args[cmd_args_start], s.reset, s.cyan, s.reset,
+            });
+            return 1;
+        }
         const t0 = cio.nanoTimestamp();
         const hot = explorer.getHotFiles(store, allocator, 10) catch return 1;
         defer {
@@ -535,6 +548,12 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
     } else if (std.mem.eql(u8, cmd, "status")) {
         // #528 item 1: read-only CLI status mirroring codedb_status, so
         // `codedb status` works without going through the MCP surface.
+        if (hasExtraCliArgs(args, cmd_args_start)) {
+            out.p("{s}\xe2\x9c\x97{s} unexpected extra argument: {s}{s}{s}  (usage: codedb [root] {s}status{s})\n", .{
+                s.red, s.reset, s.bold, args[cmd_args_start], s.reset, s.cyan, s.reset,
+            });
+            return 1;
+        }
         const t0 = cio.nanoTimestamp();
         store.mu.lock();
         const file_count = store.files.count();
@@ -569,7 +588,7 @@ fn runQuery(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, store
         // reach the same warm tools the MCP surface exposes.
         var nav: std.ArrayList(u8) = .empty;
         defer nav.deinit(allocator);
-        if (mcp_server.runCliTool(io, allocator, explorer, root, cmd, args, cmd_args_start, &nav)) |code| {
+        if (mcp_server.runCliTool(io, allocator, explorer, store, root, cmd, args, cmd_args_start, &nav)) |code| {
             out.p("{s}", .{nav.items});
             return code;
         }
@@ -655,12 +674,17 @@ fn cliWriteFull(fd: c_int, data: []const u8) bool {
     return true;
 }
 
+/// The read-only query commands — single source of truth (#578 grew from
+/// three hand-maintained copies drifting: cliIsQueryCmd, isCommand, and the
+/// runQuery dispatch chain in mainImpl). isCommand appends the non-query
+/// commands; the dispatch chain calls cliIsQueryCmd directly.
+const cli_query_cmds = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "status", "symbol", "callers", "callpath", "deps", "glob", "ls", "file", "context", "changes" };
+
 /// True for the read-only query commands the daemon will serve / the client
 /// will proxy. Everything else (serve, mcp, snapshot, index, ...) is handled
 /// only by the cold path.
 fn cliIsQueryCmd(cmd: []const u8) bool {
-    const cmds = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "symbol", "callers", "deps", "glob", "ls", "file", "context" };
-    for (cmds) |c| {
+    for (cli_query_cmds) |c| {
         if (std.mem.eql(u8, cmd, c)) return true;
     }
     return false;
@@ -674,6 +698,32 @@ fn cliIsQueryCmd(cmd: []const u8) bool {
 /// keeps working and clients simply fall back to the cold path.
 /// Daemon side. Bind a per-project Unix socket and serve framed query requests
 /// against the warm `explorer`/`store`. Runs on its own detached thread so it
+/// #592: per-project cli-daemon spawn lock. Open-or-create
+/// `<data_dir>/cli-daemon.lock` and take an exclusive non-blocking flock.
+/// Returns the fd on success — callers keep it open for the process lifetime
+/// (the kernel releases flocks on exit, so crashes never leave a stale lock).
+/// Returns null when another process holds the lock or the file can't be
+/// opened.
+pub fn daemonLockTryAcquire(data_dir: []const u8) ?c_int {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const p = std.fmt.bufPrintZ(&buf, "{s}/cli-daemon.lock", .{data_dir}) catch return null;
+    const fd = std.c.open(p.ptr, .{ .ACCMODE = .RDWR, .CREAT = true }, @as(c_uint, 0o600));
+    if (fd < 0) return null;
+    if (std.c.flock(fd, std.c.LOCK.EX | std.c.LOCK.NB) != 0) {
+        _ = std.c.close(fd);
+        return null;
+    }
+    return fd;
+}
+
+/// Probe whether the spawn lock is free without keeping it: used by the CLI
+/// auto-spawn path so racing cold calls don't fork duplicate daemons.
+pub fn daemonLockAvailable(data_dir: []const u8) bool {
+    const fd = daemonLockTryAcquire(data_dir) orelse return false;
+    _ = std.c.flock(fd, std.c.LOCK.UN);
+    _ = std.c.close(fd);
+    return true;
+}
 /// never blocks the daemon's primary loop. Connections are handled sequentially
 /// (CLI calls are infrequent and runQuery already tolerates concurrent reads
 /// from the watcher).
@@ -925,6 +975,13 @@ fn mainImpl() !void {
                 // honors CODEDB_NO_TELEMETRY.
                 no_telemetry = true;
                 continue;
+            } else if (std.mem.eql(u8, a, "--allow-temp")) {
+                // #538: opt-in to indexing temp roots (/tmp, /private/tmp). Sets
+                // CODEDB_ALLOW_TEMP so root_policy.tempIndexingAllowed (and any
+                // daemon this CLI spawns) honors it; the env var alone works too —
+                // the flag just flips it. Lets SWE-bench/CI harnesses index /tmp.
+                cio.posixSetenv("CODEDB_ALLOW_TEMP", "1");
+                continue;
             }
             try filtered.append(allocator, a);
         }
@@ -994,12 +1051,13 @@ fn mainImpl() !void {
             }
             if (!isValidMcpFlag(a)) {
                 out.p("{s}\xe2\x9c\x97{s} unknown flag for {s}mcp{s}: {s}{s}{s}\n  valid: {s}--no-telemetry{s}, {s}--help{s}, {s}--config-file=<path>{s}\n", .{
-                    s.red,  s.reset,
-                    s.bold, s.reset,
-                    s.bold, a,      s.reset,
-                    s.bold, s.reset,
-                    s.bold, s.reset,
-                    s.bold, s.reset,
+                    s.red,   s.reset,
+                    s.bold,  s.reset,
+                    s.bold,  a,
+                    s.reset, s.bold,
+                    s.reset, s.bold,
+                    s.reset, s.bold,
+                    s.reset,
                 });
                 out.exitWithFlush(1);
             }
@@ -1056,12 +1114,55 @@ fn mainImpl() !void {
         out.exitWithFlush(1);
     }
 
+    // #553: `status` must be a cheap, fast-exiting metadata query. It previously
+    // fell through to the full index bootstrap below (snapshot mmap, or — with no
+    // snapshot — a complete re-index + multi-GB snapshot rewrite) and, being in
+    // cliIsQueryCmd, also auto-spawned a warm cli-daemon. Backgrounded as a
+    // SessionStart warmup (`codedb . status &`), each call left a multi-GB
+    // resident orphan that stacked until the machine OOM'd. Report from on-disk
+    // metadata only — no Explorer load, no daemon spawn — and exit immediately.
+    if (std.mem.eql(u8, cmd, "status")) {
+        const t0 = cio.nanoTimestamp();
+        const data_dir = getDataDir(io, allocator, abs_root) catch {
+            out.p("{s}\xe2\x9c\x97{s} cannot resolve data dir for {s}{s}{s}\n", .{
+                s.red, s.reset, s.bold, abs_root, s.reset,
+            });
+            out.exitWithFlush(1);
+        };
+        defer allocator.free(data_dir);
+        const meta = index_mod.readStatusMeta(io, data_dir, allocator);
+        const elapsed = cio.nanoTimestamp() - t0;
+        var dur_buf: [64]u8 = undefined;
+        out.p("{s}\xe2\x9c\x93{s} {s}codedb {s}{s}  {s}{s}{s}\n", .{
+            s.green,                               s.reset,
+            s.bold,                                release_info.semver,
+            s.reset,                               sty.durationColor(s, elapsed),
+            sty.formatDuration(&dur_buf, elapsed), s.reset,
+        });
+        out.p("  {s}root{s}      {s}{s}{s}\n", .{ s.dim, s.reset, s.cyan, root, s.reset });
+        if (meta.indexed) {
+            out.p("  {s}files{s}     {s}{d}{s} indexed\n", .{ s.dim, s.reset, s.bold, meta.file_count, s.reset });
+            if (meta.git_head) |h| {
+                out.p("  {s}head{s}      {s}{s}{s}\n", .{ s.dim, s.reset, s.cyan, h[0..12], s.reset });
+            }
+        } else {
+            out.p("  {s}files{s}     {s}not indexed{s}  \xe2\x80\x94 run `codedb {s} index`\n", .{ s.dim, s.reset, s.bold, s.reset, root });
+        }
+        out.p("  {s}data{s}      {s}{s}{s}\n", .{ s.dim, s.reset, s.dim, data_dir, s.reset });
+        out.exitWithFlush(0);
+    }
+
     // Thin-client fast path: if a warm daemon (codedb <root> serve / mcp) is
     // already listening for this project, proxy read-only query commands to it
     // and skip the per-invocation snapshot reload entirely. Falls through to
     // the cold in-process path below when no daemon answers. Must run before
     // getDataDir + the load section so the proxied call pays none of that cost.
-    if (cliIsQueryCmd(cmd)) {
+    // CODEDB_NO_CLI_DAEMON disables the thin client ENTIRELY — proxy and
+    // auto-spawn — so benchmarks/tests pin the in-process path. It previously
+    // gated only the spawn, so a pre-existing daemon still answered queries
+    // despite the variable (observed while profiling #564: a stray cli-daemon
+    // served 'search' in 944µs with the variable set).
+    if (cliIsQueryCmd(cmd) and cio.posixGetenv("CODEDB_NO_CLI_DAEMON") == null) {
         if (cliTryProxy(io, allocator, abs_root, args, use_color)) |code| {
             out.flush();
             std.process.exit(code);
@@ -1070,20 +1171,37 @@ fn mainImpl() !void {
         // is warm; this call still falls through to the cold path below. The
         // daemon is the SAME binary (resolved via the self-exe path) run as
         // `codedb <abs_root> cli-daemon`, with stdio redirected to /dev/null and
-        // no waitpid (fire-and-forget). Gated by CODEDB_NO_CLI_DAEMON and skipped
-        // for an empty root. cli-daemon is not a query command, so the spawned
-        // process won't recurse into this path.
-        if (cio.posixGetenv("CODEDB_NO_CLI_DAEMON") == null and abs_root.len > 0) {
-            if (std.process.executablePathAlloc(io, allocator)) |self_exe| {
-                defer allocator.free(self_exe);
-                const daemon_argv = [_][]const u8{ self_exe, abs_root, "cli-daemon" };
-                cio.spawnDetached(allocator, &daemon_argv);
-            } else |_| {}
+        // no waitpid (fire-and-forget). Skipped for an empty root. cli-daemon is
+        // not a query command, so the spawned process won't recurse into this path.
+        // #592: also skipped while another daemon holds the per-project spawn
+        // lock — concurrent cold calls otherwise fork a daemon EACH, every
+        // duplicate rescans the index, and the stampede leaves orphans churning
+        // CPU. Losers of this probe simply cold-serve their one call.
+        if (abs_root.len > 0) {
+            const probe_dir = getDataDir(io, allocator, abs_root) catch null;
+            defer if (probe_dir) |d| allocator.free(d);
+            const lock_free = if (probe_dir) |d| daemonLockAvailable(d) else true;
+            if (lock_free) {
+                if (std.process.executablePathAlloc(io, allocator)) |self_exe| {
+                    defer allocator.free(self_exe);
+                    const daemon_argv = [_][]const u8{ self_exe, abs_root, "cli-daemon" };
+                    cio.spawnDetached(allocator, &daemon_argv);
+                } else |_| {}
+            }
         }
     }
 
     const data_dir = try getDataDir(io, allocator, abs_root);
     defer allocator.free(data_dir);
+
+    // #592: exactly one cli-daemon per project. Take the per-project flock
+    // BEFORE the expensive load below so a duplicate exits without paying a
+    // full rescan (or stealing the winner's socket via the stale-path unlink
+    // in cliDaemonListen). The fd is held for the process lifetime; the
+    // kernel drops the lock on any exit, so a crash never leaves it stale.
+    if (std.mem.eql(u8, cmd, "cli-daemon")) {
+        if (daemonLockTryAcquire(data_dir) == null) return;
+    }
 
     // Load user config (.codedbrc). Resolution: --config-file=<path>, then
     // $CWD/.codedbrc, then <binary_dir>/.codedbrc. Silently falls back to
@@ -1143,6 +1261,14 @@ fn mainImpl() !void {
                 // all content per query. Matches the serve/mcp daemon.
                 loadTrigramFromDiskIfPresent(io, &explorer, data_dir, allocator);
             }
+            if (std.mem.eql(u8, cmd, "search")) {
+                // #547: searchContent's Tier 0 recall is the word inverted index,
+                // not the trigram. Without it, `search` is blind to identifier
+                // terms that `word` surfaces (long / low-frequency names). Cheap
+                // mmap load, mirroring the trigram load above; `word`/`mcp`
+                // already load it, `search` did not.
+                loadWordIndexFromDiskIfPresent(io, &explorer, data_dir, git_head, allocator);
+            }
             if (std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "bench-engine") or std.mem.eql(u8, cmd, "cli-daemon")) {
                 loadWordIndexFromDiskIfPresent(io, &explorer, data_dir, git_head, allocator);
                 // word/bench-engine want a guaranteed-ready index — rebuild + persist
@@ -1191,17 +1317,25 @@ fn mainImpl() !void {
             // For search: single-pass scan + trigram build (no re-reading files).
             // For other commands: outline-only scan, trigrams from disk or rebuild.
             const is_search = std.mem.eql(u8, cmd, "search");
+            // #546: a multi-word query ranks via BM25, which rebuilds the word index
+            // from in-memory outlines/contents — the trigram-only fast scan commits
+            // neither, so the first-ever cold multi-word search ranked over an empty
+            // index and returned nothing. Route it through the full single-pass scan
+            // (outlines + contents + trigrams); single-token and --regex searches
+            // keep the trigram-only fast path.
+            const search_skips_outlines = blk: {
+                if (!is_search) break :blk true;
+                const sa = parseSearchArgs(args, cmd_args_start) catch break :blk true;
+                break :blk sa.use_regex or std.mem.indexOfScalar(u8, sa.query, ' ') == null;
+            };
             if (is_search and !heads_match) {
-                const tmp_tri = try watcher.initialScanWithTrigrams(io, &store, &explorer, root, allocator, std.heap.c_allocator, true);
+                const tmp_tri = try watcher.initialScanWithTrigrams(io, &store, &explorer, root, allocator, std.heap.c_allocator, search_skips_outlines);
                 if (tmp_tri) |tri| {
                     tri.writeToDisk(io, data_dir, git_head) catch {};
                     tri.deinit();
                     std.heap.c_allocator.destroy(tri);
                     if (MmapTrigramIndex.initFromDisk(io, data_dir, allocator)) |loaded| {
-                        explorer.mu.lock();
-                        explorer.trigram_index.deinit();
-                        explorer.trigram_index = .{ .mmap = loaded };
-                        explorer.mu.unlock();
+                        explorer.adoptTrigramIndex(.{ .mmap = loaded });
                     }
                 }
             } else {
@@ -1222,15 +1356,9 @@ fn mainImpl() !void {
                 const current_count = @as(u32, @intCast(explorer.outlines.count()));
                 if (disk_hdr != null and current_count == disk_hdr.?.file_count) {
                     if (MmapTrigramIndex.initFromDisk(io, data_dir, allocator)) |loaded| {
-                        explorer.mu.lock();
-                        explorer.trigram_index.deinit();
-                        explorer.trigram_index = .{ .mmap = loaded };
-                        explorer.mu.unlock();
+                        explorer.adoptTrigramIndex(.{ .mmap = loaded });
                     } else if (TrigramIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
-                        explorer.mu.lock();
-                        explorer.trigram_index.deinit();
-                        explorer.trigram_index = .{ .heap = loaded };
-                        explorer.mu.unlock();
+                        explorer.adoptTrigramIndex(.{ .heap = loaded });
                     } else {
                         explorer.rebuildTrigrams() catch {};
                         explorer.trigram_index.writeToDisk(io, data_dir, git_head) catch |err| {
@@ -1266,10 +1394,7 @@ fn mainImpl() !void {
                 // Load trigrams as mmap (zero heap cost); then we can safely
                 // release file contents since mmap serves future searches.
                 if (MmapTrigramIndex.initFromDisk(io, data_dir, allocator)) |loaded| {
-                    explorer.mu.lock();
-                    explorer.trigram_index.deinit();
-                    explorer.trigram_index = .{ .mmap = loaded };
-                    explorer.mu.unlock();
+                    explorer.adoptTrigramIndex(.{ .mmap = loaded });
                 }
                 release_contents_after_cache = true;
             }
@@ -1301,13 +1426,7 @@ fn mainImpl() !void {
             }
         } // end else (no snapshot)
     }
-
-    if (std.mem.eql(u8, cmd, "tree") or std.mem.eql(u8, cmd, "outline") or std.mem.eql(u8, cmd, "find") or
-        std.mem.eql(u8, cmd, "search") or std.mem.eql(u8, cmd, "word") or std.mem.eql(u8, cmd, "read") or
-        std.mem.eql(u8, cmd, "hot") or std.mem.eql(u8, cmd, "symbol") or std.mem.eql(u8, cmd, "callers") or
-        std.mem.eql(u8, cmd, "deps") or std.mem.eql(u8, cmd, "glob") or std.mem.eql(u8, cmd, "ls") or
-        std.mem.eql(u8, cmd, "file") or std.mem.eql(u8, cmd, "context") or
-        std.mem.eql(u8, cmd, "status"))
+    if (cliIsQueryCmd(cmd))
     {
         const code = runQuery(io, allocator, &explorer, &store, abs_root, cmd, args, cmd_args_start, &out, s);
         out.flush();
@@ -1341,7 +1460,10 @@ fn mainImpl() !void {
         } else if (std.mem.eql(u8, op, "search") or std.mem.eql(u8, op, "search-fmt")) {
             const warm = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
             defer {
-                for (warm) |r| { allocator.free(r.path); allocator.free(r.line_text); }
+                for (warm) |r| {
+                    allocator.free(r.path);
+                    allocator.free(r.line_text);
+                }
                 allocator.free(warm);
             }
         }
@@ -1381,13 +1503,19 @@ fn mainImpl() !void {
             } else if (std.mem.eql(u8, op, "search")) {
                 const r = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
                 hits_seen = r.len;
-                for (r) |item| { allocator.free(item.path); allocator.free(item.line_text); }
+                for (r) |item| {
+                    allocator.free(item.path);
+                    allocator.free(item.line_text);
+                }
                 allocator.free(r);
             } else if (std.mem.eql(u8, op, "search-fmt")) {
                 const r = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
                 hits_seen = r.len;
                 defer {
-                    for (r) |item| { allocator.free(item.path); allocator.free(item.line_text); }
+                    for (r) |item| {
+                        allocator.free(item.path);
+                        allocator.free(item.line_text);
+                    }
                     allocator.free(r);
                 }
                 var scratch: std.ArrayList(u8) = .empty;
@@ -1405,7 +1533,10 @@ fn mainImpl() !void {
                 const r = explorer.searchContent(query, allocator, 50) catch &[_]explore_mod.SearchResult{};
                 hits_seen = r.len;
                 defer {
-                    for (r) |item| { allocator.free(item.path); allocator.free(item.line_text); }
+                    for (r) |item| {
+                        allocator.free(item.path);
+                        allocator.free(item.line_text);
+                    }
                     allocator.free(r);
                 }
                 var seen = std.StringHashMap(void).init(allocator);
@@ -1517,6 +1648,11 @@ fn mainImpl() !void {
             return;
         }
 
+        // Warm the word index + result caches in the background so the first
+        // proxied CLI queries hit a fully warm explorer (the daemon used to
+        // stay lean and charge the first `word`/`context` query the rebuild).
+        spawnWarmup(io, allocator, &explorer, data_dir, abs_root, &shutdown);
+
         // Block here until idle (or a bind-race shutdown). On return the process
         // exits immediately — std.process.exit reclaims everything and avoids
         // racing the detached listener thread against freed explorer/store.
@@ -1576,6 +1712,7 @@ fn mainImpl() !void {
         } else |err| {
             std.log.warn("cli-proxy: could not start listener: {s}", .{@errorName(err)});
         }
+        spawnWarmup(io, allocator, &explorer, data_dir, abs_root, &shutdown);
         try server.serve(io, allocator, &store, &agents, &explorer, queue, port);
     } else if (std.mem.eql(u8, cmd, "mcp")) {
         // Background auto-update check (no-op when CODEDB_NO_AUTO_UPDATE is set
@@ -1671,6 +1808,7 @@ fn mainImpl() !void {
         } else |err| {
             std.log.warn("cli-proxy: could not start listener: {s}", .{@errorName(err)});
         }
+        spawnWarmup(io, allocator, &explorer, data_dir, abs_root, &shutdown);
         mcp_server.run(io, allocator, &store, &explorer, &agents, abs_root, cfg.max_cached, &telem, maybe_deferred, &shutdown);
 
         shutdown.store(true, .release);
@@ -1684,6 +1822,10 @@ fn mainImpl() !void {
         out.p("{s}\xe2\x9c\x97{s} unknown command: {s}{s}{s}\n", .{
             s.red, s.reset, s.bold, cmd, s.reset,
         });
+        // #578: flush before exit — std.process.exit skips buffered output, so
+        // the 'unknown command' line was silently lost (observed as exit 1
+        // with no output at all).
+        out.flush();
         std.process.exit(1);
     }
 }
@@ -1747,6 +1889,13 @@ pub fn parsePositional(args: []const []const u8) ParsedPositional {
 pub const LineRange = struct { start: u32, end: u32 };
 
 pub const LineRangeError = error{ MissingDash, BadStart, BadEnd, ZeroLine, Reversed };
+
+/// True when positional args remain after the command name. Used by arity-zero
+/// CLI commands (tree/hot/status) so typos like `codedb tree typo` exit 1
+/// instead of silently ignoring the extra token. See issue #528 (item 13).
+pub fn hasExtraCliArgs(args: []const []const u8, cmd_args_start: usize) bool {
+    return args.len > cmd_args_start;
+}
 
 /// Parse a `FROM-TO` line-range spec (the argument to `read -L`). `TO` may be
 /// `$` or `end` for end-of-file. Rejects malformed, non-numeric, zero-based,
@@ -1862,7 +2011,9 @@ pub fn isValidMcpFlag(arg: []const u8) bool {
 }
 
 fn isCommand(arg: []const u8) bool {
-    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "read", "hot", "status", "symbol", "callers", "deps", "glob", "ls", "file", "context", "snapshot", "serve", "mcp", "update", "nuke", "cli-daemon" };
+    // cli_query_cmds is the shared query-command table (see its doc); only the
+    // non-query commands are listed here.
+    const commands = cli_query_cmds ++ [_][]const u8{ "snapshot", "serve", "mcp", "update", "nuke", "cli-daemon" };
     for (commands) |c| {
         if (std.mem.eql(u8, arg, c)) return true;
     }
@@ -1945,20 +2096,22 @@ fn getDataDir(io: std.Io, allocator: std.mem.Allocator, abs_root: []const u8) ![
 
 fn loadTrigramFromDiskIfPresent(io: std.Io, explorer: *Explorer, data_dir: []const u8, allocator: std.mem.Allocator) void {
     explorer.mu.lockShared();
-    const already_loaded = explorer.trigram_index.fileCount() > 0;
+    const disk_backed = explorer.trigram_index != .heap;
+    const heap_files = explorer.trigram_index.fileCount();
+    const total_files = explorer.outlines.count();
     explorer.mu.unlockShared();
-    if (already_loaded) return;
+    // Skip only when a disk index is already adopted or the heap index
+    // covers the whole project. A PARTIAL heap (snapshot freshness reindex
+    // touches a few changed files before this runs) must not block the
+    // load — adoptTrigramBase keeps those files as a masking overlay.
+    if (disk_backed or (heap_files > 0 and heap_files >= total_files)) return;
 
     if (MmapTrigramIndex.initFromDisk(io, data_dir, allocator)) |loaded| {
-        explorer.mu.lock();
-        defer explorer.mu.unlock();
-        explorer.trigram_index.deinit();
-        explorer.trigram_index = .{ .mmap = loaded };
-    } else if (TrigramIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
-        explorer.mu.lock();
-        defer explorer.mu.unlock();
-        explorer.trigram_index.deinit();
-        explorer.trigram_index = .{ .heap = loaded };
+        explorer.adoptTrigramBase(loaded);
+    } else if (heap_files == 0) {
+        if (TrigramIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
+            explorer.adoptTrigramIndex(.{ .heap = loaded });
+        }
     }
 }
 
@@ -1971,7 +2124,11 @@ fn loadWordIndexFromDiskIfPresent(
 ) void {
     if (!explorer.wordIndexCanLoadFromDisk()) return;
 
+    // Each disable below logs WHY at debug level: a silent fallback here means
+    // the next query pays a full heap rebuild with no breadcrumb, which reads
+    // as an unexplained RSS/latency spike when profiling.
     const header = WordIndex.readDiskHeader(io, data_dir, allocator) catch null orelse {
+        std.log.debug("word.index disk load skipped: no readable header", .{});
         explorer.disableWordIndexDiskLoad();
         return;
     };
@@ -1980,6 +2137,7 @@ fn loadWordIndexFromDiskIfPresent(
     const current_count = @as(u32, @intCast(explorer.outlines.count()));
     explorer.mu.unlockShared();
     if (header.file_count != current_count) {
+        std.log.debug("word.index disk load skipped: file_count {d} != indexed {d}", .{ header.file_count, current_count });
         explorer.disableWordIndexDiskLoad();
         return;
     }
@@ -1990,6 +2148,7 @@ fn loadWordIndexFromDiskIfPresent(
         break :blk std.mem.eql(u8, &current_git_head.?, &header.git_head.?);
     };
     if (!heads_match) {
+        std.log.debug("word.index disk load skipped: git head mismatch", .{});
         explorer.disableWordIndexDiskLoad();
         return;
     }
@@ -1997,7 +2156,103 @@ fn loadWordIndexFromDiskIfPresent(
     if (WordIndex.mmapFromDisk(io, data_dir, allocator) orelse WordIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
         explorer.replaceWordIndex(loaded);
     } else {
+        std.log.debug("word.index disk load skipped: mmap and heap read both failed", .{});
         explorer.disableWordIndexDiskLoad();
+    }
+}
+
+/// Background warmup for the long-lived server modes (#tail-latency): real
+/// query logs show the latency tail is lazy work charged to the first query
+/// (word-index rebuild after a snapshot fast-load: 50ms–2s), and 62% of
+/// calls are exact repeats that the result caches can serve at µs — but only
+/// if something fills them. The thread waits for the scan to be ready, then
+/// (1) loads-or-rebuilds + persists the word index, and (2) replays the most
+/// repeated recent queries from queries.log through the same entry points
+/// real codedb_search calls use. CODEDB_NO_WARMUP=1 disables it.
+const WarmupCtx = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    explorer: *Explorer,
+    data_dir: []u8,
+    abs_root: []u8,
+    shutdown: *std.atomic.Value(bool),
+};
+
+fn warmupThreadMain(ctx: *WarmupCtx) void {
+    const allocator = ctx.allocator;
+    defer {
+        allocator.free(ctx.data_dir);
+        allocator.free(ctx.abs_root);
+        allocator.destroy(ctx);
+    }
+
+    // Deferred MCP scans flip the state back to .ready when indexing is done;
+    // serve/cli-daemon never leave .ready. Cap the wait so a wedged scan
+    // can't pin this thread forever.
+    var waited_ms: u64 = 0;
+    while (mcp_server.getScanState() != .ready and waited_ms < 120_000) {
+        if (ctx.shutdown.load(.acquire)) return;
+        cio.sleepMs(50);
+        waited_ms += 50;
+    }
+    if (ctx.shutdown.load(.acquire) or mcp_server.getScanState() != .ready) return;
+
+    // (1) Index prewarm: pay the word-index load/rebuild here instead of on
+    // the first codedb_word/search call, and persist a rebuild so the NEXT
+    // process start mmap-loads it.
+    const git_head = git_mod.getGitHead(ctx.abs_root, allocator) catch null;
+    loadWordIndexFromDiskIfPresent(ctx.io, ctx.explorer, ctx.data_dir, git_head, allocator);
+    if (!ctx.explorer.wordIndexIsComplete()) {
+        ctx.explorer.rebuildWordIndex() catch {};
+        if (ctx.explorer.wordIndexIsComplete()) {
+            persistWordIndexToDisk(ctx.io, ctx.explorer, ctx.data_dir, git_head);
+        }
+    }
+    if (ctx.shutdown.load(.acquire)) return;
+
+    // (2) Result-cache warmup: replay the most repeated recent queries. The
+    // searches also trigger the lazy ranking builds (symbol index, call
+    // graph, co-change) so no real query pays for those either.
+    if (cio.posixGetenv("CODEDB_NO_SEARCH_CACHE") != null) return;
+    var path_buf: [1024]u8 = undefined;
+    const log_path = std.fmt.bufPrint(&path_buf, "{s}/queries.log", .{ctx.data_dir}) catch return;
+    const log_bytes = std.Io.Dir.cwd().readFileAlloc(ctx.io, log_path, allocator, .limited(warmup_mod.max_log_tail_bytes)) catch return;
+    defer allocator.free(log_bytes);
+    const queries = warmup_mod.topQueries(allocator, log_bytes, warmup_mod.max_replay_queries) catch return;
+    defer warmup_mod.freeQueries(allocator, queries);
+    warmup_mod.replay(ctx.explorer, allocator, queries, ctx.shutdown);
+}
+
+fn spawnWarmup(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, data_dir: []const u8, abs_root: []const u8, shutdown: *std.atomic.Value(bool)) void {
+    if (cio.posixGetenv("CODEDB_NO_WARMUP") != null) return;
+    // Low-memory mode trades latency for RSS everywhere else (see
+    // compactMcpReadyMemory); don't pre-pay index builds + caches there.
+    if (cio.posixGetenv("CODEDB_LOW_MEMORY") != null) return;
+    const ctx = allocator.create(WarmupCtx) catch return;
+    const data_dir_copy = allocator.dupe(u8, data_dir) catch {
+        allocator.destroy(ctx);
+        return;
+    };
+    const abs_root_copy = allocator.dupe(u8, abs_root) catch {
+        allocator.free(data_dir_copy);
+        allocator.destroy(ctx);
+        return;
+    };
+    ctx.* = .{
+        .io = io,
+        .allocator = allocator,
+        .explorer = explorer,
+        .data_dir = data_dir_copy,
+        .abs_root = abs_root_copy,
+        .shutdown = shutdown,
+    };
+    if (std.Thread.spawn(.{}, warmupThreadMain, .{ctx})) |t| {
+        t.detach();
+    } else |err| {
+        std.log.debug("warmup: could not start thread: {s}", .{@errorName(err)});
+        allocator.free(ctx.data_dir);
+        allocator.free(ctx.abs_root);
+        allocator.destroy(ctx);
     }
 }
 
@@ -2233,10 +2488,7 @@ fn scanBg(io: std.Io, store: *Store, explorer: *Explorer, root: []const u8, allo
         const current_count = @as(u32, @intCast(explorer.outlines.count()));
         if (disk_hdr != null and current_count == disk_hdr.?.file_count) {
             if (MmapTrigramIndex.initFromDisk(io, data_dir, allocator)) |loaded| {
-                explorer.mu.lock();
-                explorer.trigram_index.deinit();
-                explorer.trigram_index = .{ .mmap = loaded };
-                explorer.mu.unlock();
+                explorer.adoptTrigramIndex(.{ .mmap = loaded });
                 scan_done.store(true, .release);
                 mcp_server.setScanState(.ready);
                 if (shutdown.load(.acquire)) return;
@@ -2257,10 +2509,7 @@ fn scanBg(io: std.Io, store: *Store, explorer: *Explorer, root: []const u8, allo
                 return;
             }
             if (TrigramIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
-                explorer.mu.lock();
-                explorer.trigram_index.deinit();
-                explorer.trigram_index = .{ .heap = loaded };
-                explorer.mu.unlock();
+                explorer.adoptTrigramIndex(.{ .heap = loaded });
                 scan_done.store(true, .release);
                 mcp_server.setScanState(.ready);
                 if (shutdown.load(.acquire)) return;
@@ -2301,15 +2550,9 @@ fn scanBg(io: std.Io, store: *Store, explorer: *Explorer, root: []const u8, allo
 
     // Compact: swap heap index for mmap — zero RSS, data lives in OS page cache.
     if (MmapTrigramIndex.initFromDisk(io, data_dir, allocator)) |loaded| {
-        explorer.mu.lock();
-        explorer.trigram_index.deinit();
-        explorer.trigram_index = .{ .mmap = loaded };
-        explorer.mu.unlock();
+        explorer.adoptTrigramIndex(.{ .mmap = loaded });
     } else if (TrigramIndex.readFromDisk(io, data_dir, allocator)) |loaded| {
-        explorer.mu.lock();
-        explorer.trigram_index.deinit();
-        explorer.trigram_index = .{ .heap = loaded };
-        explorer.mu.unlock();
+        explorer.adoptTrigramIndex(.{ .heap = loaded });
     }
 
     scan_done.store(true, .release);

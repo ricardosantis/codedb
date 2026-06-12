@@ -7,15 +7,16 @@ const Explorer = @import("explore.zig").Explorer;
 const SearchResult = @import("explore.zig").SearchResult;
 const WordIndex = @import("index.zig").WordIndex;
 const TrigramIndex = @import("index.zig").TrigramIndex;
+const MmapTrigramIndex = @import("index.zig").MmapTrigramIndex;
 const SparseNgramIndex = @import("index.zig").SparseNgramIndex;
 const explore = @import("explore.zig");
 const Language = explore.Language;
+const git = @import("git.zig");
 const SymbolKind = explore.SymbolKind;
 const DependencyGraph = explore.DependencyGraph;
 const SymbolLocation = explore.SymbolLocation;
 const mcp_mod = @import("mcp.zig");
 const AgentRegistry = @import("agent.zig").AgentRegistry;
-
 
 test "issue-264: early exit at max_results misses valid matches in remaining candidates" {
     // searchContent stops as soon as result_list.items.len >= max_results.
@@ -56,7 +57,6 @@ test "issue-264: early exit at max_results misses valid matches in remaining can
     try testing.expect(found_quiet);
 }
 
-
 test "search: line numbers correct with incremental counting" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -80,7 +80,6 @@ test "search: line numbers correct with incremental counting" {
     try testing.expectEqual(@as(u32, 6), results[1].line_num);
 }
 
-
 test "issue-290: searchContent with hyphen query does not crash" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -95,7 +94,6 @@ test "issue-290: searchContent with hyphen query does not crash" {
         testing.allocator.free(results);
     }
 }
-
 
 test "issue-292: searchContent with pipe query does not crash" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -112,7 +110,6 @@ test "issue-292: searchContent with pipe query does not crash" {
     }
 }
 
-
 test "issue-292: codedb_search guidance hints regex=true on metachar query" {
     const args_json = "{\"query\":\"timestamp|activity|filter\"}";
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
@@ -122,7 +119,6 @@ test "issue-292: codedb_search guidance hints regex=true on metachar query" {
     mcp_mod.mcpGenerateGuidance(testing.allocator, "codedb_search", &parsed.value.object, "", false, &buf);
     try testing.expect(std.mem.indexOf(u8, buf.items, "regex=true") != null);
 }
-
 
 test "issue-292: codedb_search guidance does not warn when regex=true is set" {
     const args_json = "{\"query\":\"timestamp|activity\",\"regex\":true}";
@@ -134,7 +130,6 @@ test "issue-292: codedb_search guidance does not warn when regex=true is set" {
     try testing.expect(std.mem.indexOf(u8, buf.items, "regex=true") == null);
 }
 
-
 test "issue-290: codedb_search guidance does not warn on plain hyphen" {
     const args_json = "{\"query\":\"test-case\"}";
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
@@ -144,7 +139,6 @@ test "issue-290: codedb_search guidance does not warn on plain hyphen" {
     mcp_mod.mcpGenerateGuidance(testing.allocator, "codedb_search", &parsed.value.object, "", false, &buf);
     try testing.expect(std.mem.indexOf(u8, buf.items, "regex=true") == null);
 }
-
 
 test "issue-363b: fuzzyFindFiles ranks exact basename match above unrelated lib.rs" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
@@ -170,7 +164,6 @@ test "issue-363b: fuzzyFindFiles ranks exact basename match above unrelated lib.
     try testing.expectEqualStrings("crates/forge_main/src/cli.rs", matches[0].path);
 }
 
-
 test "issue-363a: searchContent surfaces source-file matches even when doc files dominate the word index" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
@@ -184,7 +177,8 @@ test "issue-363a: searchContent surfaces source-file matches even when doc files
     var i: usize = 0;
     while (i < 4) : (i += 1) {
         const path = try std.fmt.bufPrint(&path_buf, "docs/notes_{d}.md", .{i});
-        const content = try std.fmt.bufPrint(&content_buf,
+        const content = try std.fmt.bufPrint(
+            &content_buf,
             "## Notes {d}\n\n" ++
                 "The searchContent function is documented here.\n" ++
                 "We discuss searchContent at length.\n" ++
@@ -229,7 +223,6 @@ test "issue-363a: searchContent surfaces source-file matches even when doc files
     try testing.expect(found_source);
 }
 
-
 test "issue-recall: codedb_search supports path_glob filter" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
@@ -258,7 +251,6 @@ test "issue-recall: codedb_search supports path_glob filter" {
     try testing.expect(std.mem.indexOf(u8, out.items, "src/main.zig") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "CHANGELOG.md") == null);
 }
-
 
 test "issue-422: search header count must reflect post-filter visible results" {
     // From the issue: a query whose ONLY match would be displayed instead
@@ -321,7 +313,6 @@ test "issue-422: search header count must reflect post-filter visible results" {
     try testing.expect(std.mem.indexOf(u8, out.items, "1 results for 'struct ForgeAPI'") != null);
 }
 
-
 test "issue-390: codedb_search scope=true caps matches per file" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
@@ -374,7 +365,6 @@ test "issue-390: codedb_search scope=true caps matches per file" {
     try testing.expect(std.mem.indexOf(u8, out.items, "src/c.zig:") != null);
 }
 
-
 test "issue-391: codedb_callers tool exists" {
     // codedb_callers is the proposed reverse-callgraph tool: given a symbol
     // name, return the call sites across the index. It fuses the existing
@@ -386,7 +376,6 @@ test "issue-391: codedb_callers tool exists" {
     // workflow has to be assembled by hand on the client side.
     try testing.expect(@hasField(mcp_mod.Tool, "codedb_callers"));
 }
-
 
 test "issue-391: codedb_callers returns call sites with scope" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -421,7 +410,6 @@ test "issue-391: codedb_callers returns call sites with scope" {
     try testing.expect(std.mem.indexOf(u8, out.items, "def.zig:1") == null);
 }
 
-
 test "issue-391: codedb_callers rejects missing name" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
@@ -445,7 +433,6 @@ test "issue-391: codedb_callers rejects missing name" {
     try testing.expect(std.mem.startsWith(u8, out.items, "error:"));
     try testing.expect(std.mem.indexOf(u8, out.items, "name") != null);
 }
-
 
 test "issue-393: BM25 ranking surfaces high-density file before single-mention file" {
     // Multi-term content queries today return matches in scan order with only
@@ -519,7 +506,6 @@ test "issue-393: BM25 ranking surfaces high-density file before single-mention f
     }
 }
 
-
 test "issue-400: BM25 ranks both-terms file above single-term files" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -555,6 +541,102 @@ test "issue-400: BM25 ranks both-terms file above single-term files" {
     try testing.expect(results[0].score > 0.0);
 }
 
+test "issue-546: searchContentAuto applies the ranker to multi-word queries (CLI parity with MCP)" {
+    // #546: `codedb search` runs through runQuery (shared by the cold CLI path and
+    // the warm cli-daemon), which always called the UNRANKED searchContent — so
+    // multi-word/conceptual CLI queries came back in recall order, never the
+    // BM25+centrality order the MCP `search` handler already used. searchContentAuto
+    // is the single query-shape-aware entry point both call, so they rank identically:
+    // a multi-word query routes to searchContentRanked. (Single tokens keep literal
+    // substring matching for exact-identifier lookups — covered elsewhere.)
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    // both.zig covers BOTH query terms; the single-term files are denser lexical
+    // hits for one term but less relevant to the two-term query.
+    try explorer.indexFile("both.zig",
+        \\pub fn parseToken() void {
+        \\    parseToken();
+        \\    parseToken();
+        \\}
+    );
+    try explorer.indexFile("only_parse.zig",
+        \\pub fn parseFoo() void {
+        \\    parse();
+        \\    parse();
+        \\    parse();
+        \\}
+    );
+    try explorer.indexFile("only_token.zig",
+        \\pub fn tokenStream() void {
+        \\    token();
+        \\    token();
+        \\}
+    );
+
+    // Multi-word query: searchContentAuto must route to the ranker, so the
+    // both-terms file ranks first and carries a positive BM25 score (the unranked
+    // recall path neither guarantees this order nor populates a score).
+    const results = try explorer.searchContentAuto("parse Token", testing.allocator, 8);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.line_text);
+            testing.allocator.free(r.path);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expect(results.len > 0);
+    try testing.expectEqualStrings("both.zig", results[0].path);
+    try testing.expect(results[0].score > 0.0);
+}
+
+test "issue-546: searchContentRanked rebuilds an incomplete (snapshot-loaded) word index" {
+    // #546 root cause: a mmap/disk-loaded word index is recall-ready but not
+    // BM25-ready (word_index_complete = false; empty id_to_path / ranked-doc table).
+    // searchContent and searchWord lazily rebuild in that state, but
+    // searchContentRanked did not — so multi-word ranked search returned NOTHING on
+    // a cold CLI / freshly-loaded snapshot even though `word` found hits. This pins
+    // the lazy rebuild: markWordIndexIncomplete simulates the post-load state (file
+    // contents remain), and ranked search must rebuild and return results instead of
+    // collapsing to an empty set.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("both.zig",
+        \\pub fn parseToken() void {
+        \\    parseToken();
+        \\    parseToken();
+        \\}
+    );
+    try explorer.indexFile("only_parse.zig",
+        \\pub fn parseFoo() void {
+        \\    parse();
+        \\}
+    );
+    try explorer.indexFile("only_token.zig",
+        \\pub fn tokenStream() void {
+        \\    token();
+        \\}
+    );
+
+    // Drop the in-memory word index to its post-snapshot-load state: not complete,
+    // contents still present. Without the lazy rebuild, searchContentRanked sees
+    // N == 0 and returns nothing.
+    explorer.markWordIndexIncomplete(false);
+
+    const results = try explorer.searchContentRanked("parse Token", testing.allocator, 8);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.line_text);
+            testing.allocator.free(r.path);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expect(results.len > 0);
+    try testing.expectEqualStrings("both.zig", results[0].path);
+}
 
 test "issue-400-bug1: searchContentRanked returns ranked results when skip_file_words=true" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
@@ -573,7 +655,6 @@ test "issue-400-bug1: searchContentRanked returns ranked results when skip_file_
     try testing.expect(results.len > 0);
 }
 
-
 test "issue-400-bug2: total_tokens stays consistent across re-index when skip_file_words=true" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
@@ -583,7 +664,6 @@ test "issue-400-bug2: total_tokens stays consistent across re-index when skip_fi
     try explorer.indexFile("a.zig", "eight\n");
     try testing.expectEqual(@as(u64, 1), explorer.word_index.total_tokens);
 }
-
 
 test "bm25-recall-a: single-term tf ordering" {
     // 3 docs with identical length but "apple" on different numbers of lines.
@@ -617,7 +697,6 @@ test "bm25-recall-a: single-term tf ordering" {
     try testing.expect(results[0].score > results[1].score);
     try testing.expect(results[1].score > results[2].score);
 }
-
 
 test "bm25-recall-b: both-terms doc beats high-tf single-term doc" {
     // doc1 has apple+banana (both query terms, one occurrence each).
@@ -657,7 +736,6 @@ test "bm25-recall-b: both-terms doc beats high-tf single-term doc" {
     }
 }
 
-
 test "bm25-recall-c: df-saturation -- ubiquitous term has near-zero idf" {
     // "the" appears in all 11 docs -> idf near zero, barely contributes.
     // "unique_marker" appears only in special.txt -> high idf, special.txt ranks first.
@@ -693,7 +771,6 @@ test "bm25-recall-c: df-saturation -- ubiquitous term has near-zero idf" {
     }
 }
 
-
 test "bm25-recall-d: length normalization favors shorter doc" {
     // short.txt: 5 tokens, one "needle".
     // long.txt: ~50 tokens, one "needle".
@@ -703,10 +780,8 @@ test "bm25-recall-d: length normalization favors shorter doc" {
     var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
 
     try explorer.indexFile("short.txt", "needle alpha beta gamma delta");
-    try explorer.indexFile("long.txt",
-        "aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr ss tt uu vv ww xx yy zz " ++
-        "aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr ss tt uu vv ww xx needle yy zz"
-    );
+    try explorer.indexFile("long.txt", "aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr ss tt uu vv ww xx yy zz " ++
+        "aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr ss tt uu vv ww xx needle yy zz");
 
     const results = try explorer.searchContentRanked("needle", testing.allocator, 10);
     defer {
@@ -721,7 +796,6 @@ test "bm25-recall-d: length normalization favors shorter doc" {
     try testing.expectEqualStrings("short.txt", results[0].path);
     try testing.expect(results[0].score > results[1].score);
 }
-
 
 test "bm25-recall-e: empty and pathological queries return empty without crash" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -747,7 +821,6 @@ test "bm25-recall-e: empty and pathological queries return empty without crash" 
     }
 }
 
-
 test "bm25-stress: 1000-doc index, common token, max_results cap honored" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
@@ -756,9 +829,7 @@ test "bm25-stress: 1000-doc index, common token, max_results cap honored" {
     var content_buf: [256]u8 = undefined;
     for (0..1000) |i| {
         const path = std.fmt.bufPrint(&path_buf, "stress/doc{d}.txt", .{i}) catch unreachable;
-        const content = std.fmt.bufPrint(&content_buf,
-            "common token alpha beta gamma doc{d} extra filler words here now", .{i}
-        ) catch unreachable;
+        const content = std.fmt.bufPrint(&content_buf, "common token alpha beta gamma doc{d} extra filler words here now", .{i}) catch unreachable;
         try explorer.indexFile(path, content);
     }
 
@@ -782,7 +853,6 @@ test "bm25-stress: 1000-doc index, common token, max_results cap honored" {
     }
 }
 
-
 test "bm25-state-sync: re-index and remove update total_tokens correctly" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();
@@ -796,7 +866,6 @@ test "bm25-state-sync: re-index and remove update total_tokens correctly" {
     explorer.removeFile("sync.txt");
     try testing.expectEqual(@as(u64, 0), explorer.word_index.total_tokens);
 }
-
 
 test "issue-425: codedb_callers excludes substring matches in unrelated identifiers" {
     // handleCallers (mcp.zig:1339) currently calls searchContentWithScope(name)
@@ -841,7 +910,6 @@ test "issue-425: codedb_callers excludes substring matches in unrelated identifi
     try testing.expect(std.mem.indexOf(u8, out.items, "1 call sites for 'fooBar'") != null);
 }
 
-
 test "issue-426: codedb_callers excludes non-code files (markdown, docs)" {
     // handleCallers (mcp.zig:1339) feeds searchContentWithScope across every
     // indexed file regardless of language. Markdown and other documentation
@@ -885,7 +953,6 @@ test "issue-426: codedb_callers excludes non-code files (markdown, docs)" {
     // Header reflects the real count.
     try testing.expect(std.mem.indexOf(u8, out.items, "1 call sites for 'fooBar'") != null);
 }
-
 
 test "issue-427: searchContent Tier 1 sort starves the definition-dense file" {
     // searchContent's Tier 1 (explore.zig:1590-1598) sorts trigram candidates
@@ -950,7 +1017,6 @@ test "issue-427: searchContent Tier 1 sort starves the definition-dense file" {
     try testing.expect(found_canonical);
 }
 
-
 test "issue-429-a: searchContent rerank boosts files whose basename matches the query" {
     // Two files, same hit count, same content length. The current rerank
     // (explore.zig:1700-1712) sorts ties by path-asc, so a file named
@@ -976,7 +1042,6 @@ test "issue-429-a: searchContent rerank boosts files whose basename matches the 
     try testing.expectEqualStrings("src/widgetX.zig", results[0].path);
 }
 
-
 test "issue-429-b: searchContent rerank penalizes test/vendor/examples paths" {
     // Two files, same hit count, same content. Pre-fix the path-asc
     // tiebreaker promotes "examples/sample.zig" (e < s) above
@@ -1000,7 +1065,6 @@ test "issue-429-b: searchContent rerank penalizes test/vendor/examples paths" {
     try testing.expect(results.len >= 2);
     try testing.expectEqualStrings("src/sample.zig", results[0].path);
 }
-
 
 test "issue-429-c: searchContent rerank boosts lines that are symbol definitions" {
     // Two files. "aaa.zig" has a passing comment mention of `fooSym`. The
@@ -1028,6 +1092,60 @@ test "issue-429-c: searchContent rerank boosts lines that are symbol definitions
     try testing.expectEqualStrings("zzz_def.zig", results[0].path);
 }
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "lex-freq-penalty: CODEDB_LEX_FREQ_PENALTY demotes files the query saturates" {
+    // engram's learned ranker down-weights pure lexical frequency (LEARNED_W
+    // lexical = -2): a file the query matches on MANY lines is usually a
+    // dispatcher/registry, not the implementation the searcher wants. Two
+    // non-eponymous files tie on per-line score, so the path-asc tiebreaker puts
+    // "dispatcher.zig" first by default; with CODEDB_LEX_FREQ_PENALTY on, the
+    // query-saturated dispatcher.zig (6 match lines) is pushed below the focused
+    // handler.zig (1 match line).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/dispatcher.zig", "pub fn a() void { _ = evt; }\n" ++
+        "pub fn b() void { _ = evt; }\n" ++
+        "pub fn c() void { _ = evt; }\n" ++
+        "pub fn d() void { _ = evt; }\n" ++
+        "pub fn e() void { _ = evt; }\n" ++
+        "pub fn f() void { _ = evt; }\n");
+    try explorer.indexFile("src/handler.zig", "pub fn g() void { _ = evt; }\n");
+
+    // Disabled (CODEDB_LEX_FREQ_PENALTY=0): equal per-line scores → path-asc tie → dispatcher leads.
+    _ = setenv("CODEDB_LEX_FREQ_PENALTY", "0", 1);
+    defer _ = unsetenv("CODEDB_LEX_FREQ_PENALTY");
+    {
+        const results = try explorer.searchContent("evt", testing.allocator, 50);
+        defer {
+            for (results) |r| {
+                testing.allocator.free(r.path);
+                testing.allocator.free(r.line_text);
+            }
+            testing.allocator.free(results);
+        }
+        try testing.expect(results.len >= 2);
+        try testing.expectEqualStrings("src/dispatcher.zig", results[0].path);
+    }
+
+    // Default (on): dispatcher.zig saturates the query → demoted below handler.zig.
+    _ = unsetenv("CODEDB_LEX_FREQ_PENALTY");
+    {
+        const results = try explorer.searchContent("evt", testing.allocator, 50);
+        defer {
+            for (results) |r| {
+                testing.allocator.free(r.path);
+                testing.allocator.free(r.line_text);
+            }
+            testing.allocator.free(results);
+        }
+        try testing.expect(results.len >= 2);
+        try testing.expectEqualStrings("src/handler.zig", results[0].path);
+    }
+}
 
 test "issue-430: Tier 0 markdown dominance starves canonical source file" {
     // Tier 0 of searchContent (explore.zig:1525-1554) iterates the word
@@ -1061,11 +1179,10 @@ test "issue-430: Tier 0 markdown dominance starves canonical source file" {
 
     // Source file with the canonical definition + several real call sites,
     // indexed LAST so its posting-list entries come after the markdown noise.
-    try explorer.indexFile("src/foo.zig",
-        "pub fn fooBar() void {}\n" ++
-            "pub fn caller1() void { fooBar(); }\n" ++
-            "pub fn caller2() void { fooBar(); }\n" ++
-            "pub fn caller3() void { fooBar(); }\n");
+    try explorer.indexFile("src/foo.zig", "pub fn fooBar() void {}\n" ++
+        "pub fn caller1() void { fooBar(); }\n" ++
+        "pub fn caller2() void { fooBar(); }\n" ++
+        "pub fn caller3() void { fooBar(); }\n");
 
     const results = try explorer.searchContent("fooBar", testing.allocator, 50);
     defer {
@@ -1088,7 +1205,6 @@ test "issue-430: Tier 0 markdown dominance starves canonical source file" {
     // the source file is reached, then Tier 0 returns at max_results.
     try testing.expect(found_source);
 }
-
 
 test "issue-431: searchContent does not crash when query is longer than content" {
     // searchInContent (explore.zig:3881) computes
@@ -1119,7 +1235,6 @@ test "issue-431: searchContent does not crash when query is longer than content"
     try testing.expect(results.len == 0);
 }
 
-
 test "issue-429-d: searchContent rerank boosts path-segment match" {
     // Two files, same hit count, same content. The query "parser" appears
     // as a directory segment of one path. Pre-fix the alphabetic tiebreak
@@ -1143,7 +1258,6 @@ test "issue-429-d: searchContent rerank boosts path-segment match" {
     try testing.expect(results.len >= 2);
     try testing.expectEqualStrings("src/parser/foo.zig", results[0].path);
 }
-
 
 test "issue-429-e: searchContent rerank penalises doc-language files so code beats markdown noise" {
     // CHANGELOG.md and benchmark docs often mention an identifier many times
@@ -1178,7 +1292,6 @@ test "issue-429-e: searchContent rerank penalises doc-language files so code bea
     try testing.expectEqualStrings("src/caller.zig", results[0].path);
 }
 
-
 test "issue-448-a: rerank boosts basename when query contains stem" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1199,7 +1312,6 @@ test "issue-448-a: rerank boosts basename when query contains stem" {
     try testing.expect(results.len >= 2);
     try testing.expectEqualStrings("src/explore.zig", results[0].path);
 }
-
 
 test "issue-448-b: rerank symbol definition boost is case-insensitive" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1222,7 +1334,6 @@ test "issue-448-b: rerank symbol definition boost is case-insensitive" {
     try testing.expectEqualStrings("zzz.zig", results[0].path);
 }
 
-
 test "issue-449: popular markdown should not disable Tier 0 code-first behavior" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1242,11 +1353,10 @@ test "issue-449: popular markdown should not disable Tier 0 code-first behavior"
         try explorer.indexFile(path, md_block);
     }
 
-    try explorer.indexFile("src/foo.zig",
-        "pub fn fooBar() void {}\n" ++
-            "pub fn caller1() void { fooBar(); }\n" ++
-            "pub fn caller2() void { fooBar(); }\n" ++
-            "pub fn caller3() void { fooBar(); }\n");
+    try explorer.indexFile("src/foo.zig", "pub fn fooBar() void {}\n" ++
+        "pub fn caller1() void { fooBar(); }\n" ++
+        "pub fn caller2() void { fooBar(); }\n" ++
+        "pub fn caller3() void { fooBar(); }\n");
 
     const results = try explorer.searchContent("fooBar", testing.allocator, 10);
     defer {
@@ -1263,7 +1373,6 @@ test "issue-449: popular markdown should not disable Tier 0 code-first behavior"
     }
     try testing.expect(found_source);
 }
-
 
 test "issue-450: prefix tier respects max_results" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1285,7 +1394,6 @@ test "issue-450: prefix tier respects max_results" {
 
     try testing.expect(results.len <= 2);
 }
-
 
 test "rerank-trace: appends one JSON line per searchContent when enabled" {
     const tmp_io = testing.io;
@@ -1339,7 +1447,6 @@ test "rerank-trace: appends one JSON line per searchContent when enabled" {
     try testing.expect(std.mem.indexOf(u8, data, "\"results\":[") != null);
 }
 
-
 test "rerank-trace: disabled by default — no file is created" {
     const tmp_io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -1374,7 +1481,6 @@ test "rerank-trace: disabled by default — no file is created" {
     const open_err = std.Io.Dir.cwd().openFile(tmp_io, probe_path, .{});
     try testing.expectError(error.FileNotFound, open_err);
 }
-
 
 test "rerank-trace: clobbers when file exceeds size limit" {
     const tmp_io = testing.io;
@@ -1424,7 +1530,6 @@ test "rerank-trace: clobbers when file exceeds size limit" {
     try testing.expect(new_size > 0);
     try testing.expect(new_size < 16 * 1024);
 }
-
 
 test "rerank-trace: single-result query records non-zero rerank score" {
     // Pre-fix: rerankAndFinalize only scored when items.len > 1, so a
@@ -1476,7 +1581,6 @@ test "rerank-trace: single-result query records non-zero rerank score" {
     try testing.expect(std.mem.indexOf(u8, data, "src/loneSym.zig") != null);
 }
 
-
 test "issue-negq: negative-query search short-circuits Tier 5 full scan" {
     // When a query contains trigrams that no indexed file contains (a
     // definitively-negative query), searchContent should return [] without
@@ -1512,7 +1616,6 @@ test "issue-negq: negative-query search short-circuits Tier 5 full scan" {
     // ruled out a match. On main this expectation fails (count == 1).
     try testing.expectEqual(@as(u64, 0), explorer.search_tier5_count);
 }
-
 
 test "issue-471a: codedb_find accepts query/name/path/pattern/q aliases" {
     // Real-user telemetry (24h) showed 71% of codedb_find calls failing with
@@ -1559,7 +1662,6 @@ test "issue-471a: codedb_find accepts query/name/path/pattern/q aliases" {
         try testing.expect(std.mem.indexOf(u8, out.items, "main.zig") != null);
     }
 }
-
 
 test "issue-471b: codedb_find error message enumerates accepted aliases" {
     // If an agent calls codedb_find with no recognized key, the error message
@@ -1637,4 +1739,1011 @@ test "issue-451: scope=true search surfaces skip-trigram files" {
         }
     }
     try testing.expect(found_canonical);
+}
+
+test "issue-546: searchContent rerank penalizes non-source tooling paths (bench/install/scripts/website)" {
+    // Mirror of issue-429-b for first-party tooling directories. Five files,
+    // identical content and hit count — only a path prior can separate them.
+    // Pre-fix the path-asc tiebreaker puts bench/ first; the implementation
+    // under src/ must win.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("bench/sample.zig", "pub fn x() void { _ = coreTerm; }\n");
+    try explorer.indexFile("install/sample.zig", "pub fn x() void { _ = coreTerm; }\n");
+    try explorer.indexFile("scripts/sample.zig", "pub fn x() void { _ = coreTerm; }\n");
+    try explorer.indexFile("website/sample.zig", "pub fn x() void { _ = coreTerm; }\n");
+    try explorer.indexFile("src/sample.zig", "pub fn x() void { _ = coreTerm; }\n");
+
+    const results = try explorer.searchContent("coreTerm", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expect(results.len >= 5);
+    try testing.expectEqualStrings("src/sample.zig", results[0].path);
+}
+
+test "issue-560: path_glob page must not be starved by higher-ranked out-of-glob files" {
+    // 40 out-of-glob decoys tie the gold file on score; the path-asc
+    // tiebreaker ranks lib/ decoys above src/gold.zig, so the gold hit sits
+    // beyond the fetched window. Pre-fix the handler fetches
+    // offset+max_results+1 ranked results and only THEN applies path_glob —
+    // every fetched row is out-of-glob, so the response is '0 results' plus
+    // a 'more results' hint even though src/gold.zig matches query and glob.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        const name = try std.fmt.allocPrint(arena.allocator(), "lib/decoy{d:0>2}.zig", .{i});
+        try explorer.indexFile(name, "pub fn x() void { _ = starveTerm; }\n");
+    }
+    try explorer.indexFile("src/gold.zig", "pub fn x() void { _ = starveTerm; }\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"query":"starveTerm","path_glob":"src/**","max_results":5}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_search, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // The in-glob match must be visible.
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/gold.zig") != null);
+    // And the header must not claim zero results.
+    try testing.expect(std.mem.indexOf(u8, out.items, "0 results") == null);
+}
+
+test "issue-562: codedb_callers excludes full-line comment mentions" {
+    // Live repro: callers of insertRestoredFile reported snapshot.zig:822
+    // ('// is false: insertRestoredFile errors above…') and a test-file
+    // comment as call sites. A full-line comment is documentation, not a
+    // call — it must not be counted or rendered.
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/zlib.zig", "pub fn insertThing() void {}\n");
+    try explorer.indexFile("src/caller.zig", "pub fn doIt() void {\n    insertThing();\n}\n");
+    try explorer.indexFile("src/noisy.zig", "// insertThing errors above if the path already exists\npub fn unrelated() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".", Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"name":"insertThing"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_callers, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // The real call site stays.
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/caller.zig:2") != null);
+    // The comment mention must not appear as a call site…
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/noisy.zig") == null);
+    // …and must not inflate the header count.
+    try testing.expect(std.mem.indexOf(u8, out.items, "1 call sites for 'insertThing'") != null);
+}
+
+test "issue-580: basename test files rank below non-test source for concept queries" {
+    // rerankSignalScore's test penalty only matches DIRECTORY segments named
+    // test/tests, so files like src/tests.zig or src/widget_tests.zig dodge
+    // the ×0.6 entirely (live: 'codedb search snapshot' put src/tests.zig at
+    // file-rank 3, above non-test source). BM25's pathRelevanceMultiplier
+    // already checks the basename — the scan-rerank path must match it.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    // The test-named file mentions the term more densely (as test files do);
+    // without a basename penalty it outranks the implementation line.
+    try explorer.indexFile("src/zz_tests.zig", "pub fn x() void { _ = conceptTerm; _ = conceptTerm; _ = conceptTerm; }\n");
+    try explorer.indexFile("src/owner.zig", "pub fn x() void { _ = conceptTerm; _ = conceptTerm; }\n");
+
+    const results = try explorer.searchContent("conceptTerm", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expect(results.len >= 2);
+    try testing.expectEqualStrings("src/owner.zig", results[0].path);
+}
+
+// ─── audit (2026-06-09): latent-issue sweep — failing test for a confirmed bug ───
+// src/explore.zig:2418 — searchContent Tier 0 `use_line_hits` fast-path returns before
+// rerankAndFinalize, so a high-count non-canonical file outranks the canonical basename
+// match (the #537/#448 structural-vs-lexical inversion, reintroduced for small max_results).
+test "audit: searchContent tier0 use_line_hits early-return skips rerank basename boost" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/other.zig", "widget\nwidget\nwidget\nwidget\nwidget\nwidget\n");
+    try explorer.indexFile("src/widget.zig", "const widget = 1;\n");
+
+    const results = try explorer.searchContent("widget", testing.allocator, 2);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expect(results.len >= 2);
+    // RED on main: results[0] == src/other.zig (count 6); canonical basename must win.
+    try testing.expectEqualStrings("src/widget.zig", results[0].path);
+}
+
+// src/explore.zig renderPlainSearch — the MCP codedb_search fast-path rendered in raw
+// hit-count order with no basename prior, so a noise file outranked the canonical match.
+test "audit: renderPlainSearch fast-path ranks lexical count over canonical basename" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/other.zig", "widget\nwidget\nwidget\nwidget\nwidget\nwidget\n");
+    try explorer.indexFile("src/widget.zig", "const widget = 1;\n");
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+
+    const rendered = try explorer.renderPlainSearch("widget", testing.allocator, &out, 2, false);
+    try testing.expect(rendered);
+
+    const wi = std.mem.indexOf(u8, out.items, "src/widget.zig");
+    const oi = std.mem.indexOf(u8, out.items, "src/other.zig");
+    try testing.expect(wi != null and oi != null);
+    // canonical src/widget.zig must render before the high-count src/other.zig
+    try testing.expect(wi.? < oi.?);
+}
+
+// src/explore.zig:1659 — readContentForSearch capped disk reads at 512KB while the indexer
+// reads up to 64MB, so a word-indexed file >512KB evicted from the content cache was
+// invisible to every search tier.
+test "audit: searchContent loses a word-indexed file >512KB evicted from the content cache" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(testing.allocator);
+    try big.appendSlice(testing.allocator, "fn f() void { _ = widgetzzz; }\n");
+    // pad past the old 512KB cap with a few long comment lines — keeps the file
+    // >512KB while staying cheap to index (the token we search for is on line 1).
+    while (big.items.len < 600 * 1024) {
+        try big.appendSlice(testing.allocator, "// ");
+        try big.appendNTimes(testing.allocator, 'x', 560);
+        try big.appendSlice(testing.allocator, "\n");
+    }
+
+    var file = try tmp.dir.createFile(io, "big.zig", .{});
+    try file.writeStreamingAll(io, big.items);
+    file.close(io);
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPathFile(io, ".", &root_buf);
+    const root = root_buf[0..root_len];
+
+    var explorer = Explorer.init(testing.allocator, 1); // capacity 1 forces eviction
+    defer explorer.deinit();
+    explorer.setRoot(io, root);
+
+    try explorer.indexFile("big.zig", big.items);
+    try explorer.indexFile("filler.zig", "fn g() void {}\n");
+
+    try testing.expect(explorer.word_index.search("widgetzzz").len > 0);
+
+    const results = try explorer.searchContent("widgetzzz", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+    var found = false;
+    for (results) |r| {
+        if (std.mem.eql(u8, r.path, "big.zig")) found = true;
+    }
+    // big.zig must be reachable now that the read cap matches the indexer's 64MB
+    try testing.expect(found);
+}
+
+// ─── #546 follow-up: cold CLI scan leaves an empty-but-"complete" word index ───
+// main.zig's cold non-index scan disables the word index to save memory, but
+// word_index_complete defaults to true. Files commit into outlines/contents while
+// WordIndex.indexFile silently no-ops, so searchContentRanked trusts the flag,
+// skips the lazy rebuild, sees N == 0, and every multi-word CLI search on a cold
+// start returns nothing.
+test "issue-546: cold CLI scan (word index disabled) still ranks multi-word queries" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    // Mirror the cold CLI scan state (main.zig sets both for non-index commands).
+    explorer.word_index.skip_file_words = true;
+    explorer.word_index.enabled = false;
+
+    try explorer.indexFile("both.zig",
+        \\pub fn parseToken() void {
+        \\    parseToken();
+        \\    parseToken();
+        \\}
+    );
+    try explorer.indexFile("only_parse.zig",
+        \\pub fn parseFoo() void {
+        \\    parse();
+        \\}
+    );
+
+    const results = try explorer.searchContentAuto("parse Token", testing.allocator, 8);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.line_text);
+            testing.allocator.free(r.path);
+        }
+        testing.allocator.free(results);
+    }
+    // RED pre-fix: the empty index claims completeness, no rebuild runs, len == 0.
+    try testing.expect(results.len > 0);
+    try testing.expectEqualStrings("both.zig", results[0].path);
+}
+
+// ─── #569: multi-word `word` queries dead-end — no per-token fallback ───
+// `word` looked up the literal phrase in the inverted index, so an agent-shaped
+// query like "gateway websocket reconnect" returned zero hits even when every
+// token had plentiful hits. Multi-word queries must fall back to per-token
+// lookup, ranking files that hit more distinct tokens first.
+test "issue-569: multi-word word query falls back to per-token matching" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/both.zig", "const gateway = 1;\nconst websocket = 2;\n");
+    try explorer.indexFile("src/one.zig", "const gateway = 9;\n");
+
+    // searchWord powers the CLI `word` cmd.
+    const hits = try explorer.searchWord("gateway websocket", testing.allocator);
+    defer testing.allocator.free(hits);
+    try testing.expect(hits.len > 0);
+    explorer.mu.lockShared();
+    const top = explorer.word_index.hitPath(hits[0]);
+    explorer.mu.unlockShared();
+    // the file hitting BOTH tokens must outrank the single-token file
+    try testing.expectEqualStrings("src/both.zig", top);
+
+    // renderWord powers MCP codedb_word — same files, with the mode noted.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try explorer.renderWord("gateway websocket", testing.allocator, &out);
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/both.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "(tokenized)") != null);
+}
+
+test "fuzzy SIMD batch scorer matches scalar fuzzyScore exactly" {
+    // fuzzyFindFiles routes single-part queries through the SIMD-across-files
+    // scorer (fuzzyScoreBatch); it must produce results identical to the scalar
+    // fuzzyScore. All DP values are sums of exactly-representable small integers,
+    // so the comparison is bit-exact. FZL must equal explore.FZ_LANES.
+    const FZL = 8;
+    const paths = [_][]const u8{
+        "src/main.zig",
+        "extensions/codex/provider.ts",
+        "README.md",
+        "src/agents/getTokenProvider.test.ts",
+        "lib/auth/token.go",
+        "a",
+        "src/index.ts",
+        "very/deep/nested/path/to/some/TokenProvider.tsx",
+        "Provider.tsx",
+        "tokenprovider.js",
+        "ui/src/components/handle-request.tsx",
+        "x",
+        "config/settings.yaml",
+        "GETtokenPROVIDER",
+        "no_zzz_qqq.bin",
+        "pi/embedded/subscribe-session.ts",
+    };
+    const queries = [_][]const u8{
+        "getTokenProvider", "TokenProvider", "handleRequest", "token",
+        "provider.ts",      "x",             "main",          "session",
+        "PROVIDER",         "abcxyz",        "index",         "subscribe",
+    };
+
+    // Per-path: scalar fuzzyScore vs a single-element SIMD batch (mirrors the
+    // guards + presence prefilter fuzzyFindFiles applies before batching).
+    for (queries) |q| {
+        for (paths) |p| {
+            const expected = explore.fuzzyScore(q, p);
+            var got: ?f32 = null;
+            if (p.len != 0 and p.len <= 512 and q.len <= 128 and !explore.fuzzyPresenceReject(q, p)) {
+                var best: [FZL]f32 = undefined;
+                var matched: [FZL]u32 = undefined;
+                const one = [_][]const u8{p};
+                explore.fuzzyScoreBatch(q, &one, &best, &matched);
+                got = explore.fuzzyFinalize(q, p, best[0], matched[0]);
+            }
+            if (expected) |e| {
+                try testing.expect(got != null);
+                try testing.expectEqual(e, got.?);
+            } else {
+                try testing.expect(got == null);
+            }
+        }
+    }
+
+    // Full FZ_LANES-wide batch (all lanes active, mixed path lengths) exercises
+    // the per-lane length masking — every lane must still match scalar.
+    {
+        const q = "provider";
+        const batch = paths[0..FZL];
+        var best: [FZL]f32 = undefined;
+        var matched: [FZL]u32 = undefined;
+        explore.fuzzyScoreBatch(q, batch, &best, &matched);
+        for (batch, 0..) |p, l| {
+            const expected = explore.fuzzyScore(q, p);
+            const got: ?f32 = if (explore.fuzzyPresenceReject(q, p)) null else explore.fuzzyFinalize(q, p, best[l], matched[l]);
+            if (expected) |e| {
+                try testing.expect(got != null);
+                try testing.expectEqual(e, got.?);
+            } else {
+                try testing.expect(got == null);
+            }
+        }
+    }
+}
+
+test "find: symbol fast-path classifier + lookup" {
+    const mcp = @import("mcp.zig");
+    // Classifier: compound identifiers (camelCase / snake_case) route to symbols;
+    // filenames, single words, ALL-CAPS, and multi-part queries do not.
+    try testing.expect(mcp.looksLikeCompoundIdentifier("getTokenProvider"));
+    try testing.expect(mcp.looksLikeCompoundIdentifier("TokenProvider"));
+    try testing.expect(mcp.looksLikeCompoundIdentifier("handle_request"));
+    try testing.expect(mcp.looksLikeCompoundIdentifier("abortChatRunById"));
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("auth")); // single lowercase word
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("config"));
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("README")); // ALL-CAPS
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("provider.ts")); // dot -> filename
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("src/main")); // path separator
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("auth provider")); // space -> multi-part
+    try testing.expect(!mcp.looksLikeCompoundIdentifier("abc")); // too short
+
+    // renderSymbolDefsFast resolves a real symbol to its definition (def kinds
+    // ranked above import usages), and returns false WITHOUT writing for a miss.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try explorer.indexFile("src/auth.zig", "pub fn getTokenProvider() void {}\n");
+    try explorer.indexFile("src/use.zig", "const getTokenProvider = @import(\"auth.zig\").getTokenProvider;\n");
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try testing.expect(explorer.renderSymbolDefsFast("getTokenProvider", alloc, &out, 10));
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/auth.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "(function)") != null);
+
+    var miss: std.ArrayList(u8) = .empty;
+    defer miss.deinit(alloc);
+    try testing.expect(!explorer.renderSymbolDefsFast("nonexistentSymbolXyz", alloc, &miss, 10));
+    try testing.expectEqual(@as(usize, 0), miss.items.len);
+}
+
+test "issue-598: mention-dense tooling files cannot saturate past the path prior" {
+    // A bench script repeating the term six times per line scores 6.0×0.5=3.0
+    // and shrugs off the tooling-path prior, beating the implementation's 2.0
+    // (live: 'capture' put benchmarks/search-shootout/shootout.py in every
+    // top-8 slot). Cap the occurrence base for tooling paths BEFORE the
+    // stem/symbol boosts so density cannot dominate.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("bench/shootout.py", "captureTerm captureTerm captureTerm captureTerm captureTerm captureTerm\n");
+    try explorer.indexFile("src/owner.zig", "pub fn x() void { _ = captureTerm; _ = captureTerm; }\n");
+
+    const results = try explorer.searchContent("captureTerm", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expect(results.len >= 2);
+    try testing.expectEqualStrings("src/owner.zig", results[0].path);
+
+    // Eponymy must survive the cap: a query that IS the tooling file's stem
+    // still ranks that file first (the stem boost applies after the cap).
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    var explorer2 = Explorer.init(arena2.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    try explorer2.indexFile("install/install.sh", "echo install install install\n");
+    try explorer2.indexFile("src/setup.zig", "pub fn x() void { _ = install; }\n");
+
+    const results2 = try explorer2.searchContent("install", testing.allocator, 10);
+    defer {
+        for (results2) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results2);
+    }
+    try testing.expect(results2.len >= 2);
+    try testing.expectEqualStrings("install/install.sh", results2[0].path);
+}
+
+test "issue-550: call-graph distance ranks structurally-near files above equal-lexical noise" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    // target defines frobnicate (0 hops); helper only CALLS it (1 hop, reached
+    // through the reverse edge — pins the undirected walk); noise mentions it
+    // just as often with no call-graph relation.
+    try explorer.indexFile("src/target.zig",
+        \\pub fn frobnicate() void {
+        \\    frobnicate();
+        \\}
+    );
+    try explorer.indexFile("src/helper.zig",
+        \\pub fn run() void {
+        \\    frobnicate();
+        \\    frobnicate();
+        \\}
+    );
+    try explorer.indexFile("src/noise.zig",
+        \\pub fn unrelated() void {
+        \\    // frobnicate mention
+        \\    // frobnicate mention
+        \\}
+    );
+
+    const results = try explorer.searchContentRanked("frobnicate", testing.allocator, 8);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.line_text);
+            testing.allocator.free(r.path);
+        }
+        testing.allocator.free(results);
+    }
+
+    try testing.expect(results.len >= 3);
+    try testing.expectEqualStrings("src/target.zig", results[0].path);
+
+    var helper_score: f32 = -1.0;
+    var noise_score: f32 = -1.0;
+    for (results) |r| {
+        if (helper_score < 0 and std.mem.eql(u8, r.path, "src/helper.zig")) helper_score = r.score;
+        if (noise_score < 0 and std.mem.eql(u8, r.path, "src/noise.zig")) noise_score = r.score;
+    }
+    try testing.expect(helper_score > 0);
+    try testing.expect(noise_score > 0);
+    try testing.expect(helper_score > noise_score);
+}
+
+test "issue-550: co-change partner of the defining file outranks an unrelated equal-lexical file" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var explorer = Explorer.init(aa, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("src/def.zig",
+        \\pub fn frobnicate() void {}
+    );
+    // partner and stranger mention the term identically; only the injected
+    // co-change history distinguishes them.
+    try explorer.indexFile("src/partner.zig",
+        \\pub fn helper() void {
+        \\    // frobnicate mention
+        \\}
+    );
+    try explorer.indexFile("src/stranger.zig",
+        \\pub fn other() void {
+        \\    // frobnicate mention
+        \\}
+    );
+
+    const partners = try aa.alloc(git.CoChangePartner, 1);
+    partners[0] = .{ .path = "src/partner.zig", .count = 8 };
+    var cc = std.StringHashMap([]git.CoChangePartner).init(aa);
+    try cc.put("src/def.zig", partners);
+    explorer.co_change = cc;
+    explorer.co_change_attempted = true;
+
+    const results = try explorer.searchContent("frobnicate", testing.allocator, 8);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.line_text);
+            testing.allocator.free(r.path);
+        }
+        testing.allocator.free(results);
+    }
+
+    try testing.expect(results.len >= 3);
+    try testing.expectEqualStrings("src/def.zig", results[0].path);
+
+    var partner_score: f32 = -1.0;
+    var stranger_score: f32 = -1.0;
+    for (results) |r| {
+        if (partner_score < 0 and std.mem.eql(u8, r.path, "src/partner.zig")) partner_score = r.score;
+        if (stranger_score < 0 and std.mem.eql(u8, r.path, "src/stranger.zig")) stranger_score = r.score;
+    }
+    try testing.expect(partner_score > 0);
+    try testing.expect(stranger_score > 0);
+    try testing.expect(partner_score > stranger_score);
+}
+
+// ── searchContent result cache ────────────────────────────────────────────────
+
+fn freeSearchResults(results: []const SearchResult) void {
+    for (results) |r| {
+        testing.allocator.free(r.path);
+        testing.allocator.free(r.line_text);
+    }
+    testing.allocator.free(results);
+}
+
+test "search-cache: repeated query is served from cache with identical caller-owned results" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    // Plain content mention (no symbol named like the query) so no lazy
+    // ranking build bumps the generation during the first search.
+    try explorer.indexFile("src/alpha.zig", "const a = 1; // zebraword here\nconst b = 2; // zebraword again\n");
+
+    const r1 = try explorer.searchContent("zebraword", testing.allocator, 10);
+    defer freeSearchResults(r1);
+    try testing.expect(r1.len >= 2);
+    try testing.expectEqual(@as(u64, 0), explorer.search_cache.hits);
+
+    const r2 = try explorer.searchContent("zebraword", testing.allocator, 10);
+    defer freeSearchResults(r2);
+    try testing.expectEqual(@as(u64, 1), explorer.search_cache.hits);
+    try testing.expectEqual(r1.len, r2.len);
+    for (r1, r2) |a, b| {
+        try testing.expectEqualStrings(a.path, b.path);
+        try testing.expectEqual(a.line_num, b.line_num);
+        try testing.expectEqualStrings(a.line_text, b.line_text);
+    }
+}
+
+test "search-cache: indexFile invalidates cached results" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/one.zig", "const a = 1; // quaggatok\n");
+
+    const r1 = try explorer.searchContent("quaggatok", testing.allocator, 10);
+    freeSearchResults(r1);
+    try explorer.indexFile("src/two.zig", "const b = 2; // quaggatok\n");
+
+    const r2 = try explorer.searchContent("quaggatok", testing.allocator, 10);
+    defer freeSearchResults(r2);
+    // The new file must appear — a stale hit would still show one result.
+    try testing.expectEqual(@as(u64, 0), explorer.search_cache.hits);
+    var saw_two = false;
+    for (r2) |r| {
+        if (std.mem.eql(u8, r.path, "src/two.zig")) saw_two = true;
+    }
+    try testing.expect(saw_two);
+}
+
+test "search-cache: removeFile invalidates cached results" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/keep.zig", "const a = 1; // okapitok\n");
+    try explorer.indexFile("src/gone.zig", "const b = 2; // okapitok\n");
+
+    const r1 = try explorer.searchContent("okapitok", testing.allocator, 10);
+    try testing.expect(r1.len == 2);
+    freeSearchResults(r1);
+    explorer.removeFile("src/gone.zig");
+
+    const r2 = try explorer.searchContent("okapitok", testing.allocator, 10);
+    defer freeSearchResults(r2);
+    try testing.expectEqual(@as(u64, 0), explorer.search_cache.hits);
+    for (r2) |r| {
+        try testing.expect(!std.mem.eql(u8, r.path, "src/gone.zig"));
+    }
+}
+
+test "search-cache: ranking env toggle prevents stale hits" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/env.zig", "const a = 1; // gnutok\n");
+
+    const r1 = try explorer.searchContent("gnutok", testing.allocator, 10);
+    freeSearchResults(r1);
+
+    // Different fingerprint -> the cached entry must NOT be served.
+    _ = setenv("CODEDB_RVSM_SIZE_PRIOR", "1", 1);
+    defer _ = unsetenv("CODEDB_RVSM_SIZE_PRIOR");
+    const r2 = try explorer.searchContent("gnutok", testing.allocator, 10);
+    freeSearchResults(r2);
+    try testing.expectEqual(@as(u64, 0), explorer.search_cache.hits);
+
+    // Same fingerprint as the stored entry -> now it hits.
+    const r3 = try explorer.searchContent("gnutok", testing.allocator, 10);
+    freeSearchResults(r3);
+    try testing.expectEqual(@as(u64, 1), explorer.search_cache.hits);
+}
+
+test "search-cache: CODEDB_NO_SEARCH_CACHE disables caching entirely" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/off.zig", "const a = 1; // dingotok\n");
+
+    _ = setenv("CODEDB_NO_SEARCH_CACHE", "1", 1);
+    defer _ = unsetenv("CODEDB_NO_SEARCH_CACHE");
+    const r1 = try explorer.searchContent("dingotok", testing.allocator, 10);
+    freeSearchResults(r1);
+    const r2 = try explorer.searchContent("dingotok", testing.allocator, 10);
+    freeSearchResults(r2);
+    try testing.expectEqual(@as(u64, 0), explorer.search_cache.hits);
+    try testing.expectEqual(@as(u64, 0), explorer.search_cache.misses);
+    try testing.expectEqual(@as(usize, 0), explorer.search_cache.entries.items.len);
+}
+
+test "search-cache: entry count stays bounded under distinct queries" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/bound.zig", "const a = 1; // boundtok\n");
+
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        var qbuf: [32]u8 = undefined;
+        const q = try std.fmt.bufPrint(&qbuf, "boundquery{d}", .{i});
+        const r = try explorer.searchContent(q, testing.allocator, 10);
+        freeSearchResults(r);
+    }
+    try testing.expect(explorer.search_cache.entries.items.len <= 64);
+}
+
+test "search-cache: renderPlainSearch repeated query is served from the render cache" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/render.zig", "const a = 1; // ibextok\nconst b = 2; // ibextok\n");
+
+    var out1: std.ArrayList(u8) = .empty;
+    defer out1.deinit(testing.allocator);
+    // renderPlainSearch only renders when Tier 0 alone can satisfy
+    // max_results, so ask for exactly the two hits the file contains.
+    const rendered1 = try explorer.renderPlainSearch("ibextok", testing.allocator, &out1, 2, false);
+    try testing.expect(rendered1);
+    try testing.expectEqual(@as(u64, 0), explorer.plain_render_cache.hits);
+
+    var out2: std.ArrayList(u8) = .empty;
+    defer out2.deinit(testing.allocator);
+    const rendered2 = try explorer.renderPlainSearch("ibextok", testing.allocator, &out2, 2, false);
+    try testing.expect(rendered2);
+    try testing.expectEqual(@as(u64, 1), explorer.plain_render_cache.hits);
+    try testing.expectEqualStrings(out1.items, out2.items);
+}
+
+test "search-cache: renderPlainSearch cache is invalidated by indexFile" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/r1.zig", "const a = 1; // lemurtok\n");
+
+    var out1: std.ArrayList(u8) = .empty;
+    defer out1.deinit(testing.allocator);
+    const rendered1 = try explorer.renderPlainSearch("lemurtok", testing.allocator, &out1, 1, false);
+    try testing.expect(rendered1);
+
+    try explorer.indexFile("src/r2.zig", "const b = 2; // lemurtok\n");
+
+    // The generation moved, so the cached rendering must NOT be served.
+    var out2: std.ArrayList(u8) = .empty;
+    defer out2.deinit(testing.allocator);
+    _ = try explorer.renderPlainSearch("lemurtok", testing.allocator, &out2, 1, false);
+    try testing.expectEqual(@as(u64, 0), explorer.plain_render_cache.hits);
+}
+
+test "search-cache: hit restores the producing search's breakdown provenance" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/bd.zig", "const a = 1; // pandatok\nconst b = 2; // pandatok\n");
+
+    const r1 = try explorer.searchContent("pandatok", testing.allocator, 10);
+    freeSearchResults(r1);
+    const fresh = explorer.last_search_breakdown;
+    try testing.expect(!fresh.cache_hit);
+
+    // Clobber the breakdown with a different query so the hit must restore
+    // it, not inherit whatever search ran last (mcp.zig's telemetry and the
+    // provenance meta both read last_search_breakdown after the call).
+    const other = try explorer.searchContent("nosuchtok", testing.allocator, 10);
+    freeSearchResults(other);
+
+    const r2 = try explorer.searchContent("pandatok", testing.allocator, 10);
+    defer freeSearchResults(r2);
+    const restored = explorer.last_search_breakdown;
+    try testing.expectEqual(@as(u64, 1), explorer.search_cache.hits);
+    try testing.expect(restored.cache_hit);
+    try testing.expectEqual(fresh.tier_reached, restored.tier_reached);
+    try testing.expectEqual(fresh.candidate_count, restored.candidate_count);
+    try testing.expectEqual(fresh.result_count, restored.result_count);
+    // A hit pays none of the tier timings.
+    try testing.expectEqual(@as(i128, 0), restored.tier0_ns);
+    try testing.expectEqual(@as(i128, 0), restored.rerank_ns);
+}
+
+test "search-cache: ranked repeated query is served from the ranked cache" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/rank.zig", "const a = 1; // bisontok grazes\nconst b = 2; // bisontok grazes more\n");
+
+    const r1 = try explorer.searchContentRanked("bisontok grazes", testing.allocator, 10);
+    defer freeSearchResults(r1);
+    try testing.expect(r1.len >= 1);
+    try testing.expectEqual(@as(u64, 0), explorer.ranked_cache.hits);
+
+    const r2 = try explorer.searchContentRanked("bisontok grazes", testing.allocator, 10);
+    defer freeSearchResults(r2);
+    try testing.expectEqual(@as(u64, 1), explorer.ranked_cache.hits);
+    try testing.expectEqual(r1.len, r2.len);
+    for (r1, r2) |a, b| {
+        try testing.expectEqualStrings(a.path, b.path);
+        try testing.expectEqual(a.line_num, b.line_num);
+        try testing.expectEqualStrings(a.line_text, b.line_text);
+        try testing.expectEqual(a.score, b.score);
+    }
+    // The plain searchContent cache must be untouched.
+    try testing.expectEqual(@as(u64, 0), explorer.search_cache.hits);
+    try testing.expectEqual(@as(usize, 0), explorer.search_cache.entries.items.len);
+}
+
+test "search-cache: ranked and plain caches never share entries for the same key" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/iso.zig", "const a = 1; // elktok\n");
+
+    // Prime the PLAIN cache with this (query, max_results) key.
+    const p = try explorer.searchContent("elktok", testing.allocator, 10);
+    freeSearchResults(p);
+    // The first RANKED call with the identical key must MISS (a shared
+    // cache would serve the plain results here).
+    const r = try explorer.searchContentRanked("elktok", testing.allocator, 10);
+    freeSearchResults(r);
+    try testing.expectEqual(@as(u64, 0), explorer.ranked_cache.hits);
+    try testing.expectEqual(@as(u64, 1), explorer.ranked_cache.misses);
+}
+
+test "search-cache: ranked cache is invalidated by indexFile" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/ra.zig", "const a = 1; // moosetok wanders\n");
+
+    const r1 = try explorer.searchContentRanked("moosetok wanders", testing.allocator, 10);
+    freeSearchResults(r1);
+    try explorer.indexFile("src/rb.zig", "const b = 2; // moosetok wanders too\n");
+
+    const r2 = try explorer.searchContentRanked("moosetok wanders", testing.allocator, 10);
+    defer freeSearchResults(r2);
+    try testing.expectEqual(@as(u64, 0), explorer.ranked_cache.hits);
+    var saw_new = false;
+    for (r2) |res| {
+        if (std.mem.eql(u8, res.path, "src/rb.zig")) saw_new = true;
+    }
+    try testing.expect(saw_new);
+}
+
+test "skip-trigram: adoptTrigramIndex prunes covered files from the tier-3 scan set" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    // Outline-only indexing mirrors snapshot restore: files land in
+    // skip_trigram_files with no trigram coverage.
+    try explorer.indexFileSkipTrigram("src/cov.zig", "const a = 1; // ocelottok\n");
+    try explorer.indexFileSkipTrigram("src/uncov.zig", "const b = 2; // ocelottok\n");
+    try testing.expectEqual(@as(usize, 2), explorer.skipTrigramFileCount());
+
+    // Build a trigram index covering only ONE of the two files and adopt it
+    // (stands in for the mmap disk load all server modes perform).
+    var tri = TrigramIndex.init(testing.allocator);
+    try tri.indexFile("src/cov.zig", "const a = 1; // ocelottok\n");
+    explorer.adoptTrigramIndex(.{ .heap = tri });
+
+    // The covered file must leave the scan set; the uncovered one must stay.
+    try testing.expectEqual(@as(usize, 1), explorer.skipTrigramFileCount());
+    try testing.expect(explorer.skip_trigram_files.contains("src/uncov.zig"));
+    try testing.expect(!explorer.skip_trigram_files.contains("src/cov.zig"));
+
+    // Recall must be intact: tier 1 serves the covered file, tier 3 the rest.
+    const r = try explorer.searchContent("ocelottok", testing.allocator, 10);
+    defer freeSearchResults(r);
+    try testing.expectEqual(@as(usize, 2), r.len);
+}
+
+test "skip-trigram: adoptTrigramBase keeps freshness-reindexed files as a masking overlay" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp_dir.dir.realPathFile(io, ".", &path_buf);
+    const tmp_path = path_buf[0..tmp_path_len];
+
+    // On-disk index: stale content for changed.zig, current for stable.zig.
+    {
+        var seed = TrigramIndex.init(testing.allocator);
+        defer seed.deinit();
+        try seed.indexFile("src/changed.zig", "const old = 1; // staletok\n");
+        try seed.indexFile("src/stable.zig", "const s = 2; // stabletok\n");
+        try seed.writeToDisk(io, tmp_path, null);
+    }
+
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    // Mirror snapshot load: the unchanged file restores outline-only (skip
+    // set), the changed file gets a full freshness reindex into the heap
+    // trigram BEFORE the disk index is adopted.
+    try explorer.indexFileSkipTrigram("src/stable.zig", "const s = 2; // stabletok\n");
+    try explorer.indexFile("src/changed.zig", "const new = 1; // freshtok\n");
+
+    const base = MmapTrigramIndex.initFromDisk(io, tmp_path, testing.allocator) orelse
+        return error.MmapInitFailed;
+    explorer.adoptTrigramBase(base);
+
+    // Both files are now trigram-covered: the scan set must be empty.
+    try testing.expectEqual(@as(usize, 0), explorer.skipTrigramFileCount());
+
+    // The overlay's NEW content wins for the reindexed file...
+    const fresh = try explorer.searchContent("freshtok", testing.allocator, 10);
+    defer freeSearchResults(fresh);
+    try testing.expectEqual(@as(usize, 1), fresh.len);
+    try testing.expectEqualStrings("src/changed.zig", fresh[0].path);
+    // ...its stale base entry is masked...
+    const stale = try explorer.searchContent("staletok", testing.allocator, 10);
+    defer freeSearchResults(stale);
+    try testing.expectEqual(@as(usize, 0), stale.len);
+    // ...and base-only files still resolve through the adopted mmap.
+    const stable = try explorer.searchContent("stabletok", testing.allocator, 10);
+    defer freeSearchResults(stable);
+    try testing.expectEqual(@as(usize, 1), stable.len);
+    try testing.expectEqualStrings("src/stable.zig", stable[0].path);
+}
+
+test "skip-trigram: rebuildTrigrams prunes the files it just covered" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFileSkipTrigram("src/rt.zig", "const a = 1; // marmottok\n");
+    try testing.expectEqual(@as(usize, 1), explorer.skipTrigramFileCount());
+
+    try explorer.rebuildTrigrams();
+    try testing.expectEqual(@as(usize, 0), explorer.skipTrigramFileCount());
+
+    const r = try explorer.searchContent("marmottok", testing.allocator, 10);
+    defer freeSearchResults(r);
+    try testing.expectEqual(@as(usize, 1), r.len);
+}
+
+// ── warmup: queries.log replay ───────────────────────────────────────────────
+
+const warmup = @import("warmup.zig");
+
+test "warmup: topQueries ranks by repeat count, skips malformed and non-search lines" {
+    const log =
+        \\{"ts":1,"ev":"query","tool":"codedb_search","query":"alpha","result_bytes":10,"latency_us":5}
+        \\{"ts":2,"ev":"query","tool":"codedb_search","query":"beta","result_bytes":10,"latency_us":5}
+        \\{"ts":3,"ev":"query","tool":"codedb_search","query":"beta","result_bytes":10,"latency_us":5}
+        \\not json at all
+        \\{"ts":4,"ev":"query","tool":"codedb_word","query":"gamma","result_bytes":10,"latency_us":5}
+        \\{"ts":5,"ev":"file_access","tool":"codedb_read","query":"delta"}
+        \\{"ts":6,"ev":"query","tool":"codedb_search","query":"beta","result_bytes":10,"latency_us":5}
+        \\{"ts":7,"ev":"query","tool":"codedb_search","query":"alpha","result_bytes":10,"latency_us":5}
+        \\{"ts":8,"ev":"query","tool":"codedb_search","query":""}
+    ;
+    const qs = try warmup.topQueries(testing.allocator, log, 16);
+    defer warmup.freeQueries(testing.allocator, qs);
+    try testing.expectEqual(@as(usize, 2), qs.len);
+    try testing.expectEqualStrings("beta", qs[0]);
+    try testing.expectEqualStrings("alpha", qs[1]);
+}
+
+test "warmup: topQueries respects the max cap" {
+    var log: std.ArrayList(u8) = .empty;
+    defer log.deinit(testing.allocator);
+    const w = cio.listWriter(&log, testing.allocator);
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        try w.print("{{\"ts\":{d},\"ev\":\"query\",\"tool\":\"codedb_search\",\"query\":\"warmq{d}\",\"result_bytes\":1,\"latency_us\":1}}\n", .{ i, i });
+    }
+    const qs = try warmup.topQueries(testing.allocator, log.items, 3);
+    defer warmup.freeQueries(testing.allocator, qs);
+    try testing.expectEqual(@as(usize, 3), qs.len);
+}
+
+test "warmup: replay pre-fills the result caches so real calls hit" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    // 20+ matching lines so the MCP fast path (renderPlainSearch with the
+    // default max_results=20) renders from Tier 0 and fills the render cache.
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(testing.allocator);
+    const cw = cio.listWriter(&content, testing.allocator);
+    var i: usize = 0;
+    while (i < 24) : (i += 1) try cw.print("const v{d} = 1; // warmtok\n", .{i});
+    try explorer.indexFile("src/warm.zig", content.items);
+    // A sparse query that renderPlainSearch can NOT satisfy, so replay falls
+    // back to searchContentAuto and fills the searchContent cache instead.
+    try explorer.indexFile("src/rare.zig", "const r = 1; // raretok\n");
+
+    var shutdown = std.atomic.Value(bool).init(false);
+    // A multi-word query routes through searchContentAuto to the ranked
+    // (BM25) path, exercising the ranked cache.
+    const queries = [_][]const u8{ "warmtok", "raretok", "raretok warmtok" };
+    warmup.replay(&explorer, testing.allocator, &queries, &shutdown);
+
+    // Real MCP-handler-shaped calls must now be cache hits.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expect(try explorer.renderPlainSearch("warmtok", testing.allocator, &out, 20, false));
+    try testing.expectEqual(@as(u64, 1), explorer.plain_render_cache.hits);
+
+    const r = try explorer.searchContent("raretok", testing.allocator, 21);
+    defer freeSearchResults(r);
+    try testing.expectEqual(@as(u64, 1), explorer.search_cache.hits);
+
+    const rr = try explorer.searchContentRanked("raretok warmtok", testing.allocator, 21);
+    defer freeSearchResults(rr);
+    try testing.expectEqual(@as(u64, 1), explorer.ranked_cache.hits);
+}
+
+test "warmup: replay honors shutdown" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/stop.zig", "const s = 1; // stoptok\n");
+    var shutdown = std.atomic.Value(bool).init(true);
+    const queries = [_][]const u8{"stoptok"};
+    warmup.replay(&explorer, testing.allocator, &queries, &shutdown);
+    try testing.expectEqual(@as(usize, 0), explorer.search_cache.entries.items.len);
+    try testing.expectEqual(@as(usize, 0), explorer.ranked_cache.entries.items.len);
+    try testing.expectEqual(@as(usize, 0), explorer.plain_render_cache.entries.items.len);
+}
+
+test "search-cache: renderPlainSearch hit restores the producing search's breakdown" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/rbd.zig", "const a = 1; // foxtok\nconst b = 2; // foxtok\n");
+
+    var out1: std.ArrayList(u8) = .empty;
+    defer out1.deinit(testing.allocator);
+    try testing.expect(try explorer.renderPlainSearch("foxtok", testing.allocator, &out1, 2, false));
+    const fresh = explorer.last_search_breakdown;
+    try testing.expect(!fresh.cache_hit);
+
+    explorer.last_search_breakdown = .{ .tier_reached = 7 };
+
+    var out2: std.ArrayList(u8) = .empty;
+    defer out2.deinit(testing.allocator);
+    try testing.expect(try explorer.renderPlainSearch("foxtok", testing.allocator, &out2, 2, false));
+    const restored = explorer.last_search_breakdown;
+    try testing.expectEqual(@as(u64, 1), explorer.plain_render_cache.hits);
+    try testing.expect(restored.cache_hit);
+    try testing.expectEqual(fresh.tier_reached, restored.tier_reached);
+    try testing.expectEqual(fresh.result_count, restored.result_count);
+    try testing.expectEqual(@as(i128, 0), restored.tier0_ns);
 }

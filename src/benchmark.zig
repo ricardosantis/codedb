@@ -88,6 +88,12 @@ fn benchSearch(explorer: *Explorer, query: []const u8, n: usize, alloc: std.mem.
         for (r) |e| alloc.free(e.line_text);
         alloc.free(r);
     }
+    if (cio.posixGetenv("CODEDB_BENCH_BREAKDOWN") != null) {
+        const b = explorer.last_search_breakdown;
+        var buf: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "  breakdown[{s}]: t0={d}ns t05={d}ns t1={d}ns t2={d}ns t3={d}ns t4={d}ns t5={d}ns rerank={d}ns tier_reached={d} cands={d} results={d}\n", .{ query, b.tier0_ns, b.tier05_ns, b.tier1_ns, b.tier2_ns, b.tier3_ns, b.tier4_ns, b.tier5_ns, b.rerank_ns, b.tier_reached, b.candidate_count, b.result_count }) catch "";
+        cio.File.stderr().writeAll(msg) catch {};
+    }
     return .{ .name = query, .kind = "search", .hits = hits, .avg_ns = total / n };
 }
 
@@ -274,7 +280,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     cio.setProcessArgs(init.args.vector);
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+    const alloc = if (cio.posixGetenv("CODEDB_BENCH_CALLOC") != null) std.heap.c_allocator else gpa.allocator();
 
     var threaded: std.Io.Threaded = .init(alloc, .{});
     defer threaded.deinit();
@@ -304,12 +310,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
     const index_ns = t0.read();
 
-    // Queries
+    // Queries — the per-query rows measure UNCACHED searches so they stay
+    // comparable across versions; one extra row shows the result-cache hit
+    // latency for a representative query.
+    cio.posixSetenv("CODEDB_NO_SEARCH_CACHE", "1");
     var qlist: std.ArrayList(QueryResult) = .empty;
     defer qlist.deinit(alloc);
 
     for ([_][]const u8{ "middleware", "authentication", "webhook", "database", "error" }) |q|
         (qlist.append(alloc, try benchSearch(&explorer, q, args.iterations, alloc)) catch {});
+    cio.posixUnsetenv("CODEDB_NO_SEARCH_CACHE");
+    if (benchSearch(&explorer, "error", args.iterations, alloc) catch null) |cached_qr| {
+        var qr = cached_qr;
+        qr.kind = "cached";
+        qlist.append(alloc, qr) catch {};
+    }
     for ([_][]const u8{ "request", "response", "config", "error" }) |q|
         (qlist.append(alloc, try benchWord(&explorer, q, args.iterations, alloc)) catch {});
     for ([_][]const u8{ "init", "main", "handleRequest", "render" }) |q|
