@@ -310,12 +310,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
     const index_ns = t0.read();
 
-    // Queries
+    // Queries — the per-query rows measure UNCACHED searches so they stay
+    // comparable across versions; one extra row shows the result-cache hit
+    // latency for a representative query.
+    cio.posixSetenv("CODEDB_NO_SEARCH_CACHE", "1");
     var qlist: std.ArrayList(QueryResult) = .empty;
     defer qlist.deinit(alloc);
 
     for ([_][]const u8{ "middleware", "authentication", "webhook", "database", "error" }) |q|
         (qlist.append(alloc, try benchSearch(&explorer, q, args.iterations, alloc)) catch {});
+    cio.posixUnsetenv("CODEDB_NO_SEARCH_CACHE");
+    if (benchSearch(&explorer, "error", args.iterations, alloc) catch null) |cached_qr| {
+        var qr = cached_qr;
+        qr.kind = "cached";
+        qlist.append(alloc, qr) catch {};
+    }
     for ([_][]const u8{ "request", "response", "config", "error" }) |q|
         (qlist.append(alloc, try benchWord(&explorer, q, args.iterations, alloc)) catch {});
     for ([_][]const u8{ "init", "main", "handleRequest", "render" }) |q|

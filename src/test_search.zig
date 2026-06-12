@@ -2298,3 +2298,167 @@ test "issue-550: co-change partner of the defining file outranks an unrelated eq
     try testing.expect(stranger_score > 0);
     try testing.expect(partner_score > stranger_score);
 }
+
+// ── searchContent result cache ────────────────────────────────────────────────
+
+fn freeSearchResults(results: []const SearchResult) void {
+    for (results) |r| {
+        testing.allocator.free(r.path);
+        testing.allocator.free(r.line_text);
+    }
+    testing.allocator.free(results);
+}
+
+test "search-cache: repeated query is served from cache with identical caller-owned results" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    // Plain content mention (no symbol named like the query) so no lazy
+    // ranking build bumps the generation during the first search.
+    try explorer.indexFile("src/alpha.zig", "const a = 1; // zebraword here\nconst b = 2; // zebraword again\n");
+
+    const r1 = try explorer.searchContent("zebraword", testing.allocator, 10);
+    defer freeSearchResults(r1);
+    try testing.expect(r1.len >= 2);
+    try testing.expectEqual(@as(u64, 0), explorer.search_cache.hits);
+
+    const r2 = try explorer.searchContent("zebraword", testing.allocator, 10);
+    defer freeSearchResults(r2);
+    try testing.expectEqual(@as(u64, 1), explorer.search_cache.hits);
+    try testing.expectEqual(r1.len, r2.len);
+    for (r1, r2) |a, b| {
+        try testing.expectEqualStrings(a.path, b.path);
+        try testing.expectEqual(a.line_num, b.line_num);
+        try testing.expectEqualStrings(a.line_text, b.line_text);
+    }
+}
+
+test "search-cache: indexFile invalidates cached results" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/one.zig", "const a = 1; // quaggatok\n");
+
+    const r1 = try explorer.searchContent("quaggatok", testing.allocator, 10);
+    freeSearchResults(r1);
+    try explorer.indexFile("src/two.zig", "const b = 2; // quaggatok\n");
+
+    const r2 = try explorer.searchContent("quaggatok", testing.allocator, 10);
+    defer freeSearchResults(r2);
+    // The new file must appear — a stale hit would still show one result.
+    try testing.expectEqual(@as(u64, 0), explorer.search_cache.hits);
+    var saw_two = false;
+    for (r2) |r| {
+        if (std.mem.eql(u8, r.path, "src/two.zig")) saw_two = true;
+    }
+    try testing.expect(saw_two);
+}
+
+test "search-cache: removeFile invalidates cached results" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/keep.zig", "const a = 1; // okapitok\n");
+    try explorer.indexFile("src/gone.zig", "const b = 2; // okapitok\n");
+
+    const r1 = try explorer.searchContent("okapitok", testing.allocator, 10);
+    try testing.expect(r1.len == 2);
+    freeSearchResults(r1);
+    explorer.removeFile("src/gone.zig");
+
+    const r2 = try explorer.searchContent("okapitok", testing.allocator, 10);
+    defer freeSearchResults(r2);
+    try testing.expectEqual(@as(u64, 0), explorer.search_cache.hits);
+    for (r2) |r| {
+        try testing.expect(!std.mem.eql(u8, r.path, "src/gone.zig"));
+    }
+}
+
+test "search-cache: ranking env toggle prevents stale hits" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/env.zig", "const a = 1; // gnutok\n");
+
+    const r1 = try explorer.searchContent("gnutok", testing.allocator, 10);
+    freeSearchResults(r1);
+
+    // Different fingerprint -> the cached entry must NOT be served.
+    _ = setenv("CODEDB_RVSM_SIZE_PRIOR", "1", 1);
+    defer _ = unsetenv("CODEDB_RVSM_SIZE_PRIOR");
+    const r2 = try explorer.searchContent("gnutok", testing.allocator, 10);
+    freeSearchResults(r2);
+    try testing.expectEqual(@as(u64, 0), explorer.search_cache.hits);
+
+    // Same fingerprint as the stored entry -> now it hits.
+    const r3 = try explorer.searchContent("gnutok", testing.allocator, 10);
+    freeSearchResults(r3);
+    try testing.expectEqual(@as(u64, 1), explorer.search_cache.hits);
+}
+
+test "search-cache: CODEDB_NO_SEARCH_CACHE disables caching entirely" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/off.zig", "const a = 1; // dingotok\n");
+
+    _ = setenv("CODEDB_NO_SEARCH_CACHE", "1", 1);
+    defer _ = unsetenv("CODEDB_NO_SEARCH_CACHE");
+    const r1 = try explorer.searchContent("dingotok", testing.allocator, 10);
+    freeSearchResults(r1);
+    const r2 = try explorer.searchContent("dingotok", testing.allocator, 10);
+    freeSearchResults(r2);
+    try testing.expectEqual(@as(u64, 0), explorer.search_cache.hits);
+    try testing.expectEqual(@as(u64, 0), explorer.search_cache.misses);
+    try testing.expectEqual(@as(usize, 0), explorer.search_cache.entries.items.len);
+}
+
+test "search-cache: entry count stays bounded under distinct queries" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/bound.zig", "const a = 1; // boundtok\n");
+
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        var qbuf: [32]u8 = undefined;
+        const q = try std.fmt.bufPrint(&qbuf, "boundquery{d}", .{i});
+        const r = try explorer.searchContent(q, testing.allocator, 10);
+        freeSearchResults(r);
+    }
+    try testing.expect(explorer.search_cache.entries.items.len <= 64);
+}
+
+test "search-cache: renderPlainSearch repeated query is served from the render cache" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/render.zig", "const a = 1; // ibextok\nconst b = 2; // ibextok\n");
+
+    var out1: std.ArrayList(u8) = .empty;
+    defer out1.deinit(testing.allocator);
+    // renderPlainSearch only renders when Tier 0 alone can satisfy
+    // max_results, so ask for exactly the two hits the file contains.
+    const rendered1 = try explorer.renderPlainSearch("ibextok", testing.allocator, &out1, 2, false);
+    try testing.expect(rendered1);
+    try testing.expectEqual(@as(u64, 0), explorer.plain_render_cache.hits);
+
+    var out2: std.ArrayList(u8) = .empty;
+    defer out2.deinit(testing.allocator);
+    const rendered2 = try explorer.renderPlainSearch("ibextok", testing.allocator, &out2, 2, false);
+    try testing.expect(rendered2);
+    try testing.expectEqual(@as(u64, 1), explorer.plain_render_cache.hits);
+    try testing.expectEqualStrings(out1.items, out2.items);
+}
+
+test "search-cache: renderPlainSearch cache is invalidated by indexFile" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/r1.zig", "const a = 1; // lemurtok\n");
+
+    var out1: std.ArrayList(u8) = .empty;
+    defer out1.deinit(testing.allocator);
+    const rendered1 = try explorer.renderPlainSearch("lemurtok", testing.allocator, &out1, 1, false);
+    try testing.expect(rendered1);
+
+    try explorer.indexFile("src/r2.zig", "const b = 2; // lemurtok\n");
+
+    // The generation moved, so the cached rendering must NOT be served.
+    var out2: std.ArrayList(u8) = .empty;
+    defer out2.deinit(testing.allocator);
+    _ = try explorer.renderPlainSearch("lemurtok", testing.allocator, &out2, 1, false);
+    try testing.expectEqual(@as(u64, 0), explorer.plain_render_cache.hits);
+}
