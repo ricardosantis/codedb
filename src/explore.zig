@@ -2009,11 +2009,78 @@ pub const Explorer = struct {
     fn bumpSearchGen(self: *Explorer) void {
         _ = self.search_gen.fetchAdd(1, .release);
     }
+    /// Remove every skip_trigram_files entry the current trigram index
+    /// covers. Caller must hold the EXCLUSIVE lock. Snapshot restore parks
+    /// every file in the skip set (#507/#537 — it cannot know what a disk
+    /// trigram index covers), so without this reconciliation tier 3
+    /// content-scans the ENTIRE project on each fall-through query even
+    /// though the loaded index already answers for those files. Keys are
+    /// borrowed from `outlines`, so removal never frees.
+    fn pruneSkipTrigramLocked(self: *Explorer) void {
+        var to_remove: std.ArrayList([]const u8) = .empty;
+        defer to_remove.deinit(self.allocator);
+        var it = self.skip_trigram_files.keyIterator();
+        while (it.next()) |k| {
+            if (self.trigram_index.containsFile(k.*)) to_remove.append(self.allocator, k.*) catch break;
+        }
+        for (to_remove.items) |k| _ = self.skip_trigram_files.remove(k);
+    }
+
+    /// Swap in a trigram index (disk mmap load / post-scan build) and
+    /// reconcile the skip set with what it covers. Every external
+    /// trigram_index replacement must go through here — a bare swap leaves
+    /// stale skip_trigram_files entries (see pruneSkipTrigramLocked).
+    pub fn adoptTrigramIndex(self: *Explorer, new_index: AnyTrigramIndex) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.bumpSearchGen();
+        self.trigram_index.deinit();
+        self.trigram_index = new_index;
+        self.pruneSkipTrigramLocked();
+    }
+
+    /// Adopt a disk-loaded mmap trigram as the BASE index, keeping any files
+    /// already trigram-indexed in the current heap index (snapshot freshness
+    /// reindex touches changed files BEFORE the disk load runs) as a masked
+    /// overlay so their newer content wins. Replaces the `fileCount() > 0`
+    /// early-return that let a single reindexed file block the disk load
+    /// entirely — leaving tier 3 to content-scan the whole project on every
+    /// fall-through query.
+    pub fn adoptTrigramBase(self: *Explorer, base: idx.MmapTrigramIndex) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.bumpSearchGen();
+        switch (self.trigram_index) {
+            .heap => |heap_copy| {
+                if (heap_copy.fileCount() == 0) {
+                    var old = heap_copy;
+                    old.deinit();
+                    self.trigram_index = .{ .mmap = base };
+                } else {
+                    self.trigram_index = .{ .mmap_overlay = .{
+                        .base = base,
+                        .overlay = heap_copy,
+                        .masked = std.StringHashMap(void).init(self.allocator),
+                    } };
+                    var it = self.trigram_index.mmap_overlay.overlay.file_trigrams.keyIterator();
+                    while (it.next()) |k| self.trigram_index.mmap_overlay.mask(k.*);
+                }
+            },
+            .mmap, .mmap_overlay => {
+                // Already disk-backed — nothing to gain from a second base.
+                var dupe_base = base;
+                dupe_base.deinit();
+            },
+        }
+        self.pruneSkipTrigramLocked();
+    }
+
     /// Rebuild trigram index from the stored file contents.
     /// Used after a cache hit to populate trigrams when they were skipped during the fast scan.
     pub fn rebuildTrigrams(self: *Explorer) !void {
         self.mu.lock();
         defer self.mu.unlock();
+        self.bumpSearchGen();
         var iter = self.contents.iterator();
         while (iter.next()) |entry| {
             // Skip large files to prevent OOM on large repos
@@ -2021,10 +2088,12 @@ pub const Explorer = struct {
             self.trigram_index.indexFile(entry.key_ptr.*, entry.value_ptr.*) catch |err| switch (err) {
                 error.OutOfMemory => {
                     std.log.warn("trigram OOM, skipping remaining files", .{});
+                    self.pruneSkipTrigramLocked();
                     return;
                 },
             };
         }
+        self.pruneSkipTrigramLocked();
     }
 
     /// Rebuild the inverted word index from cached contents when complete, or
