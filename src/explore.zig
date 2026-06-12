@@ -2128,6 +2128,17 @@ pub const Explorer = struct {
         defer self.mu.unlock();
         if (self.symbol_index_complete) return;
         self.bumpSearchGen();
+        // Rebuild from scratch: entries indexed BEFORE the index was marked
+        // incomplete would otherwise be duplicated by the loop below (it
+        // passes had_prior=false, which skips per-file eviction). The index
+        // is authoritative once complete — lookups no longer outline-scan —
+        // so it must hold exactly one entry per live symbol.
+        var sym_iter = self.symbol_index.iterator();
+        while (sym_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.symbol_index.clearRetainingCapacity();
         self.symbol_index_complete = true;
         var it = self.outlines.iterator();
         while (it.next()) |entry| {
@@ -2580,21 +2591,26 @@ pub const Explorer = struct {
             }
         }
 
-        // Fallback: scan outlines (handles edge cases during index build)
-        var iter = self.outlines.iterator();
-        while (iter.next()) |entry| {
-            for (entry.value_ptr.symbols.items) |sym| {
-                if (std.mem.eql(u8, sym.name, name)) {
-                    return .{
-                        .path = try allocator.dupe(u8, entry.key_ptr.*),
-                        .symbol = .{
-                            .name = try allocator.dupe(u8, sym.name),
-                            .kind = sym.kind,
-                            .line_start = sym.line_start,
-                            .line_end = sym.line_end,
-                            .detail = if (sym.detail) |d| try allocator.dupe(u8, d) else null,
-                        },
-                    };
+        // Fallback: scan outlines, only while the symbol index is incomplete
+        // (see findAllSymbols for the invariant). When complete, a miss in
+        // the index IS the answer — the scan was an O(files × symbols) "no"
+        // on every missing-symbol lookup.
+        if (!self.symbol_index_complete) {
+            var iter = self.outlines.iterator();
+            while (iter.next()) |entry| {
+                for (entry.value_ptr.symbols.items) |sym| {
+                    if (std.mem.eql(u8, sym.name, name)) {
+                        return .{
+                            .path = try allocator.dupe(u8, entry.key_ptr.*),
+                            .symbol = .{
+                                .name = try allocator.dupe(u8, sym.name),
+                                .kind = sym.kind,
+                                .line_start = sym.line_start,
+                                .line_end = sym.line_end,
+                                .detail = if (sym.detail) |d| try allocator.dupe(u8, d) else null,
+                            },
+                        };
+                    }
                 }
             }
         }
@@ -2633,30 +2649,37 @@ pub const Explorer = struct {
             });
         }
 
-        // Safety scan: append any outline symbols the index missed.
-        const LocLookup = struct {
-            fn contains(locs: []const SymbolLocation, path: []const u8, line_start: u32) bool {
-                for (locs) |loc| {
-                    if (loc.line_start == line_start and std.mem.eql(u8, loc.path, path)) return true;
+        // Safety scan: append any outline symbols the index missed. Only
+        // needed while the index is incomplete (fast-snapshot restore marks
+        // it so; ensureSymbolIndex above normally rebuilds it first) — when
+        // complete, commits (rebuildSymbolIndexFor) and removals
+        // (removeSymbolIndexFor) keep it authoritative, and this scan is
+        // O(files × symbols) of pure overhead (~6ms on a 20k-file corpus).
+        if (!self.symbol_index_complete) {
+            const LocLookup = struct {
+                fn contains(locs: []const SymbolLocation, path: []const u8, line_start: u32) bool {
+                    for (locs) |loc| {
+                        if (loc.line_start == line_start and std.mem.eql(u8, loc.path, path)) return true;
+                    }
+                    return false;
                 }
-                return false;
-            }
-        };
-        var iter = self.outlines.iterator();
-        while (iter.next()) |entry| {
-            for (entry.value_ptr.symbols.items) |sym| {
-                if (!std.mem.eql(u8, sym.name, name)) continue;
-                if (LocLookup.contains(indexed_locs, entry.key_ptr.*, sym.line_start)) continue;
-                try result_list.append(allocator, .{
-                    .path = try allocator.dupe(u8, entry.key_ptr.*),
-                    .symbol = .{
-                        .name = try allocator.dupe(u8, sym.name),
-                        .kind = sym.kind,
-                        .line_start = sym.line_start,
-                        .line_end = sym.line_end,
-                        .detail = if (sym.detail) |d| try allocator.dupe(u8, d) else null,
-                    },
-                });
+            };
+            var iter = self.outlines.iterator();
+            while (iter.next()) |entry| {
+                for (entry.value_ptr.symbols.items) |sym| {
+                    if (!std.mem.eql(u8, sym.name, name)) continue;
+                    if (LocLookup.contains(indexed_locs, entry.key_ptr.*, sym.line_start)) continue;
+                    try result_list.append(allocator, .{
+                        .path = try allocator.dupe(u8, entry.key_ptr.*),
+                        .symbol = .{
+                            .name = try allocator.dupe(u8, sym.name),
+                            .kind = sym.kind,
+                            .line_start = sym.line_start,
+                            .line_end = sym.line_end,
+                            .detail = if (sym.detail) |d| try allocator.dupe(u8, d) else null,
+                        },
+                    });
+                }
             }
         }
         return result_list.toOwnedSlice(allocator);
@@ -2999,14 +3022,20 @@ pub const Explorer = struct {
                 return false;
             }
         };
+        // Safety scans (count + render below) are only needed while the
+        // symbol index is incomplete — see findAllSymbols for the invariant.
+        // When complete they were two O(files × symbols) passes per call.
+        const scan_outlines = !self.symbol_index_complete;
 
         var total: usize = indexed_locs.len;
-        var count_iter = self.outlines.iterator();
-        while (count_iter.next()) |entry| {
-            for (entry.value_ptr.symbols.items) |sym| {
-                if (!std.mem.eql(u8, sym.name, name)) continue;
-                if (LocLookup.contains(indexed_locs, entry.key_ptr.*, sym.line_start)) continue;
-                total += 1;
+        if (scan_outlines) {
+            var count_iter = self.outlines.iterator();
+            while (count_iter.next()) |entry| {
+                for (entry.value_ptr.symbols.items) |sym| {
+                    if (!std.mem.eql(u8, sym.name, name)) continue;
+                    if (LocLookup.contains(indexed_locs, entry.key_ptr.*, sym.line_start)) continue;
+                    total += 1;
+                }
             }
         }
         if (total == 0) return false;
@@ -3028,14 +3057,16 @@ pub const Explorer = struct {
             try w.writeAll("\n");
         }
 
-        var render_iter = self.outlines.iterator();
-        while (render_iter.next()) |entry| {
-            for (entry.value_ptr.symbols.items) |sym| {
-                if (!std.mem.eql(u8, sym.name, name)) continue;
-                if (LocLookup.contains(indexed_locs, entry.key_ptr.*, sym.line_start)) continue;
-                try w.print("  {s}:{d} ({s})", .{ entry.key_ptr.*, sym.line_start, @tagName(sym.kind) });
-                if (sym.detail) |d| try w.print("  // {s}", .{d});
-                try w.writeAll("\n");
+        if (scan_outlines) {
+            var render_iter = self.outlines.iterator();
+            while (render_iter.next()) |entry| {
+                for (entry.value_ptr.symbols.items) |sym| {
+                    if (!std.mem.eql(u8, sym.name, name)) continue;
+                    if (LocLookup.contains(indexed_locs, entry.key_ptr.*, sym.line_start)) continue;
+                    try w.print("  {s}:{d} ({s})", .{ entry.key_ptr.*, sym.line_start, @tagName(sym.kind) });
+                    if (sym.detail) |d| try w.print("  // {s}", .{d});
+                    try w.writeAll("\n");
+                }
             }
         }
         return true;

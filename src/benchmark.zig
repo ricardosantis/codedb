@@ -91,7 +91,7 @@ fn benchSearch(explorer: *Explorer, query: []const u8, n: usize, alloc: std.mem.
     if (cio.posixGetenv("CODEDB_BENCH_BREAKDOWN") != null) {
         const b = explorer.last_search_breakdown;
         var buf: [512]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "  breakdown[{s}]: t0={d}ns t05={d}ns t1={d}ns t2={d}ns rerank={d}ns tier_reached={d} cands={d} results={d}\n", .{ query, b.tier0_ns, b.tier05_ns, b.tier1_ns, b.tier2_ns, b.rerank_ns, b.tier_reached, b.candidate_count, b.result_count }) catch "";
+        const msg = std.fmt.bufPrint(&buf, "  breakdown[{s}]: t0={d}ns t05={d}ns t1={d}ns t2={d}ns t3={d}ns t4={d}ns t5={d}ns rerank={d}ns tier_reached={d} cands={d} results={d}\n", .{ query, b.tier0_ns, b.tier05_ns, b.tier1_ns, b.tier2_ns, b.tier3_ns, b.tier4_ns, b.tier5_ns, b.rerank_ns, b.tier_reached, b.candidate_count, b.result_count }) catch "";
         cio.File.stderr().writeAll(msg) catch {};
     }
     return .{ .name = query, .kind = "search", .hits = hits, .avg_ns = total / n };

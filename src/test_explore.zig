@@ -2383,3 +2383,39 @@ test "issue-594: failed re-index restores the word index from valid prior conten
         }
     }
 }
+
+test "symbol lookups stay correct across the deferred-index restore path" {
+    // The outline safety scans in findSymbol/findAllSymbols/renderSymbols are
+    // now gated on !symbol_index_complete. This covers the scenario they
+    // existed for (#310): outlines populated while the symbol index is
+    // deferred (snapshot fast-load marks it incomplete, #564). Lookups must
+    // still find every symbol — ensureSymbolIndex rebuilds first.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator(), Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+
+    try explorer.indexFile("a.zig", "pub fn gatedSym() void {}");
+    explorer.markSymbolIndexIncomplete();
+    // While incomplete, per-file index updates no-op — this outline lands
+    // with NO symbol_index entry, exactly the #310 gap shape.
+    try explorer.indexFile("b.zig", "pub fn gatedSym() void {}");
+
+    const all = try explorer.findAllSymbols("gatedSym", arena.allocator());
+    try testing.expectEqual(@as(usize, 2), all.len);
+
+    const one = try explorer.findSymbol("gatedSym", arena.allocator());
+    try testing.expect(one != null);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(arena.allocator());
+    try testing.expect(try explorer.renderSymbols("gatedSym", arena.allocator(), &out));
+    try testing.expect(std.mem.indexOf(u8, out.items, "a.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "b.zig") != null);
+
+    // And with a COMPLETE index, a removed file's symbols must vanish from
+    // results (the index, not the scan, is authoritative now).
+    explorer.removeFile("b.zig");
+    const after = try explorer.findAllSymbols("gatedSym", arena.allocator());
+    try testing.expectEqual(@as(usize, 1), after.len);
+    try testing.expectEqualStrings("a.zig", after[0].path);
+}
