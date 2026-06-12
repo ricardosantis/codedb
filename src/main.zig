@@ -2235,6 +2235,9 @@ fn warmupThreadMain(ctx: *WarmupCtx) void {
 
 fn spawnWarmup(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, data_dir: []const u8, abs_root: []const u8, shutdown: *std.atomic.Value(bool)) void {
     if (cio.posixGetenv("CODEDB_NO_WARMUP") != null) return;
+    // Low-memory mode trades latency for RSS everywhere else (see
+    // compactMcpReadyMemory); don't pre-pay index builds + caches there.
+    if (cio.posixGetenv("CODEDB_LOW_MEMORY") != null) return;
     const ctx = allocator.create(WarmupCtx) catch return;
     const data_dir_copy = allocator.dupe(u8, data_dir) catch {
         allocator.destroy(ctx);
