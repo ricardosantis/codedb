@@ -2492,6 +2492,83 @@ test "search-cache: hit restores the producing search's breakdown provenance" {
     try testing.expectEqual(@as(i128, 0), restored.rerank_ns);
 }
 
+// ── warmup: queries.log replay ───────────────────────────────────────────────
+
+const warmup = @import("warmup.zig");
+
+test "warmup: topQueries ranks by repeat count, skips malformed and non-search lines" {
+    const log =
+        \\{"ts":1,"ev":"query","tool":"codedb_search","query":"alpha","result_bytes":10,"latency_us":5}
+        \\{"ts":2,"ev":"query","tool":"codedb_search","query":"beta","result_bytes":10,"latency_us":5}
+        \\{"ts":3,"ev":"query","tool":"codedb_search","query":"beta","result_bytes":10,"latency_us":5}
+        \\not json at all
+        \\{"ts":4,"ev":"query","tool":"codedb_word","query":"gamma","result_bytes":10,"latency_us":5}
+        \\{"ts":5,"ev":"file_access","tool":"codedb_read","query":"delta"}
+        \\{"ts":6,"ev":"query","tool":"codedb_search","query":"beta","result_bytes":10,"latency_us":5}
+        \\{"ts":7,"ev":"query","tool":"codedb_search","query":"alpha","result_bytes":10,"latency_us":5}
+        \\{"ts":8,"ev":"query","tool":"codedb_search","query":""}
+    ;
+    const qs = try warmup.topQueries(testing.allocator, log, 16);
+    defer warmup.freeQueries(testing.allocator, qs);
+    try testing.expectEqual(@as(usize, 2), qs.len);
+    try testing.expectEqualStrings("beta", qs[0]);
+    try testing.expectEqualStrings("alpha", qs[1]);
+}
+
+test "warmup: topQueries respects the max cap" {
+    var log: std.ArrayList(u8) = .empty;
+    defer log.deinit(testing.allocator);
+    const w = cio.listWriter(&log, testing.allocator);
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        try w.print("{{\"ts\":{d},\"ev\":\"query\",\"tool\":\"codedb_search\",\"query\":\"warmq{d}\",\"result_bytes\":1,\"latency_us\":1}}\n", .{ i, i });
+    }
+    const qs = try warmup.topQueries(testing.allocator, log.items, 3);
+    defer warmup.freeQueries(testing.allocator, qs);
+    try testing.expectEqual(@as(usize, 3), qs.len);
+}
+
+test "warmup: replay pre-fills the result caches so real calls hit" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    // 20+ matching lines so the MCP fast path (renderPlainSearch with the
+    // default max_results=20) renders from Tier 0 and fills the render cache.
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(testing.allocator);
+    const cw = cio.listWriter(&content, testing.allocator);
+    var i: usize = 0;
+    while (i < 24) : (i += 1) try cw.print("const v{d} = 1; // warmtok\n", .{i});
+    try explorer.indexFile("src/warm.zig", content.items);
+    // A sparse query that renderPlainSearch can NOT satisfy, so replay falls
+    // back to searchContentAuto and fills the searchContent cache instead.
+    try explorer.indexFile("src/rare.zig", "const r = 1; // raretok\n");
+
+    var shutdown = std.atomic.Value(bool).init(false);
+    const queries = [_][]const u8{ "warmtok", "raretok" };
+    warmup.replay(&explorer, testing.allocator, &queries, &shutdown);
+
+    // Real MCP-handler-shaped calls must now be cache hits.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expect(try explorer.renderPlainSearch("warmtok", testing.allocator, &out, 20, false));
+    try testing.expectEqual(@as(u64, 1), explorer.plain_render_cache.hits);
+
+    const r = try explorer.searchContent("raretok", testing.allocator, 21);
+    defer freeSearchResults(r);
+    try testing.expectEqual(@as(u64, 1), explorer.search_cache.hits);
+}
+
+test "warmup: replay honors shutdown" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/stop.zig", "const s = 1; // stoptok\n");
+    var shutdown = std.atomic.Value(bool).init(true);
+    const queries = [_][]const u8{"stoptok"};
+    warmup.replay(&explorer, testing.allocator, &queries, &shutdown);
+    try testing.expectEqual(@as(usize, 0), explorer.search_cache.entries.items.len);
+    try testing.expectEqual(@as(usize, 0), explorer.plain_render_cache.entries.items.len);
+}
+
 test "search-cache: renderPlainSearch hit restores the producing search's breakdown" {
     var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
     defer explorer.deinit();

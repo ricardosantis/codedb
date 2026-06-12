@@ -19,6 +19,7 @@ const snapshot_mod = @import("snapshot.zig");
 const telemetry = @import("telemetry.zig");
 const root_policy = @import("root_policy.zig");
 const nuke_mod = @import("nuke.zig");
+const warmup_mod = @import("warmup.zig");
 const update_mod = @import("update.zig");
 const release_info = @import("release_info.zig");
 const Config = @import("config.zig").Config;
@@ -1659,6 +1660,11 @@ fn mainImpl() !void {
             return;
         }
 
+        // Warm the word index + result caches in the background so the first
+        // proxied CLI queries hit a fully warm explorer (the daemon used to
+        // stay lean and charge the first `word`/`context` query the rebuild).
+        spawnWarmup(io, allocator, &explorer, data_dir, abs_root, &shutdown);
+
         // Block here until idle (or a bind-race shutdown). On return the process
         // exits immediately — std.process.exit reclaims everything and avoids
         // racing the detached listener thread against freed explorer/store.
@@ -1718,6 +1724,7 @@ fn mainImpl() !void {
         } else |err| {
             std.log.warn("cli-proxy: could not start listener: {s}", .{@errorName(err)});
         }
+        spawnWarmup(io, allocator, &explorer, data_dir, abs_root, &shutdown);
         try server.serve(io, allocator, &store, &agents, &explorer, queue, port);
     } else if (std.mem.eql(u8, cmd, "mcp")) {
         // Background auto-update check (no-op when CODEDB_NO_AUTO_UPDATE is set
@@ -1813,6 +1820,7 @@ fn mainImpl() !void {
         } else |err| {
             std.log.warn("cli-proxy: could not start listener: {s}", .{@errorName(err)});
         }
+        spawnWarmup(io, allocator, &explorer, data_dir, abs_root, &shutdown);
         mcp_server.run(io, allocator, &store, &explorer, &agents, abs_root, cfg.max_cached, &telem, maybe_deferred, &shutdown);
 
         shutdown.store(true, .release);
@@ -2160,6 +2168,98 @@ fn loadWordIndexFromDiskIfPresent(
     } else {
         std.log.debug("word.index disk load skipped: mmap and heap read both failed", .{});
         explorer.disableWordIndexDiskLoad();
+    }
+}
+
+/// Background warmup for the long-lived server modes (#tail-latency): real
+/// query logs show the latency tail is lazy work charged to the first query
+/// (word-index rebuild after a snapshot fast-load: 50ms–2s), and 62% of
+/// calls are exact repeats that the result caches can serve at µs — but only
+/// if something fills them. The thread waits for the scan to be ready, then
+/// (1) loads-or-rebuilds + persists the word index, and (2) replays the most
+/// repeated recent queries from queries.log through the same entry points
+/// real codedb_search calls use. CODEDB_NO_WARMUP=1 disables it.
+const WarmupCtx = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    explorer: *Explorer,
+    data_dir: []u8,
+    abs_root: []u8,
+    shutdown: *std.atomic.Value(bool),
+};
+
+fn warmupThreadMain(ctx: *WarmupCtx) void {
+    const allocator = ctx.allocator;
+    defer {
+        allocator.free(ctx.data_dir);
+        allocator.free(ctx.abs_root);
+        allocator.destroy(ctx);
+    }
+
+    // Deferred MCP scans flip the state back to .ready when indexing is done;
+    // serve/cli-daemon never leave .ready. Cap the wait so a wedged scan
+    // can't pin this thread forever.
+    var waited_ms: u64 = 0;
+    while (mcp_server.getScanState() != .ready and waited_ms < 120_000) {
+        if (ctx.shutdown.load(.acquire)) return;
+        cio.sleepMs(50);
+        waited_ms += 50;
+    }
+    if (ctx.shutdown.load(.acquire) or mcp_server.getScanState() != .ready) return;
+
+    // (1) Index prewarm: pay the word-index load/rebuild here instead of on
+    // the first codedb_word/search call, and persist a rebuild so the NEXT
+    // process start mmap-loads it.
+    const git_head = git_mod.getGitHead(ctx.abs_root, allocator) catch null;
+    loadWordIndexFromDiskIfPresent(ctx.io, ctx.explorer, ctx.data_dir, git_head, allocator);
+    if (!ctx.explorer.wordIndexIsComplete()) {
+        ctx.explorer.rebuildWordIndex() catch {};
+        if (ctx.explorer.wordIndexIsComplete()) {
+            persistWordIndexToDisk(ctx.io, ctx.explorer, ctx.data_dir, git_head);
+        }
+    }
+    if (ctx.shutdown.load(.acquire)) return;
+
+    // (2) Result-cache warmup: replay the most repeated recent queries. The
+    // searches also trigger the lazy ranking builds (symbol index, call
+    // graph, co-change) so no real query pays for those either.
+    if (cio.posixGetenv("CODEDB_NO_SEARCH_CACHE") != null) return;
+    var path_buf: [1024]u8 = undefined;
+    const log_path = std.fmt.bufPrint(&path_buf, "{s}/queries.log", .{ctx.data_dir}) catch return;
+    const log_bytes = std.Io.Dir.cwd().readFileAlloc(ctx.io, log_path, allocator, .limited(warmup_mod.max_log_tail_bytes)) catch return;
+    defer allocator.free(log_bytes);
+    const queries = warmup_mod.topQueries(allocator, log_bytes, warmup_mod.max_replay_queries) catch return;
+    defer warmup_mod.freeQueries(allocator, queries);
+    warmup_mod.replay(ctx.explorer, allocator, queries, ctx.shutdown);
+}
+
+fn spawnWarmup(io: std.Io, allocator: std.mem.Allocator, explorer: *Explorer, data_dir: []const u8, abs_root: []const u8, shutdown: *std.atomic.Value(bool)) void {
+    if (cio.posixGetenv("CODEDB_NO_WARMUP") != null) return;
+    const ctx = allocator.create(WarmupCtx) catch return;
+    const data_dir_copy = allocator.dupe(u8, data_dir) catch {
+        allocator.destroy(ctx);
+        return;
+    };
+    const abs_root_copy = allocator.dupe(u8, abs_root) catch {
+        allocator.free(data_dir_copy);
+        allocator.destroy(ctx);
+        return;
+    };
+    ctx.* = .{
+        .io = io,
+        .allocator = allocator,
+        .explorer = explorer,
+        .data_dir = data_dir_copy,
+        .abs_root = abs_root_copy,
+        .shutdown = shutdown,
+    };
+    if (std.Thread.spawn(.{}, warmupThreadMain, .{ctx})) |t| {
+        t.detach();
+    } else |err| {
+        std.log.debug("warmup: could not start thread: {s}", .{@errorName(err)});
+        allocator.free(ctx.data_dir);
+        allocator.free(ctx.abs_root);
+        allocator.destroy(ctx);
     }
 }
 
