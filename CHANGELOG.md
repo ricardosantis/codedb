@@ -1,15 +1,27 @@
 # Changelog
 
 
-## 0.2.5825 - 2026-06-07
+## 0.2.5825 - 2026-06-12
 
-`0.2.5825` is a broad retrieval-quality + capability cut. It fixes a class of
-**post-snapshot-load search and recall gaps** found by engram's `codedb-report`
-(#537, #539, #547), restores **call-graph edges into snapshot-restored files**
-(#537b), adds a **call-path query tool** and **PageRank graph ranking** (#531),
-**richer symbol search** and **token-leaner JSON output**, a batch of **TS/JS
-dependency-graph fixes** (#540, #541, #548), an **opt-in for indexing temp
-roots** (#538), and **CLI hardening** (#528).
+`0.2.5825` is a broad retrieval-quality + capability + performance cut. It fixes
+a class of **post-snapshot-load search and recall gaps** found by engram's
+`codedb-report` (#537, #539, #547), restores **call-graph edges into
+snapshot-restored files** (#537b), adds a **call-path query tool** and
+**PageRank graph ranking** (#531), **richer symbol search** and **token-leaner
+JSON output**, a batch of **TS/JS dependency-graph fixes** (#540, #541, #548),
+an **opt-in for indexing temp roots** (#538), and **CLI hardening** (#528).
+
+On top of that, a sustained latency pass driven by 2,467 production query-log
+calls cut the **search hot path ~2–4×** (#611), added **whole-query result
+caches + a background warmup** that drop first-call MCP search latency
+**21.8 → 6.3 ms** and repeat searches to microseconds (#613), and fixed the
+single biggest production-tail bug: **tier-3 whole-repo content scans after a
+snapshot restore** — negative searches **9.2 → 0.5–0.9 ms** with
+`recall_complete=true` (#615). Query-specific **call-graph-distance and git
+co-change ranking signals** landed (#550), `codedb_context` gained a
+**`max_tokens` budget** (#531), and a long run of correctness fixes hardened
+the store, the mmap overlay, the word index, and the caches
+(#583–#606).
 
 ### Search recall after a snapshot load (#537, #539)
 
@@ -90,9 +102,128 @@ roots** (#538), and **CLI hardening** (#528).
   (`tree`, `hot`, `status`, …) now report a usage error and exit non-zero instead
   of silently succeeding.
 
+### Performance: search hot path ~2–4× (#611)
+
+- **`searchContent` hot path rewritten** — line-offset cache, doc_id-grouped
+  candidate processing, packed-key sorts, rare-byte scan anchors, keyed final
+  sort, pointer-facts memoization, direct-address doc slots, symbol-length
+  masks, init-time path classification, run-at-a-time posting grouping, and a
+  single outline fetch per candidate.
+
+### Performance: result caches + background warmup (#613)
+
+- **Whole-query result LRUs** for `searchContent`, `renderPlainSearch` (the MCP
+  fast path), and the BM25 `searchContentRanked` path — 64 entries / 4 MB each.
+  Entries are served only when both the search generation and a fingerprint of
+  the nine ranking kill-switch env vars still match. Repeat searches:
+  **20.7 µs → 2.0 µs**. `CODEDB_NO_SEARCH_CACHE=1` disables.
+- **Background warmup** — serve / mcp / cli-daemon spawn a thread that builds +
+  persists the word index off the query path and replays the most-repeated
+  queries from the project's `queries.log` through the real search entry
+  points. 62% of production calls are exact repeats. First-call MCP search:
+  **21.8 → 6.3 ms**. `CODEDB_NO_WARMUP=1` disables; skipped under
+  `CODEDB_LOW_MEMORY`.
+- **Generation race fixed** — search-generation bumps now happen inside the
+  exclusive lock, so a concurrent search can never cache pre-mutation results
+  under the post-mutation generation. Cache hits restore the producing search's
+  provenance breakdown.
+- **Symbol lookups gated on `symbol_index_complete`** — `findSymbol` /
+  `findAllSymbols` / `renderSymbols` ran full O(files × symbols) outline safety
+  scans on every call (a #310-era net predating #564). When the index is
+  complete: **~6 ms/call → 50–100 ns** on a 20k-file corpus.
+
+### Performance: tier-3 scan-set reconciliation after snapshot restore (#615)
+
+- **The dominant production search-tail bug.** Snapshot restore parks every file
+  in `skip_trigram_files`, and (1) nothing pruned the set when the disk trigram
+  index was mmap-loaded, while (2) the freshness pass reindexing one dirty file
+  blocked the disk load entirely (`loadTrigramFromDiskIfPresent` early-returned
+  on any heap entry). Net: tier 3 content-scanned the whole project on every
+  fall-through query with `recall_complete=false`. Measured live: 613/616 files
+  in the scan set, negative searches **9.2 → 0.5–0.9 ms** after the fix.
+- All trigram replacement now funnels through `adoptTrigramIndex` /
+  `adoptTrigramBase` (swap, bump generation, prune the skip set); the mmap load
+  keeps freshness-reindexed files as a masking overlay so newer content wins
+  over stale base entries.
+- **`CODEDB_TRIGRAM_CAP`** overrides the 15k-file heap-trigram cap (measured on
+  a 20k-file corpus: uncapped = zero-hit queries 7.1 → 1.4 ms for +110 MB peak
+  RSS); provenance meta reports the effective cap.
+
+### Performance: load path + CLI status (#553, #564)
+
+- **`codedb <dir> status` is metadata-only** (#553) — it no longer materializes
+  the full index (previously a multi-GB resident process that never exited).
+  Reported by **@lekt9**. 🙏
+- **Snapshot fast-load defers the symbol index** (#564) — ~33% of load time and
+  ~43 MB of heap that plain search never used; built lazily on first symbol
+  query, tracked by the new `symbol_index_complete` flag.
+
+### Ranking: query-specific graph signals (#550, #546, #554)
+
+- **Call-graph distance** (#608) — files near the matched symbols in the
+  resolved call graph get a query-specific boost; defines-first tier-0
+  candidates seed the BFS. `CODEDB_NO_GRAPH_DISTANCE` opts out.
+- **Git co-change** (#609) — bounded history pass (500 commits, ≤32-file
+  commits, top-8 partners per file) boosts files that historically change with
+  the matched ones. `CODEDB_NO_COCHANGE` opts out.
+- **Negative lexical file-frequency penalty** (#554) — mention-everywhere terms
+  stop dragging hub files up; ported from engram's ranking experiments,
+  default-on with `CODEDB_LEX_FREQ_PENALTY` kill switch.
+- **Multi-word CLI search is ranked end-to-end** (#546) — the cold CLI path
+  rebuilds an incomplete word index and routes through BM25 ranking; bench /
+  scripts / website / install tooling paths are down-ranked below `src`
+  implementation; basename-only test files get the test penalty (#580);
+  mention-dense tooling files can no longer saturate past the path prior
+  (#598).
+
+### `codedb_context` token budget (#531 → #610)
+
+- **`max_tokens`** — sections render to buffers and are admitted by value order
+  (head → files → symbols rich→lean → reader.md → callers → calls → snippets)
+  under the budget, then emitted in document order with `[max_tokens: omitted …]`
+  markers. Without the arg, output is byte-identical to before.
+
+### Correctness: store, caches, and indexes (#583–#606)
+
+- **Store hardening** (#597, #603) — no unlocked diff writes, data-log
+  compaction, and `appendVersion` cleans up half-initialized entries on
+  failure.
+- **mmap overlay** (#593, #600) — overlay edits mask stale base entries and
+  `writeToDisk` persists merged base+overlay state instead of dropping edits.
+- **Word index** (#583, #585, #606) — disk-loaded indexes drop stale postings;
+  doc_id slots freed by `removeFile` are reused (bounded `id_to_path` in
+  long-lived daemons) with attribution preserved across persist/reload.
+- **ContentCache** (#584, #596) — every entry stays reachable from its probe
+  window, and capacity is now byte-budgeted (owned values bounded, oversized
+  values refused).
+- **OOM-safe indexing** (#594) — `indexFile` failure paths no longer panic,
+  use-after-free, double-deinit, or poison entries.
+- **Explorer re-index safety** (#586, #587) — symbol-index keys no longer
+  dangle after re-index; `removeFile` clears its `skip_trigram_files` entry.
+- **Secret filtering** (#589, #572) — `id_ecdsa` / `id_dsa` / `*_sk` FIDO key
+  names, `*.env` variants, and `.git-credentials` are blocked in both
+  `isSensitivePath` copies (now shared with `snapshot.zig`).
+- **Misc**: per-project flock makes cli-daemon spawn mutually exclusive (#592);
+  call-site extraction skips comments and string literals (#562, #572);
+  `renderImportedBy` gates its basename fallback on ambiguity (#588);
+  `codedb_query` deps-op strings are arena-owned (use-after-free + leak, #572).
+
+### CLI & tool UX (#558–#578)
+
+- `codedb_changes` is bridged into the CLI (#578); `codedb_ls` names a
+  non-indexed path instead of saying "no entries" (#576); leading flags no
+  longer bind as the positional and empty symbol names error (#573);
+  `codedb_context` falls back to plain words for all-lowercase tasks (#570);
+  multi-word `word` queries fall back to per-token matching (#569); `deps`
+  empty lists always print the `(N files)` summary (#568); `codedb_query`
+  filter accepts `pattern` and errors on missing params (#558); `path_glob`
+  pages fill from the glob-filtered sequence (#560); `CODEDB_NO_CLI_DAEMON`
+  disables the thin client entirely (#566).
+
 ### Contributors
 
-Thanks to **@nsxdavid** for the TS/JS dependency-graph fixes (#542, #543). 🙏
+Thanks to **@nsxdavid** for the TS/JS dependency-graph fixes (#542, #543), and
+to **@lekt9** for reporting the resident-status-process leak (#553). 🙏
 
 ## 0.2.5824 - 2026-06-05
 
