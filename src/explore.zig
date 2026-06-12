@@ -2748,42 +2748,59 @@ pub const Explorer = struct {
             }
 
             // Postings for one file are appended contiguously (indexFile
-            // processes whole files), so consecutive hits almost always share
-            // a doc_id — the cached-index fast path resolves them without
-            // touching the slot table at all. Indices (not pointers) into
+            // processes whole files), so the hit list decomposes into runs of
+            // one doc_id each — group run-at-a-time: scan to the run boundary
+            // first, then touch the slot table and the entry ONCE per run
+            // instead of once per hit. Indices (not pointers) into
             // tier0_files stay valid across array growth.
-            var last_doc_id: u32 = 0;
-            var last_cur: u32 = SLOT_NONE;
-            for (word_hits, 0..) |hit, ordinal| {
-                if (last_cur != SLOT_NONE and hit.doc_id == last_doc_id) {
-                    if (last_cur != SLOT_INVALID) {
-                        const e = &tier0_files.items[last_cur];
-                        e.count +|= 1;
-                        e.hits_end = ordinal + 1;
-                    }
-                    continue;
-                }
+            var run_start: usize = 0;
+            while (run_start < word_hits.len) {
+                const doc_id = word_hits[run_start].doc_id;
+                var run_end = run_start + 1;
+                while (run_end < word_hits.len and word_hits[run_end].doc_id == doc_id) run_end += 1;
+                defer run_start = run_end;
+
                 var cur: u32 = blk: {
                     if (use_slots) {
-                        if (hit.doc_id >= ndocs) break :blk SLOT_INVALID;
-                        break :blk slots[hit.doc_id];
+                        if (doc_id >= ndocs) break :blk SLOT_INVALID;
+                        break :blk slots[doc_id];
                     }
-                    break :blk idx_by_doc.get(hit.doc_id) orelse SLOT_NONE;
+                    break :blk idx_by_doc.get(doc_id) orelse SLOT_NONE;
                 };
                 if (cur == SLOT_NONE) {
-                    const hit_path = self.word_index.hitPath(hit);
+                    const hit_path = self.word_index.hitPath(word_hits[run_start]);
                     if (hit_path.len == 0) {
                         cur = SLOT_INVALID;
                     } else {
-                        const is_doc = isDocLanguage(detectLanguage(hit_path));
-                        const defines = !is_doc and self.fileDefinesSymbol(hit_path, query);
+                        // One outline fetch serves both signals: language is
+                        // detectLanguage(path) computed at outline init, and
+                        // the defines scan is gated by the symbol-name-length
+                        // mask — the old shape hashed the path twice
+                        // (detectLanguage + fileDefinesSymbol's own get).
+                        // Files with no outline never define (same as
+                        // fileDefinesSymbol's `orelse return false`).
+                        var is_doc = false;
+                        var defines = false;
+                        if (self.outlines.get(hit_path)) |o| {
+                            is_doc = isDocLanguage(o.language);
+                            if (!is_doc and o.name_len_mask & FileOutline.nameLenBit(query.len) != 0) {
+                                for (o.symbols.items) |sym| {
+                                    if (asciiEqlIgnoreCase(sym.name, query)) {
+                                        defines = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            is_doc = isDocLanguage(detectLanguage(hit_path));
+                        }
                         cur = @intCast(tier0_files.items.len);
                         tier0_files.append(allocator, .{
                             .path = hit_path,
-                            .doc_id = hit.doc_id,
+                            .doc_id = doc_id,
                             .count = 0,
-                            .first_seen = ordinal,
-                            .hits_end = ordinal + 1,
+                            .first_seen = run_start,
+                            .hits_end = run_end,
                             .is_doc = is_doc,
                             .defines = defines,
                         }) catch {
@@ -2791,18 +2808,16 @@ pub const Explorer = struct {
                         };
                     }
                     if (use_slots) {
-                        if (hit.doc_id < ndocs) slots[hit.doc_id] = cur;
+                        if (doc_id < ndocs) slots[doc_id] = cur;
                     } else {
-                        idx_by_doc.put(hit.doc_id, cur) catch {};
+                        idx_by_doc.put(doc_id, cur) catch {};
                     }
                 }
                 if (cur != SLOT_INVALID) {
                     const e = &tier0_files.items[cur];
-                    e.count +|= 1;
-                    e.hits_end = ordinal + 1;
+                    e.count +|= @intCast(@min(run_end - run_start, std.math.maxInt(u32)));
+                    e.hits_end = run_end;
                 }
-                last_doc_id = hit.doc_id;
-                last_cur = cur;
             }
 
             // Sort plain u64 keys instead of the 48-byte structs. The old
@@ -2932,27 +2947,21 @@ pub const Explorer = struct {
                 var hits_per_file = std.StringHashMap(u32).init(allocator);
                 defer hits_per_file.deinit();
                 hits_per_file.ensureTotalCapacity(@intCast(@min(word_hits.len, 1024))) catch {};
-                // Same contiguous-posting fast path as Tier 0's grouping:
-                // consecutive hits share a doc_id, so the per-hit hitPath +
-                // string getOrPut collapses to once per unique file. The
-                // cached pointer is only dereferenced immediately after being
-                // (re)set, so it cannot dangle across a rehash.
-                var hpf_last_doc: u32 = 0;
-                var hpf_last: ?*u32 = null;
-                for (word_hits) |hit| {
-                    if (hpf_last) |cnt| {
-                        if (hit.doc_id == hpf_last_doc) {
-                            cnt.* += 1;
-                            continue;
-                        }
-                    }
-                    const hp = self.word_index.hitPath(hit);
+                // Same contiguous-posting decomposition as Tier 0's grouping:
+                // the hit list is runs of one doc_id each, so hitPath + the
+                // string getOrPut run once per file run, not per hit.
+                var hpf_run_start: usize = 0;
+                while (hpf_run_start < word_hits.len) {
+                    const hpf_doc = word_hits[hpf_run_start].doc_id;
+                    var hpf_run_end = hpf_run_start + 1;
+                    while (hpf_run_end < word_hits.len and word_hits[hpf_run_end].doc_id == hpf_doc) hpf_run_end += 1;
+                    defer hpf_run_start = hpf_run_end;
+
+                    const hp = self.word_index.hitPath(word_hits[hpf_run_start]);
                     if (hp.len == 0) continue;
                     const gop_h = try hits_per_file.getOrPut(hp);
                     if (!gop_h.found_existing) gop_h.value_ptr.* = 0;
-                    gop_h.value_ptr.* += 1;
-                    hpf_last_doc = hit.doc_id;
-                    hpf_last = gop_h.value_ptr;
+                    gop_h.value_ptr.* += @intCast(@min(hpf_run_end - hpf_run_start, std.math.maxInt(u32)));
                 }
                 const SortCtx = struct {
                     contents: *ContentCache,
@@ -3101,42 +3110,44 @@ pub const Explorer = struct {
             slots = allocator.alloc(u32, ndocs) catch &.{};
             if (slots.len > 0) @memset(slots, SLOT_NONE);
         }
-        for (word_hits, 0..) |hit, ordinal| {
-            // Postings for one file are appended contiguously (indexFile
-            // processes whole files), so consecutive hits almost always share
-            // a doc_id — checking the newest entry first resolves them
-            // without touching the slots or the rescan at all.
-            if (tier0_files_len > 0 and tier0_files_buf[tier0_files_len - 1].doc_id == hit.doc_id) {
-                tier0_files_buf[tier0_files_len - 1].count +|= 1;
-                tier0_files_buf[tier0_files_len - 1].hits_end = ordinal + 1;
-                continue;
-            }
-            const hit_path = self.word_index.hitPath(hit);
+        // Postings for one file are appended contiguously (indexFile
+        // processes whole files), so the hit list decomposes into runs of one
+        // doc_id each — group run-at-a-time: scan to the run boundary first,
+        // then touch the slots/rescan and the entry ONCE per run.
+        var run_start: usize = 0;
+        while (run_start < word_hits.len) {
+            const doc_id = word_hits[run_start].doc_id;
+            var run_end = run_start + 1;
+            while (run_end < word_hits.len and word_hits[run_end].doc_id == doc_id) run_end += 1;
+            defer run_start = run_end;
+
+            const hit_path = self.word_index.hitPath(word_hits[run_start]);
             if (hit_path.len == 0) continue;
 
             var found_i: ?usize = null;
             if (slots.len > 0) {
-                if (hit.doc_id < slots.len and slots[hit.doc_id] != SLOT_NONE) found_i = slots[hit.doc_id];
+                if (doc_id < slots.len and slots[doc_id] != SLOT_NONE) found_i = slots[doc_id];
             } else {
                 for (tier0_files_buf[0..tier0_files_len], 0..) |stats, i| {
-                    if (stats.doc_id == hit.doc_id) {
+                    if (stats.doc_id == doc_id) {
                         found_i = i;
                         break;
                     }
                 }
             }
+            const run_count: u32 = @intCast(@min(run_end - run_start, std.math.maxInt(u32)));
             if (found_i) |i| {
-                tier0_files_buf[i].count +|= 1;
-                tier0_files_buf[i].hits_end = ordinal + 1;
+                tier0_files_buf[i].count +|= run_count;
+                tier0_files_buf[i].hits_end = run_end;
             } else {
                 if (tier0_files_len >= tier0_files_buf.len) return false;
-                if (slots.len > 0 and hit.doc_id < slots.len) slots[hit.doc_id] = @intCast(tier0_files_len);
+                if (slots.len > 0 and doc_id < slots.len) slots[doc_id] = @intCast(tier0_files_len);
                 tier0_files_buf[tier0_files_len] = .{
-                    .doc_id = hit.doc_id,
+                    .doc_id = doc_id,
                     .path = hit_path,
-                    .count = 1,
-                    .first_seen = ordinal,
-                    .hits_end = ordinal + 1,
+                    .count = run_count,
+                    .first_seen = run_start,
+                    .hits_end = run_end,
                     .is_doc = isDocLanguage(detectLanguage(hit_path)),
                 };
                 tier0_files_len += 1;
