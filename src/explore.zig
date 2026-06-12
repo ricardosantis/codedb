@@ -270,6 +270,11 @@ pub const SearchBreakdown = struct {
     tier_reached: u8 = 0,
     candidate_count: u32 = 0,
     result_count: u32 = 0,
+    /// True when the results were served from the whole-query result cache.
+    /// The tier/candidate/result fields then describe the search that
+    /// PRODUCED the cached entry; the *_ns timings are zeroed because the
+    /// hit did not pay them.
+    cache_hit: bool = false,
 };
 
 pub const DependencyGraph = struct {
@@ -924,6 +929,352 @@ const LineOffsetCache = struct {
         return n;
     }
 };
+
+/// Whole-query result cache for searchContent: agents re-issue identical
+/// searches constantly, and a hit copies the cached results into the
+/// caller's allocator instead of re-running the search tiers. An entry is
+/// served only when BOTH its generation (Explorer.search_gen, bumped by
+/// every mutation that can change results: indexing, removal, word-index
+/// rebuilds, and the lazy symbol-index / call-graph / co-change builds) and
+/// its env fingerprint (the ranking kill-switch variables) still match — so
+/// a hit can never observe state a fresh search would not have produced.
+/// CODEDB_NO_SEARCH_CACHE=1 disables it entirely (the repo benchmark sets
+/// this so its per-query numbers keep measuring uncached searches).
+const SearchResultCache = struct {
+    const CachedResult = struct {
+        path: []u8,
+        line_num: u32,
+        line_text: []u8,
+        score: f32,
+    };
+    const Entry = struct {
+        query: []u8,
+        max_results: usize,
+        gen: u64,
+        env_fp: u64,
+        results: []CachedResult,
+        /// Breakdown of the search that produced the entry (timings zeroed,
+        /// cache_hit set), restored into last_search_breakdown on a hit so
+        /// telemetry and the MCP provenance meta describe the results
+        /// actually served instead of whatever search ran last.
+        breakdown: SearchBreakdown,
+        bytes: usize,
+        last_used: u64,
+    };
+
+    allocator: std.mem.Allocator,
+    entries: std.ArrayList(Entry) = .empty,
+    mu: cio.Mutex = .{},
+    tick: u64 = 0,
+    total_bytes: usize = 0,
+    /// Test-visible counters; production code does not read them.
+    hits: u64 = 0,
+    misses: u64 = 0,
+
+    const MAX_ENTRIES: usize = 64;
+    const MAX_BYTES: usize = 4 * 1024 * 1024;
+    /// One entry may not claim more than a quarter of the byte budget.
+    const MAX_ENTRY_BYTES: usize = MAX_BYTES / 4;
+
+    fn init(allocator: std.mem.Allocator) SearchResultCache {
+        return .{ .allocator = allocator };
+    }
+
+    fn freeEntry(self: *SearchResultCache, e: *Entry) void {
+        self.allocator.free(e.query);
+        for (e.results) |r| {
+            self.allocator.free(r.path);
+            self.allocator.free(r.line_text);
+        }
+        self.allocator.free(e.results);
+    }
+
+    fn deinit(self: *SearchResultCache) void {
+        for (self.entries.items) |*e| self.freeEntry(e);
+        self.entries.deinit(self.allocator);
+    }
+
+    /// On hit, returns results duped into `out_allocator` (caller owns each
+    /// path/line_text and the slice, same contract as a fresh search) and
+    /// writes the producing search's breakdown to `out_breakdown`. A stale
+    /// same-key entry is dropped so the slot can refill.
+    fn get(self: *SearchResultCache, query: []const u8, max_results: usize, gen: u64, env_fp: u64, out_allocator: std.mem.Allocator, out_breakdown: *SearchBreakdown) ?[]const SearchResult {
+        self.mu.lock();
+        defer self.mu.unlock();
+        var i: usize = 0;
+        while (i < self.entries.items.len) : (i += 1) {
+            const e = &self.entries.items[i];
+            if (e.max_results != max_results or !std.mem.eql(u8, e.query, query)) continue;
+            if (e.gen != gen or e.env_fp != env_fp) {
+                var dead = self.entries.swapRemove(i);
+                self.total_bytes -= dead.bytes;
+                self.freeEntry(&dead);
+                self.misses += 1;
+                return null;
+            }
+            const out = out_allocator.alloc(SearchResult, e.results.len) catch return null;
+            var n: usize = 0;
+            for (e.results) |r| {
+                const p = out_allocator.dupe(u8, r.path) catch break;
+                const t = out_allocator.dupe(u8, r.line_text) catch {
+                    out_allocator.free(p);
+                    break;
+                };
+                out[n] = .{ .path = p, .line_num = r.line_num, .line_text = t, .score = r.score };
+                n += 1;
+            }
+            if (n != e.results.len) {
+                // OOM mid-copy: release and fall through to a fresh search.
+                for (out[0..n]) |r| {
+                    out_allocator.free(r.path);
+                    out_allocator.free(r.line_text);
+                }
+                out_allocator.free(out);
+                return null;
+            }
+            self.tick += 1;
+            e.last_used = self.tick;
+            self.hits += 1;
+            out_breakdown.* = e.breakdown;
+            return out;
+        }
+        self.misses += 1;
+        return null;
+    }
+
+    /// Copies `results` into cache-owned memory. Any OOM just skips caching.
+    fn put(self: *SearchResultCache, query: []const u8, max_results: usize, gen: u64, env_fp: u64, results: []const SearchResult, breakdown: SearchBreakdown) void {
+        var bytes: usize = query.len + @sizeOf(Entry);
+        for (results) |r| bytes += r.path.len + r.line_text.len + @sizeOf(CachedResult);
+        if (bytes > MAX_ENTRY_BYTES) return;
+
+        const owned = self.allocator.alloc(CachedResult, results.len) catch return;
+        var n: usize = 0;
+        for (results) |r| {
+            const p = self.allocator.dupe(u8, r.path) catch break;
+            const t = self.allocator.dupe(u8, r.line_text) catch {
+                self.allocator.free(p);
+                break;
+            };
+            owned[n] = .{ .path = p, .line_num = r.line_num, .line_text = t, .score = r.score };
+            n += 1;
+        }
+        const query_copy = if (n == results.len) self.allocator.dupe(u8, query) catch null else null;
+        if (query_copy == null) {
+            for (owned[0..n]) |r| {
+                self.allocator.free(r.path);
+                self.allocator.free(r.line_text);
+            }
+            self.allocator.free(owned);
+            return;
+        }
+
+        self.mu.lock();
+        defer self.mu.unlock();
+        // Replace any existing same-key entry (it was a miss or stale).
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const e = &self.entries.items[i];
+            if (e.max_results == max_results and std.mem.eql(u8, e.query, query)) {
+                var dead = self.entries.swapRemove(i);
+                self.total_bytes -= dead.bytes;
+                self.freeEntry(&dead);
+                continue;
+            }
+            i += 1;
+        }
+        // Evict least-recently-used entries until the new one fits.
+        while (self.entries.items.len >= MAX_ENTRIES or
+            (self.entries.items.len > 0 and self.total_bytes + bytes > MAX_BYTES))
+        {
+            var lru: usize = 0;
+            for (self.entries.items, 0..) |e, j| {
+                if (e.last_used < self.entries.items[lru].last_used) lru = j;
+            }
+            var dead = self.entries.swapRemove(lru);
+            self.total_bytes -= dead.bytes;
+            self.freeEntry(&dead);
+        }
+        self.tick += 1;
+        self.entries.append(self.allocator, .{
+            .query = query_copy.?,
+            .max_results = max_results,
+            .gen = gen,
+            .env_fp = env_fp,
+            .results = owned,
+            .breakdown = sanitizeCachedBreakdown(breakdown),
+            .bytes = bytes,
+            .last_used = self.tick,
+        }) catch {
+            self.allocator.free(query_copy.?);
+            for (owned) |r| {
+                self.allocator.free(r.path);
+                self.allocator.free(r.line_text);
+            }
+            self.allocator.free(owned);
+            return;
+        };
+        self.total_bytes += bytes;
+    }
+};
+
+/// Keep the producing search's provenance (tier/candidate/result counts) but
+/// zero the timings a hit never pays, and mark it as a hit. Stored at put
+/// time so a cache hit can restore an honest last_search_breakdown.
+fn sanitizeCachedBreakdown(bd: SearchBreakdown) SearchBreakdown {
+    return .{
+        .tier_reached = bd.tier_reached,
+        .candidate_count = bd.candidate_count,
+        .result_count = bd.result_count,
+        .cache_hit = true,
+    };
+}
+
+/// Rendered-output sibling of SearchResultCache for renderPlainSearch — the
+/// MCP fast path renders straight to text and never reaches searchContent,
+/// so it gets its own (query, max_results, paths_only) → bytes cache with
+/// identical generation + env-fingerprint validation and LRU discipline.
+const PlainRenderCache = struct {
+    const Entry = struct {
+        query: []u8,
+        max_results: usize,
+        paths_only: bool,
+        gen: u64,
+        env_fp: u64,
+        bytes: []u8,
+        /// See SearchResultCache.Entry.breakdown.
+        breakdown: SearchBreakdown,
+        last_used: u64,
+    };
+
+    allocator: std.mem.Allocator,
+    entries: std.ArrayList(Entry) = .empty,
+    mu: cio.Mutex = .{},
+    tick: u64 = 0,
+    total_bytes: usize = 0,
+    /// Test-visible counters; production code does not read them.
+    hits: u64 = 0,
+    misses: u64 = 0,
+
+    const MAX_ENTRIES: usize = 64;
+    const MAX_BYTES: usize = 4 * 1024 * 1024;
+    const MAX_ENTRY_BYTES: usize = MAX_BYTES / 4;
+
+    fn init(allocator: std.mem.Allocator) PlainRenderCache {
+        return .{ .allocator = allocator };
+    }
+
+    fn freeEntry(self: *PlainRenderCache, e: *Entry) void {
+        self.allocator.free(e.query);
+        self.allocator.free(e.bytes);
+    }
+
+    fn deinit(self: *PlainRenderCache) void {
+        for (self.entries.items) |*e| self.freeEntry(e);
+        self.entries.deinit(self.allocator);
+    }
+
+    /// On hit, appends the cached rendering to `out`, writes the producing
+    /// search's breakdown to `out_breakdown`, and returns true.
+    fn render(self: *PlainRenderCache, query: []const u8, max_results: usize, paths_only: bool, gen: u64, env_fp: u64, out_allocator: std.mem.Allocator, out: *std.ArrayList(u8), out_breakdown: *SearchBreakdown) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        var i: usize = 0;
+        while (i < self.entries.items.len) : (i += 1) {
+            const e = &self.entries.items[i];
+            if (e.max_results != max_results or e.paths_only != paths_only or !std.mem.eql(u8, e.query, query)) continue;
+            if (e.gen != gen or e.env_fp != env_fp) {
+                var dead = self.entries.swapRemove(i);
+                self.total_bytes -= dead.bytes.len;
+                self.freeEntry(&dead);
+                self.misses += 1;
+                return false;
+            }
+            out.appendSlice(out_allocator, e.bytes) catch return false;
+            self.tick += 1;
+            e.last_used = self.tick;
+            self.hits += 1;
+            out_breakdown.* = e.breakdown;
+            return true;
+        }
+        self.misses += 1;
+        return false;
+    }
+
+    /// Copies `bytes` into cache-owned memory. Any OOM just skips caching.
+    fn put(self: *PlainRenderCache, query: []const u8, max_results: usize, paths_only: bool, gen: u64, env_fp: u64, bytes: []const u8, breakdown: SearchBreakdown) void {
+        if (bytes.len > MAX_ENTRY_BYTES) return;
+        const bytes_copy = self.allocator.dupe(u8, bytes) catch return;
+        const query_copy = self.allocator.dupe(u8, query) catch {
+            self.allocator.free(bytes_copy);
+            return;
+        };
+
+        self.mu.lock();
+        defer self.mu.unlock();
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const e = &self.entries.items[i];
+            if (e.max_results == max_results and e.paths_only == paths_only and std.mem.eql(u8, e.query, query)) {
+                var dead = self.entries.swapRemove(i);
+                self.total_bytes -= dead.bytes.len;
+                self.freeEntry(&dead);
+                continue;
+            }
+            i += 1;
+        }
+        while (self.entries.items.len >= MAX_ENTRIES or
+            (self.entries.items.len > 0 and self.total_bytes + bytes_copy.len > MAX_BYTES))
+        {
+            var lru: usize = 0;
+            for (self.entries.items, 0..) |e, j| {
+                if (e.last_used < self.entries.items[lru].last_used) lru = j;
+            }
+            var dead = self.entries.swapRemove(lru);
+            self.total_bytes -= dead.bytes.len;
+            self.freeEntry(&dead);
+        }
+        self.tick += 1;
+        self.entries.append(self.allocator, .{
+            .query = query_copy,
+            .max_results = max_results,
+            .paths_only = paths_only,
+            .gen = gen,
+            .env_fp = env_fp,
+            .bytes = bytes_copy,
+            .breakdown = sanitizeCachedBreakdown(breakdown),
+            .last_used = self.tick,
+        }) catch {
+            self.allocator.free(query_copy);
+            self.allocator.free(bytes_copy);
+            return;
+        };
+        self.total_bytes += bytes_copy.len;
+    }
+};
+
+/// Fingerprint of the env kill-switches that change ranking/search output —
+/// part of the SearchResultCache key so toggling one (tests do this
+/// mid-process) can never serve results computed under the other setting.
+fn rankingEnvFingerprint() u64 {
+    var h = std.hash.Wyhash.init(0x5eed);
+    inline for ([_][]const u8{
+        "CODEDB_NO_CENTRALITY",
+        "CODEDB_NO_GRAPH_DISTANCE",
+        "CODEDB_NO_COCHANGE",
+        "CODEDB_LEX_FREQ_PENALTY",
+        "CODEDB_LEX_FREQ_AMP",
+        "CODEDB_RVSM_SIZE_PRIOR",
+        "CODEDB_RVSM_AMP",
+        "CODEDB_RVSM_K",
+        "CODEDB_IN_DEGREE_CENTRALITY",
+    }) |name| {
+        h.update(name);
+        if (cio.posixGetenv(name)) |v| h.update(v) else h.update(&[_]u8{0});
+    }
+    return h.final();
+}
+
 pub const Explorer = struct {
     outlines: std.StringHashMap(FileOutline),
     dep_graph: DependencyGraph,
@@ -979,6 +1330,18 @@ pub const Explorer = struct {
     /// Production code does not read this field.
     search_tier5_count: u64 = 0,
     last_search_breakdown: SearchBreakdown = .{},
+    /// Whole-query result cache for searchContent, validated against
+    /// search_gen + the ranking-env fingerprint (see SearchResultCache).
+    search_cache: SearchResultCache,
+    /// Separate instance for searchContentRanked (BM25 path): the two
+    /// functions return DIFFERENT results for the same (query, max_results)
+    /// key, so they must never share entries.
+    ranked_cache: SearchResultCache,
+    /// Rendered-output cache for renderPlainSearch (same validation).
+    plain_render_cache: PlainRenderCache,
+    /// Bumped (atomically — searches run under the SHARED lock) by every
+    /// mutation that can change search results; see bumpSearchGen callers.
+    search_gen: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Buffers adopted from snapshot loads (the raw outline_state section).
     /// Restored FileOutlines borrow their import/symbol strings as slices into
     /// these (see FileOutline.borrows_strings), so they must outlive every
@@ -1015,6 +1378,9 @@ pub const Explorer = struct {
             .dep_graph = DependencyGraph.init(allocator),
             .contents = try ContentCache.initAlloc(allocator, content_cache_capacity),
             .line_offsets = LineOffsetCache.init(allocator),
+            .search_cache = SearchResultCache.init(allocator),
+            .ranked_cache = SearchResultCache.init(allocator),
+            .plain_render_cache = PlainRenderCache.init(allocator),
             .symbol_index = std.StringHashMap(std.ArrayList(SymbolLocation)).init(allocator),
             .symbol_index_complete = true,
             .word_index = WordIndex.init(allocator),
@@ -1043,6 +1409,9 @@ pub const Explorer = struct {
 
         self.contents.deinit();
         self.line_offsets.deinit();
+        self.search_cache.deinit();
+        self.ranked_cache.deinit();
+        self.plain_render_cache.deinit();
         if (self.call_centrality) |*c| c.deinit();
         if (self.call_graph) |*cg| cg.deinit(self.allocator);
         if (self.co_change) |*cc| git.freeCoChange(cc, self.allocator);
@@ -1134,6 +1503,7 @@ pub const Explorer = struct {
 
         self.mu.lock();
         defer self.mu.unlock();
+        self.bumpSearchGen();
 
         const outline_gop = try self.outlines.getOrPut(path);
         const is_new = !outline_gop.found_existing;
@@ -1624,6 +1994,21 @@ pub const Explorer = struct {
         const parsed = try parseContentForIndexing(self.allocator, path, content);
         return self.commitParsedFileOwnedOutline(path, parsed.content, parsed.outline, full_index, skip_trigram);
     }
+
+    /// Invalidate the searchContent result cache. Called by every mutation
+    /// that can change what a search returns — file commits/removals, index
+    /// rebuilds, and the one-shot lazy ranking-signal builds (symbol index,
+    /// call graph, co-change). Atomic because the lazy builds run under the
+    /// SHARED lock.
+    ///
+    /// Ordering invariant: never bump BEFORE a mutation outside the
+    /// exclusive lock — a search could load the new generation, win the
+    /// shared lock, and cache pre-mutation results under the post-mutation
+    /// generation. Bump while holding the exclusive lock, or (for the lazy
+    /// shared-lock builds) only after the mutation is visible.
+    fn bumpSearchGen(self: *Explorer) void {
+        _ = self.search_gen.fetchAdd(1, .release);
+    }
     /// Rebuild trigram index from the stored file contents.
     /// Used after a cache hit to populate trigrams when they were skipped during the fast scan.
     pub fn rebuildTrigrams(self: *Explorer) !void {
@@ -1693,6 +2078,7 @@ pub const Explorer = struct {
 
         self.mu.lock();
         defer self.mu.unlock();
+        self.bumpSearchGen();
         self.word_index.deinit();
         self.word_index = rebuilt;
         self.word_index_generation +%= 1;
@@ -1741,6 +2127,18 @@ pub const Explorer = struct {
         self.mu.lock();
         defer self.mu.unlock();
         if (self.symbol_index_complete) return;
+        self.bumpSearchGen();
+        // Rebuild from scratch: entries indexed BEFORE the index was marked
+        // incomplete would otherwise be duplicated by the loop below (it
+        // passes had_prior=false, which skips per-file eviction). The index
+        // is authoritative once complete — lookups no longer outline-scan —
+        // so it must hold exactly one entry per live symbol.
+        var sym_iter = self.symbol_index.iterator();
+        while (sym_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.symbol_index.clearRetainingCapacity();
         self.symbol_index_complete = true;
         var it = self.outlines.iterator();
         while (it.next()) |entry| {
@@ -1804,6 +2202,7 @@ pub const Explorer = struct {
     pub fn removeFile(self: *Explorer, path: []const u8) void {
         self.mu.lock();
         defer self.mu.unlock();
+        self.bumpSearchGen();
         if (!self.word_index_complete) {
             self.word_index_can_load_from_disk = false;
         } else {
@@ -2192,21 +2591,26 @@ pub const Explorer = struct {
             }
         }
 
-        // Fallback: scan outlines (handles edge cases during index build)
-        var iter = self.outlines.iterator();
-        while (iter.next()) |entry| {
-            for (entry.value_ptr.symbols.items) |sym| {
-                if (std.mem.eql(u8, sym.name, name)) {
-                    return .{
-                        .path = try allocator.dupe(u8, entry.key_ptr.*),
-                        .symbol = .{
-                            .name = try allocator.dupe(u8, sym.name),
-                            .kind = sym.kind,
-                            .line_start = sym.line_start,
-                            .line_end = sym.line_end,
-                            .detail = if (sym.detail) |d| try allocator.dupe(u8, d) else null,
-                        },
-                    };
+        // Fallback: scan outlines, only while the symbol index is incomplete
+        // (see findAllSymbols for the invariant). When complete, a miss in
+        // the index IS the answer — the scan was an O(files × symbols) "no"
+        // on every missing-symbol lookup.
+        if (!self.symbol_index_complete) {
+            var iter = self.outlines.iterator();
+            while (iter.next()) |entry| {
+                for (entry.value_ptr.symbols.items) |sym| {
+                    if (std.mem.eql(u8, sym.name, name)) {
+                        return .{
+                            .path = try allocator.dupe(u8, entry.key_ptr.*),
+                            .symbol = .{
+                                .name = try allocator.dupe(u8, sym.name),
+                                .kind = sym.kind,
+                                .line_start = sym.line_start,
+                                .line_end = sym.line_end,
+                                .detail = if (sym.detail) |d| try allocator.dupe(u8, d) else null,
+                            },
+                        };
+                    }
                 }
             }
         }
@@ -2245,30 +2649,37 @@ pub const Explorer = struct {
             });
         }
 
-        // Safety scan: append any outline symbols the index missed.
-        const LocLookup = struct {
-            fn contains(locs: []const SymbolLocation, path: []const u8, line_start: u32) bool {
-                for (locs) |loc| {
-                    if (loc.line_start == line_start and std.mem.eql(u8, loc.path, path)) return true;
+        // Safety scan: append any outline symbols the index missed. Only
+        // needed while the index is incomplete (fast-snapshot restore marks
+        // it so; ensureSymbolIndex above normally rebuilds it first) — when
+        // complete, commits (rebuildSymbolIndexFor) and removals
+        // (removeSymbolIndexFor) keep it authoritative, and this scan is
+        // O(files × symbols) of pure overhead (~6ms on a 20k-file corpus).
+        if (!self.symbol_index_complete) {
+            const LocLookup = struct {
+                fn contains(locs: []const SymbolLocation, path: []const u8, line_start: u32) bool {
+                    for (locs) |loc| {
+                        if (loc.line_start == line_start and std.mem.eql(u8, loc.path, path)) return true;
+                    }
+                    return false;
                 }
-                return false;
-            }
-        };
-        var iter = self.outlines.iterator();
-        while (iter.next()) |entry| {
-            for (entry.value_ptr.symbols.items) |sym| {
-                if (!std.mem.eql(u8, sym.name, name)) continue;
-                if (LocLookup.contains(indexed_locs, entry.key_ptr.*, sym.line_start)) continue;
-                try result_list.append(allocator, .{
-                    .path = try allocator.dupe(u8, entry.key_ptr.*),
-                    .symbol = .{
-                        .name = try allocator.dupe(u8, sym.name),
-                        .kind = sym.kind,
-                        .line_start = sym.line_start,
-                        .line_end = sym.line_end,
-                        .detail = if (sym.detail) |d| try allocator.dupe(u8, d) else null,
-                    },
-                });
+            };
+            var iter = self.outlines.iterator();
+            while (iter.next()) |entry| {
+                for (entry.value_ptr.symbols.items) |sym| {
+                    if (!std.mem.eql(u8, sym.name, name)) continue;
+                    if (LocLookup.contains(indexed_locs, entry.key_ptr.*, sym.line_start)) continue;
+                    try result_list.append(allocator, .{
+                        .path = try allocator.dupe(u8, entry.key_ptr.*),
+                        .symbol = .{
+                            .name = try allocator.dupe(u8, sym.name),
+                            .kind = sym.kind,
+                            .line_start = sym.line_start,
+                            .line_end = sym.line_end,
+                            .detail = if (sym.detail) |d| try allocator.dupe(u8, d) else null,
+                        },
+                    });
+                }
             }
         }
         return result_list.toOwnedSlice(allocator);
@@ -2611,14 +3022,20 @@ pub const Explorer = struct {
                 return false;
             }
         };
+        // Safety scans (count + render below) are only needed while the
+        // symbol index is incomplete — see findAllSymbols for the invariant.
+        // When complete they were two O(files × symbols) passes per call.
+        const scan_outlines = !self.symbol_index_complete;
 
         var total: usize = indexed_locs.len;
-        var count_iter = self.outlines.iterator();
-        while (count_iter.next()) |entry| {
-            for (entry.value_ptr.symbols.items) |sym| {
-                if (!std.mem.eql(u8, sym.name, name)) continue;
-                if (LocLookup.contains(indexed_locs, entry.key_ptr.*, sym.line_start)) continue;
-                total += 1;
+        if (scan_outlines) {
+            var count_iter = self.outlines.iterator();
+            while (count_iter.next()) |entry| {
+                for (entry.value_ptr.symbols.items) |sym| {
+                    if (!std.mem.eql(u8, sym.name, name)) continue;
+                    if (LocLookup.contains(indexed_locs, entry.key_ptr.*, sym.line_start)) continue;
+                    total += 1;
+                }
             }
         }
         if (total == 0) return false;
@@ -2640,20 +3057,41 @@ pub const Explorer = struct {
             try w.writeAll("\n");
         }
 
-        var render_iter = self.outlines.iterator();
-        while (render_iter.next()) |entry| {
-            for (entry.value_ptr.symbols.items) |sym| {
-                if (!std.mem.eql(u8, sym.name, name)) continue;
-                if (LocLookup.contains(indexed_locs, entry.key_ptr.*, sym.line_start)) continue;
-                try w.print("  {s}:{d} ({s})", .{ entry.key_ptr.*, sym.line_start, @tagName(sym.kind) });
-                if (sym.detail) |d| try w.print("  // {s}", .{d});
-                try w.writeAll("\n");
+        if (scan_outlines) {
+            var render_iter = self.outlines.iterator();
+            while (render_iter.next()) |entry| {
+                for (entry.value_ptr.symbols.items) |sym| {
+                    if (!std.mem.eql(u8, sym.name, name)) continue;
+                    if (LocLookup.contains(indexed_locs, entry.key_ptr.*, sym.line_start)) continue;
+                    try w.print("  {s}:{d} ({s})", .{ entry.key_ptr.*, sym.line_start, @tagName(sym.kind) });
+                    if (sym.detail) |d| try w.print("  // {s}", .{d});
+                    try w.writeAll("\n");
+                }
             }
         }
         return true;
     }
 
     pub fn searchContent(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
+        // Result-cache front door: a hit copies the cached results into the
+        // caller's allocator (same ownership contract as a fresh search).
+        // The generation is read BEFORE the search runs, so any concurrent
+        // mutation makes the stored entry stale immediately — conservative
+        // in the safe direction. Lazy builds during a query's FIRST run bump
+        // the generation mid-search; that entry just never hits and the next
+        // run stores a valid one.
+        const cacheable = max_results > 0 and query.len > 0 and query.len <= 1024 and
+            cio.posixGetenv("CODEDB_NO_SEARCH_CACHE") == null;
+        if (!cacheable) return self.searchContentUncached(query, allocator, max_results);
+        const gen = self.search_gen.load(.acquire);
+        const env_fp = rankingEnvFingerprint();
+        if (self.search_cache.get(query, max_results, gen, env_fp, allocator, &self.last_search_breakdown)) |hit| return hit;
+        const res = try self.searchContentUncached(query, allocator, max_results);
+        self.search_cache.put(query, max_results, gen, env_fp, res, self.last_search_breakdown);
+        return res;
+    }
+
+    fn searchContentUncached(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
         // #539: ensure the word index — Tier 0's recall source — is populated.
         // After a snapshot fast-load it is built lazily (see issue-220); without
         // this, searchContent's recall collapses to the trigram/skip_trigram tiers
@@ -3072,6 +3510,26 @@ pub const Explorer = struct {
     }
 
     pub fn renderPlainSearch(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8), max_results: usize, paths_only: bool) !bool {
+        // Rendered-output cache front door — same generation discipline as
+        // searchContent's cache (see that wrapper for the staleness
+        // reasoning). Only successful renders (rendered == true) are stored;
+        // a false return falls through to searchContentAuto, which caches
+        // through searchContent itself.
+        const cacheable = max_results > 0 and query.len > 0 and query.len <= 1024 and
+            cio.posixGetenv("CODEDB_NO_SEARCH_CACHE") == null;
+        const cache_gen = self.search_gen.load(.acquire);
+        const cache_fp = if (cacheable) rankingEnvFingerprint() else 0;
+        if (cacheable and self.plain_render_cache.render(query, max_results, paths_only, cache_gen, cache_fp, allocator, out, &self.last_search_breakdown)) return true;
+        const out_start = out.items.len;
+
+        const rendered = try self.renderPlainSearchUncached(query, allocator, out, max_results, paths_only);
+        if (rendered and cacheable) {
+            self.plain_render_cache.put(query, max_results, paths_only, cache_gen, cache_fp, out.items[out_start..], self.last_search_breakdown);
+        }
+        return rendered;
+    }
+
+    fn renderPlainSearchUncached(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, out: *std.ArrayList(u8), max_results: usize, paths_only: bool) !bool {
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
@@ -3849,6 +4307,9 @@ pub const Explorer = struct {
         self.co_change_attempted = true;
         const root = self.root_path orelse return;
         self.co_change = git.buildCoChange(self.allocator, root, 500, 32, 8);
+        // The co-change boost just became available: results cached before
+        // the build could differ from a fresh search.
+        if (self.co_change != null) self.bumpSearchGen();
     }
 
     /// Boost for files that historically change together with the files
@@ -4012,6 +4473,9 @@ pub const Explorer = struct {
             .node_name = nn,
             .node_line = nl,
         };
+        // The graph-distance boost gate (`call_graph != null`) just flipped:
+        // results cached before the build could differ from a fresh search.
+        self.bumpSearchGen();
     }
 
     /// Build `call_centrality` once (idempotent, mutex-guarded). Must be called
@@ -4073,6 +4537,22 @@ pub const Explorer = struct {
     }
 
     pub fn searchContentRanked(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
+        // Result-cache front door — same discipline as searchContent's
+        // wrapper (gen read BEFORE the search; see that comment), but a
+        // SEPARATE cache instance: the BM25 ranking returns different
+        // results than searchContent for the same (query, max_results) key.
+        const cacheable = max_results > 0 and query.len > 0 and query.len <= 1024 and
+            cio.posixGetenv("CODEDB_NO_SEARCH_CACHE") == null;
+        if (!cacheable) return self.searchContentRankedUncached(query, allocator, max_results);
+        const gen = self.search_gen.load(.acquire);
+        const env_fp = rankingEnvFingerprint();
+        if (self.ranked_cache.get(query, max_results, gen, env_fp, allocator, &self.last_search_breakdown)) |hit| return hit;
+        const res = try self.searchContentRankedUncached(query, allocator, max_results);
+        self.ranked_cache.put(query, max_results, gen, env_fp, res, .{ .result_count = @intCast(@min(res.len, std.math.maxInt(u32))) });
+        return res;
+    }
+
+    fn searchContentRankedUncached(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
         // #546: BM25 reads the word index's id_to_path + ranked-doc table, which a
         // mmap/disk-loaded index lacks until rebuilt (word_index_complete = false).
         // The recall readers (searchContent, searchWord, renderWord) already trigger
