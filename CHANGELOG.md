@@ -12,7 +12,7 @@ JSON output**, a batch of **TS/JS dependency-graph fixes** (#540, #541, #548),
 an **opt-in for indexing temp roots** (#538), and **CLI hardening** (#528).
 
 On top of that, a sustained latency pass driven by 2,467 production query-log
-calls cut the **search hot path ~2–4×** (#611), added **whole-query result
+calls cut the **search hot path ~4–8×** (#611), added **whole-query result
 caches + a background warmup** that drop first-call MCP search latency
 **21.8 → 6.3 ms** and repeat searches to microseconds (#613), and fixed the
 single biggest production-tail bug: **tier-3 whole-repo content scans after a
@@ -102,13 +102,18 @@ the store, the mmap overlay, the word index, and the caches
   (`tree`, `hot`, `status`, …) now report a usage error and exit non-zero instead
   of silently succeeding.
 
-### Performance: search hot path ~2–4× (#611)
+### Performance: search hot path ~4–8× (#611)
 
 - **`searchContent` hot path rewritten** — line-offset cache, doc_id-grouped
   candidate processing, packed-key sorts, rare-byte scan anchors, keyed final
   sort, pointer-facts memoization, direct-address doc slots, symbol-length
   masks, init-time path classification, run-at-a-time posting grouping, and a
   single outline fetch per candidate.
+- Measured on the codedb repo (`c_allocator`, min-of-N, uncached):
+  `middleware` 88 → 10.2 µs (**8.6×**), `database` 65 → 7.4 µs (**8.8×**),
+  `error` 107 → 19.6 µs (**5.5×**), `authentication` 28.7 µs,
+  `webhook` 16.6 µs. The benchmark pins `CODEDB_NO_SEARCH_CACHE=1` so rows
+  stay comparable across versions, plus one explicit cached row.
 
 ### Performance: result caches + background warmup (#613)
 
@@ -154,9 +159,11 @@ the store, the mmap overlay, the word index, and the caches
 - **`codedb <dir> status` is metadata-only** (#553) — it no longer materializes
   the full index (previously a multi-GB resident process that never exited).
   Reported by **@lekt9**. 🙏
-- **Snapshot fast-load defers the symbol index** (#564) — ~33% of load time and
-  ~43 MB of heap that plain search never used; built lazily on first symbol
-  query, tracked by the new `symbol_index_complete` flag.
+- **Snapshot fast-load defers the symbol index** (#564) — built lazily on
+  first symbol query, tracked by the new `symbol_index_complete` flag.
+  Measured on openclaw (13,654 files, ReleaseFast, warm): load 60 → 40 ms,
+  Pass C heap +62.5 → +20.5 MB, one-shot search physical footprint
+  132.7 → 89.2 MB (−33%), max RSS 244 → 200 MB.
 
 ### Ranking: query-specific graph signals (#550, #546, #554)
 
