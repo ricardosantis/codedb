@@ -1333,6 +1333,10 @@ pub const Explorer = struct {
     /// Whole-query result cache for searchContent, validated against
     /// search_gen + the ranking-env fingerprint (see SearchResultCache).
     search_cache: SearchResultCache,
+    /// Separate instance for searchContentRanked (BM25 path): the two
+    /// functions return DIFFERENT results for the same (query, max_results)
+    /// key, so they must never share entries.
+    ranked_cache: SearchResultCache,
     /// Rendered-output cache for renderPlainSearch (same validation).
     plain_render_cache: PlainRenderCache,
     /// Bumped (atomically — searches run under the SHARED lock) by every
@@ -1375,6 +1379,7 @@ pub const Explorer = struct {
             .contents = try ContentCache.initAlloc(allocator, content_cache_capacity),
             .line_offsets = LineOffsetCache.init(allocator),
             .search_cache = SearchResultCache.init(allocator),
+            .ranked_cache = SearchResultCache.init(allocator),
             .plain_render_cache = PlainRenderCache.init(allocator),
             .symbol_index = std.StringHashMap(std.ArrayList(SymbolLocation)).init(allocator),
             .symbol_index_complete = true,
@@ -1405,6 +1410,7 @@ pub const Explorer = struct {
         self.contents.deinit();
         self.line_offsets.deinit();
         self.search_cache.deinit();
+        self.ranked_cache.deinit();
         self.plain_render_cache.deinit();
         if (self.call_centrality) |*c| c.deinit();
         if (self.call_graph) |*cg| cg.deinit(self.allocator);
@@ -4500,6 +4506,22 @@ pub const Explorer = struct {
     }
 
     pub fn searchContentRanked(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
+        // Result-cache front door — same discipline as searchContent's
+        // wrapper (gen read BEFORE the search; see that comment), but a
+        // SEPARATE cache instance: the BM25 ranking returns different
+        // results than searchContent for the same (query, max_results) key.
+        const cacheable = max_results > 0 and query.len > 0 and query.len <= 1024 and
+            cio.posixGetenv("CODEDB_NO_SEARCH_CACHE") == null;
+        if (!cacheable) return self.searchContentRankedUncached(query, allocator, max_results);
+        const gen = self.search_gen.load(.acquire);
+        const env_fp = rankingEnvFingerprint();
+        if (self.ranked_cache.get(query, max_results, gen, env_fp, allocator, &self.last_search_breakdown)) |hit| return hit;
+        const res = try self.searchContentRankedUncached(query, allocator, max_results);
+        self.ranked_cache.put(query, max_results, gen, env_fp, res, .{ .result_count = @intCast(@min(res.len, std.math.maxInt(u32))) });
+        return res;
+    }
+
+    fn searchContentRankedUncached(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const SearchResult {
         // #546: BM25 reads the word index's id_to_path + ranked-doc table, which a
         // mmap/disk-loaded index lacks until rebuilt (word_index_complete = false).
         // The recall readers (searchContent, searchWord, renderWord) already trigger

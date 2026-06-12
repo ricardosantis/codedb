@@ -2492,6 +2492,66 @@ test "search-cache: hit restores the producing search's breakdown provenance" {
     try testing.expectEqual(@as(i128, 0), restored.rerank_ns);
 }
 
+test "search-cache: ranked repeated query is served from the ranked cache" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/rank.zig", "const a = 1; // bisontok grazes\nconst b = 2; // bisontok grazes more\n");
+
+    const r1 = try explorer.searchContentRanked("bisontok grazes", testing.allocator, 10);
+    defer freeSearchResults(r1);
+    try testing.expect(r1.len >= 1);
+    try testing.expectEqual(@as(u64, 0), explorer.ranked_cache.hits);
+
+    const r2 = try explorer.searchContentRanked("bisontok grazes", testing.allocator, 10);
+    defer freeSearchResults(r2);
+    try testing.expectEqual(@as(u64, 1), explorer.ranked_cache.hits);
+    try testing.expectEqual(r1.len, r2.len);
+    for (r1, r2) |a, b| {
+        try testing.expectEqualStrings(a.path, b.path);
+        try testing.expectEqual(a.line_num, b.line_num);
+        try testing.expectEqualStrings(a.line_text, b.line_text);
+        try testing.expectEqual(a.score, b.score);
+    }
+    // The plain searchContent cache must be untouched.
+    try testing.expectEqual(@as(u64, 0), explorer.search_cache.hits);
+    try testing.expectEqual(@as(usize, 0), explorer.search_cache.entries.items.len);
+}
+
+test "search-cache: ranked and plain caches never share entries for the same key" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/iso.zig", "const a = 1; // elktok\n");
+
+    // Prime the PLAIN cache with this (query, max_results) key.
+    const p = try explorer.searchContent("elktok", testing.allocator, 10);
+    freeSearchResults(p);
+    // The first RANKED call with the identical key must MISS (a shared
+    // cache would serve the plain results here).
+    const r = try explorer.searchContentRanked("elktok", testing.allocator, 10);
+    freeSearchResults(r);
+    try testing.expectEqual(@as(u64, 0), explorer.ranked_cache.hits);
+    try testing.expectEqual(@as(u64, 1), explorer.ranked_cache.misses);
+}
+
+test "search-cache: ranked cache is invalidated by indexFile" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/ra.zig", "const a = 1; // moosetok wanders\n");
+
+    const r1 = try explorer.searchContentRanked("moosetok wanders", testing.allocator, 10);
+    freeSearchResults(r1);
+    try explorer.indexFile("src/rb.zig", "const b = 2; // moosetok wanders too\n");
+
+    const r2 = try explorer.searchContentRanked("moosetok wanders", testing.allocator, 10);
+    defer freeSearchResults(r2);
+    try testing.expectEqual(@as(u64, 0), explorer.ranked_cache.hits);
+    var saw_new = false;
+    for (r2) |res| {
+        if (std.mem.eql(u8, res.path, "src/rb.zig")) saw_new = true;
+    }
+    try testing.expect(saw_new);
+}
+
 // ── warmup: queries.log replay ───────────────────────────────────────────────
 
 const warmup = @import("warmup.zig");
@@ -2544,7 +2604,9 @@ test "warmup: replay pre-fills the result caches so real calls hit" {
     try explorer.indexFile("src/rare.zig", "const r = 1; // raretok\n");
 
     var shutdown = std.atomic.Value(bool).init(false);
-    const queries = [_][]const u8{ "warmtok", "raretok" };
+    // A multi-word query routes through searchContentAuto to the ranked
+    // (BM25) path, exercising the ranked cache.
+    const queries = [_][]const u8{ "warmtok", "raretok", "raretok warmtok" };
     warmup.replay(&explorer, testing.allocator, &queries, &shutdown);
 
     // Real MCP-handler-shaped calls must now be cache hits.
@@ -2556,6 +2618,10 @@ test "warmup: replay pre-fills the result caches so real calls hit" {
     const r = try explorer.searchContent("raretok", testing.allocator, 21);
     defer freeSearchResults(r);
     try testing.expectEqual(@as(u64, 1), explorer.search_cache.hits);
+
+    const rr = try explorer.searchContentRanked("raretok warmtok", testing.allocator, 21);
+    defer freeSearchResults(rr);
+    try testing.expectEqual(@as(u64, 1), explorer.ranked_cache.hits);
 }
 
 test "warmup: replay honors shutdown" {
@@ -2566,6 +2632,7 @@ test "warmup: replay honors shutdown" {
     const queries = [_][]const u8{"stoptok"};
     warmup.replay(&explorer, testing.allocator, &queries, &shutdown);
     try testing.expectEqual(@as(usize, 0), explorer.search_cache.entries.items.len);
+    try testing.expectEqual(@as(usize, 0), explorer.ranked_cache.entries.items.len);
     try testing.expectEqual(@as(usize, 0), explorer.plain_render_cache.entries.items.len);
 }
 
