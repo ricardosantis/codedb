@@ -3321,10 +3321,25 @@ pub const Explorer = struct {
         defer file_hit_counts.deinit();
         var max_file_hits: u32 = 0;
         if (lfp.enabled) {
+            // Results arrive grouped by file, so the consecutive-path fast
+            // path turns one string getOrPut per result into one per unique
+            // file. The cached pointer is only dereferenced immediately after
+            // being (re)set, so it cannot dangle across a rehash.
+            var last_path: []const u8 = "";
+            var last_count: ?*u32 = null;
             for (result_list.items) |r| {
+                if (last_count) |cnt| {
+                    if (std.mem.eql(u8, r.path, last_path)) {
+                        cnt.* += 1;
+                        if (cnt.* > max_file_hits) max_file_hits = cnt.*;
+                        continue;
+                    }
+                }
                 const gop = try file_hit_counts.getOrPut(r.path);
                 gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
                 if (gop.value_ptr.* > max_file_hits) max_file_hits = gop.value_ptr.*;
+                last_path = r.path;
+                last_count = gop.value_ptr;
             }
         }
         // #550: a single-token query that exactly names a known symbol gets the
@@ -3388,14 +3403,15 @@ pub const Explorer = struct {
             if (sp.enabled) entry.value_ptr.sp_mult = sp.multiplier(self, path);
         }
 
-        // Same consecutive-path memoization as the facts pass: the facts are
-        // copied by VALUE, so later map lookups can never be invalidated (the
-        // map is no longer mutated here anyway).
+        // Same consecutive-path memoization as the facts pass. Holding a
+        // pointer (instead of copying the ~120-byte facts struct per result)
+        // is safe: the map is not mutated anywhere in this loop.
+        const no_facts = PathRerankFacts{};
         var score_last_path: []const u8 = "";
-        var score_last_facts: PathRerankFacts = .{};
+        var score_last_facts: *const PathRerankFacts = &no_facts;
         for (result_list.items) |*r| {
             if (score_last_path.len == 0 or !std.mem.eql(u8, r.path, score_last_path)) {
-                score_last_facts = facts_by_path.get(r.path) orelse PathRerankFacts{};
+                score_last_facts = facts_by_path.getPtr(r.path) orelse &no_facts;
                 score_last_path = r.path;
             }
             const facts = score_last_facts;
@@ -3434,19 +3450,55 @@ pub const Explorer = struct {
             r.score = score;
         }
         if (result_list.items.len > 1) {
-            // pdq, not block: (score, path, line_num) is a total order, so an
-            // unstable sort yields the identical permutation while moving the
-            // fat SearchResult structs far less.
-            std.sort.pdq(SearchResult, result_list.items, {}, struct {
-                pub fn lessThan(_: void, a: SearchResult, b: SearchResult) bool {
-                    const sa = if (a.score == a.score) a.score else 0;
-                    const sb = if (b.score == b.score) b.score else 0;
-                    if (sa != sb) return sa > sb;
-                    const ord = std.mem.order(u8, a.path, b.path);
-                    if (ord != .eq) return ord == .lt;
-                    return a.line_num < b.line_num;
+            // The (score desc, path asc, line asc) order sorts via one
+            // precomputed u64 key per result — score as order-isomorphic
+            // descending bits, path as its lexicographic rank among the
+            // unique result paths — with line_num as the in-comparator
+            // tiebreak. No string compares or 40-byte struct moves inside
+            // the sort loop; the permutation applies in one scratch pass.
+            var unique_paths: std.ArrayList([]const u8) = .empty;
+            defer unique_paths.deinit(allocator);
+            try unique_paths.ensureTotalCapacity(allocator, facts_by_path.count());
+            var path_iter = facts_by_path.keyIterator();
+            while (path_iter.next()) |k| unique_paths.appendAssumeCapacity(k.*);
+            std.sort.pdq([]const u8, unique_paths.items, {}, struct {
+                pub fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                    return std.mem.lessThan(u8, a, b);
                 }
             }.lessThan);
+            for (unique_paths.items, 0..) |p, rank| {
+                if (facts_by_path.getPtr(p)) |f| f.path_rank = @intCast(rank);
+            }
+
+            const keys = try allocator.alloc(u64, result_list.items.len);
+            defer allocator.free(keys);
+            const order = try allocator.alloc(u32, result_list.items.len);
+            defer allocator.free(order);
+            {
+                var lp: []const u8 = "";
+                var lrank: u32 = std.math.maxInt(u32);
+                for (result_list.items, 0..) |r, ri| {
+                    if (lp.len == 0 or !std.mem.eql(u8, r.path, lp)) {
+                        lrank = if (facts_by_path.getPtr(r.path)) |f| f.path_rank else std.math.maxInt(u32);
+                        lp = r.path;
+                    }
+                    keys[ri] = (@as(u64, scoreDescBits(r.score)) << 32) | lrank;
+                    order[ri] = @intCast(ri);
+                }
+            }
+            const SortCtx = struct {
+                keys: []const u64,
+                items: []const SearchResult,
+                pub fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+                    if (ctx.keys[a] != ctx.keys[b]) return ctx.keys[a] < ctx.keys[b];
+                    return ctx.items[a].line_num < ctx.items[b].line_num;
+                }
+            };
+            std.sort.pdq(u32, order, SortCtx{ .keys = keys, .items = result_list.items }, SortCtx.lessThan);
+            const scratch = try allocator.alloc(SearchResult, result_list.items.len);
+            defer allocator.free(scratch);
+            @memcpy(scratch, result_list.items);
+            for (order, 0..) |src, dst| result_list.items[dst] = scratch[src];
         }
         self.appendRerankTrace(query, result_list.items);
         return result_list.toOwnedSlice(allocator);
@@ -3471,7 +3523,23 @@ pub const Explorer = struct {
         cc: f32 = 1,
         lfp_mult: f32 = 1,
         sp_mult: f32 = 1,
+        /// Lexicographic rank of this path among the result set's unique
+        /// paths — assigned by rerankAndFinalize just before the final sort
+        /// so the sort key replaces per-comparison string compares.
+        path_rank: u32 = 0,
     };
+
+    /// Map a score to bits whose UNSIGNED ascending order equals descending
+    /// float order — the standard sign-flip trick, with NaN collapsed to 0
+    /// and -0.0 to +0.0 so it ties exactly like the float comparator it
+    /// replaces (`if (sa != sb) return sa > sb` with NaN already mapped).
+    fn scoreDescBits(score: f32) u32 {
+        var v: f32 = if (score == score) score else 0;
+        if (v == 0) v = 0;
+        const b: u32 = @bitCast(v);
+        const asc: u32 = if (b & 0x8000_0000 != 0) ~b else b | 0x8000_0000;
+        return ~asc;
+    }
 
     fn pathRerankFacts(self: *const Explorer, path: []const u8, query: []const u8) PathRerankFacts {
         var facts: PathRerankFacts = .{};
@@ -6334,53 +6402,68 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
         query_lower_buf[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
     }
     const query_lower = query_lower_buf[0..query.len];
-    const first_lower: u8 = query_lower[0];
-    const first_upper: u8 = if (first_lower >= 'a' and first_lower <= 'z') first_lower - 32 else first_lower;
+    // Anchor the scan on the needle's RAREST byte (see code_char_freq) — for
+    // common-first-letter words this cuts verify calls by an order of
+    // magnitude versus always anchoring on byte 0. A match starting at s has
+    // its anchor at s + anchor, so candidate positions live in
+    // [anchor, end + anchor).
+    var anchor: usize = 0;
+    var anchor_rarity: u8 = std.math.maxInt(u8);
+    for (query_lower, 0..) |c, j| {
+        if (code_char_freq[c] < anchor_rarity) {
+            anchor_rarity = code_char_freq[c];
+            anchor = j;
+        }
+    }
+    const anchor_lower: u8 = query_lower[anchor];
+    const anchor_upper: u8 = if (anchor_lower >= 'a' and anchor_lower <= 'z') anchor_lower - 32 else anchor_lower;
     var file_hits: usize = 0;
-    var pos: usize = 0;
     const end = content.len - query.len + 1;
+    const scan_end = end + anchor;
+    var pos: usize = anchor;
 
     // Track line number incrementally.
     var current_line: u32 = 1;
     var current_line_start: usize = 0;
 
-    // SIMD constants — 16-byte NEON/SSE vectors.
-    const VW = 16;
+    // SIMD constants — 32-byte vectors (2x NEON / 1x AVX2 per compare).
+    const VW = 32;
     const Vec = @Vector(VW, u8);
-    const splat_lo: Vec = @splat(first_lower);
-    const splat_hi: Vec = @splat(first_upper);
+    const splat_lo: Vec = @splat(anchor_lower);
+    const splat_hi: Vec = @splat(anchor_upper);
 
-    scan: while (pos < end) {
-        // ── SIMD path: process full 16-byte chunks ──
-        if (pos + VW <= end) {
+    scan: while (pos < scan_end) {
+        // ── SIMD path: process full chunks ──
+        if (pos + VW <= scan_end) {
             const chunk: Vec = content[pos..][0..VW].*;
             const eq_lo: @Vector(VW, u1) = @bitCast(chunk == splat_lo);
             const eq_hi: @Vector(VW, u1) = @bitCast(chunk == splat_hi);
-            var mask: u16 = @bitCast(eq_lo | eq_hi);
+            var mask: u32 = @bitCast(eq_lo | eq_hi);
 
             if (mask == 0) {
                 pos += VW;
                 continue;
             }
 
-            // Process ALL first-byte candidates in this chunk without reloading.
+            // Process ALL anchor candidates in this chunk without reloading.
             while (mask != 0) {
                 const offset: usize = @ctz(mask);
                 const cand = pos + offset;
-                if (cand >= end) break;
+                if (cand >= scan_end) break;
+                const start = cand - anchor;
 
-                if (matchAtCaseInsensitive(content, cand, query_lower)) {
+                if (matchAtCaseInsensitive(content, start, query_lower)) {
                     // ── Match found ──
-                    while (current_line_start < cand) {
+                    while (current_line_start < start) {
                         if (simdIndexOfNewline(content, current_line_start)) |nl| {
-                            if (nl < cand) {
+                            if (nl < start) {
                                 current_line += 1;
                                 current_line_start = nl + 1;
                             } else break;
                         } else break;
                     }
                     const line_start = current_line_start;
-                    const line_end = simdIndexOfNewline(content, cand) orelse content.len;
+                    const line_end = simdIndexOfNewline(content, start) orelse content.len;
 
                     const line_text = try allocator.dupe(u8, content[line_start..line_end]);
                     errdefer allocator.free(line_text);
@@ -6392,8 +6475,10 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
 
                     current_line += 1;
                     current_line_start = line_end + 1;
-                    pos = line_end + 1;
-                    if (pos >= end) return;
+                    // One result per line: the next match must START after
+                    // the line, so its anchor sits at least `anchor` later.
+                    pos = line_end + 1 + anchor;
+                    if (pos >= scan_end) return;
                     continue :scan;
                 }
                 mask &= mask - 1; // clear lowest bit, try next candidate in chunk
@@ -6402,32 +6487,35 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
             continue;
         }
 
-        // ── Scalar tail for last <16 bytes ──
+        // ── Scalar tail for the last <VW bytes ──
         const c = content[pos];
-        if ((c == first_lower or c == first_upper) and matchAtCaseInsensitive(content, pos, query_lower)) {
-            while (current_line_start < pos) {
-                if (simdIndexOfNewline(content, current_line_start)) |nl| {
-                    if (nl < pos) {
-                        current_line += 1;
-                        current_line_start = nl + 1;
+        if (c == anchor_lower or c == anchor_upper) {
+            const start = pos - anchor;
+            if (matchAtCaseInsensitive(content, start, query_lower)) {
+                while (current_line_start < start) {
+                    if (simdIndexOfNewline(content, current_line_start)) |nl| {
+                        if (nl < start) {
+                            current_line += 1;
+                            current_line_start = nl + 1;
+                        } else break;
                     } else break;
-                } else break;
+                }
+                const line_start = current_line_start;
+                const line_end = simdIndexOfNewline(content, start) orelse content.len;
+
+                const line_text = try allocator.dupe(u8, content[line_start..line_end]);
+                errdefer allocator.free(line_text);
+                const path_copy = try allocator.dupe(u8, path);
+                errdefer allocator.free(path_copy);
+                try result_list.append(allocator, .{ .path = path_copy, .line_num = current_line, .line_text = line_text });
+                file_hits += 1;
+                if (file_hits >= max_per_file or result_list.items.len >= max_results) return;
+
+                current_line += 1;
+                current_line_start = line_end + 1;
+                pos = line_end + 1 + anchor;
+                continue;
             }
-            const line_start = current_line_start;
-            const line_end = simdIndexOfNewline(content, pos) orelse content.len;
-
-            const line_text = try allocator.dupe(u8, content[line_start..line_end]);
-            errdefer allocator.free(line_text);
-            const path_copy = try allocator.dupe(u8, path);
-            errdefer allocator.free(path_copy);
-            try result_list.append(allocator, .{ .path = path_copy, .line_num = current_line, .line_text = line_text });
-            file_hits += 1;
-            if (file_hits >= max_per_file or result_list.items.len >= max_results) return;
-
-            current_line += 1;
-            current_line_start = line_end + 1;
-            pos = line_end + 1;
-            continue;
         }
         pos += 1;
     }
@@ -6512,43 +6600,70 @@ pub fn regexMatch(haystack: []const u8, pattern: []const u8) bool {
     return false;
 }
 
+/// Rough frequency of each lowercase byte in source code, used only to pick
+/// the SIMD anchor inside indexOfCaseInsensitive — lower is rarer. Anchor
+/// choice never affects correctness, only how often candidates verify.
+const code_char_freq: [256]u8 = blk: {
+    var t = [_]u8{3} ** 256;
+    const ranks = "zqjxkvbywgpfmucdlhrsnioate";
+    for (ranks, 0..) |c, i| t[c] = @intCast(i + 4);
+    for ('0'..'9' + 1) |c| t[c] = 5;
+    t['_'] = 20;
+    t['.'] = 14;
+    break :blk t;
+};
+
 fn indexOfCaseInsensitive(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len == 0) return 0;
     if (needle.len > haystack.len) return null;
 
-    // Pre-compute lowered first byte + second byte for fast skip.
-    const first_lower: u8 = if (needle[0] >= 'A' and needle[0] <= 'Z') needle[0] + 32 else needle[0];
-    const first_upper: u8 = if (needle[0] >= 'a' and needle[0] <= 'z') needle[0] - 32 else needle[0];
     const end = haystack.len - needle.len + 1;
 
     if (needle.len == 1) {
-        // Single-char: use std.mem.indexOfAny for speed.
-        const chars = [2]u8{ first_lower, first_upper };
+        const c = needle[0];
+        const lower: u8 = if (c >= 'A' and c <= 'Z') c + 32 else c;
+        const upper: u8 = if (lower >= 'a' and lower <= 'z') lower - 32 else lower;
+        const chars = [2]u8{ lower, upper };
         return std.mem.indexOfAny(u8, haystack, &chars);
     }
 
-    const second_lower: u8 = if (needle[1] >= 'A' and needle[1] <= 'Z') needle[1] + 32 else needle[1];
+    // Jump between candidates of the needle's RAREST byte with the
+    // vectorized indexOfAnyPos instead of walking byte-by-byte — content
+    // scans (searchInContent, Tier 1 candidate verification) spend most of
+    // their time here, and anchoring on a rare letter (a 'k' or 'x') rather
+    // than position 0 keeps the verify rate low for common-first-letter words.
+    var anchor: usize = 0;
+    var anchor_freq: u8 = std.math.maxInt(u8);
+    for (needle, 0..) |c, j| {
+        const cl: u8 = if (c >= 'A' and c <= 'Z') c + 32 else c;
+        if (code_char_freq[cl] < anchor_freq) {
+            anchor_freq = code_char_freq[cl];
+            anchor = j;
+        }
+    }
+    const ac = needle[anchor];
+    const anchor_lower: u8 = if (ac >= 'A' and ac <= 'Z') ac + 32 else ac;
+    const anchor_upper: u8 = if (anchor_lower >= 'a' and anchor_lower <= 'z') anchor_lower - 32 else anchor_lower;
+    const anchor_chars = [2]u8{ anchor_lower, anchor_upper };
 
-    var i: usize = 0;
-    while (i < end) : (i += 1) {
-        // Fast reject: check first byte, then second byte before full compare.
-        const c0 = haystack[i];
-        if (c0 != first_lower and c0 != first_upper) continue;
-        const c1 = haystack[i + 1];
-        const c1_lower = if (c1 >= 'A' and c1 <= 'Z') c1 + 32 else c1;
-        if (c1_lower != second_lower) continue;
-
-        // First two bytes match — verify the rest.
+    // A match starting at s puts the anchor at s + anchor, so anchor
+    // candidates live in [anchor, end + anchor).
+    const scan = haystack[0 .. end - 1 + anchor + 1];
+    var i: usize = anchor;
+    while (std.mem.indexOfAnyPos(u8, scan, i, &anchor_chars)) |pos| {
+        i = pos + 1;
+        const start = pos - anchor;
         var match = true;
-        for (2..needle.len) |j| {
-            const hc = if (haystack[i + j] >= 'A' and haystack[i + j] <= 'Z') haystack[i + j] + 32 else haystack[i + j];
-            const nc = if (needle[j] >= 'A' and needle[j] <= 'Z') needle[j] + 32 else needle[j];
-            if (hc != nc) {
+        for (needle, 0..) |nc0, j| {
+            const hc = haystack[start + j];
+            const hl: u8 = if (hc >= 'A' and hc <= 'Z') hc + 32 else hc;
+            const nl: u8 = if (nc0 >= 'A' and nc0 <= 'Z') nc0 + 32 else nc0;
+            if (hl != nl) {
                 match = false;
                 break;
             }
         }
-        if (match) return i;
+        if (match) return start;
     }
     return null;
 }
