@@ -754,6 +754,7 @@ fn loadOutlineStateMap(io: std.Io, snapshot_path: []const u8, allocator: std.mem
                 .line_end = line_end,
                 .detail = detail,
             });
+            outline.name_len_mask |= explore_mod.FileOutline.nameLenBit(name.len);
         }
 
         try result.put(path, outline);

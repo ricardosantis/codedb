@@ -55,6 +55,41 @@ pub const Symbol = struct {
     detail: ?[]const u8 = null,
 };
 
+/// Query-independent path-prior flags shared by the rerankers — a pure
+/// function of the path, see classifyPath.
+pub const PathClass = struct {
+    is_tooling: bool = false,
+    is_test: bool = false,
+    is_example: bool = false,
+    is_vendor: bool = false,
+};
+
+/// Classify `path` for the rerank path priors. Pure — the result is cached
+/// on FileOutline at init; callers without an outline compute it directly.
+pub fn classifyPath(path: []const u8) PathClass {
+    var c: PathClass = .{};
+    // One tokenize pass over the path instead of one per segment keyword.
+    var iter = std.mem.tokenizeAny(u8, path, "/\\");
+    while (iter.next()) |seg| {
+        // #598: mention-dense tooling files (a bench script repeating the
+        // term six times per line) saturate the per-line count and shrug off
+        // the ×0.5 path prior — the occurrence BASE is capped for tooling.
+        if (std.mem.eql(u8, seg, "bench") or std.mem.eql(u8, seg, "benchmarks") or
+            std.mem.eql(u8, seg, "scripts") or std.mem.eql(u8, seg, "website") or
+            std.mem.eql(u8, seg, "install")) c.is_tooling = true;
+        if (std.mem.eql(u8, seg, "tests") or std.mem.eql(u8, seg, "test")) c.is_test = true;
+        if (std.mem.eql(u8, seg, "examples") or std.mem.eql(u8, seg, "example")) c.is_example = true;
+        if (std.mem.eql(u8, seg, "vendor") or std.mem.eql(u8, seg, "node_modules") or
+            std.mem.eql(u8, seg, "third_party")) c.is_vendor = true;
+    }
+    // #580: match BM25's pathRelevanceMultiplier — test files identified by
+    // BASENAME (tests.zig, test_*.zig, *_tests.zig) are tests even without
+    // a test/ directory segment.
+    const basename = std.fs.path.basename(path);
+    if (std.mem.startsWith(u8, basename, "test") or std.mem.indexOf(u8, basename, "_test") != null) c.is_test = true;
+    return c;
+}
+
 pub const FileOutline = struct {
     path: []const u8,
     language: Language,
@@ -69,6 +104,20 @@ pub const FileOutline = struct {
     /// section, retained by the Explorer) rather than individual allocations,
     /// so deinit must not free them. The ArrayLists themselves are still owned.
     borrows_strings: bool = false,
+    /// Bitmask of symbol-name lengths present (bit min(len, 63)). A
+    /// conservative superset — never cleared on symbol removal — that lets
+    /// per-query definition scans (fileDefinesSymbol, pathRerankFacts) skip
+    /// the whole symbol list when no name could match the query's length.
+    /// Every site that appends to `symbols` must OR in the new name's bit.
+    name_len_mask: u64 = 0,
+    /// Query-independent path-prior classification (issue #429 signals),
+    /// computed once at init — pure function of `path`, so reranks can read
+    /// it instead of re-tokenizing the path on every query.
+    path_class: PathClass = .{},
+
+    pub fn nameLenBit(len: usize) u64 {
+        return @as(u64, 1) << @as(u6, @intCast(@min(len, 63)));
+    }
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) FileOutline {
         return .{
@@ -77,6 +126,7 @@ pub const FileOutline = struct {
             .line_count = 0,
             .byte_size = 0,
             .allocator = allocator,
+            .path_class = classifyPath(path),
         };
     }
     pub fn deinit(self: *FileOutline) void {
@@ -743,10 +793,142 @@ const LexFreqPenalty = struct {
         return 1.0 - self.amp * norm;
     }
 };
+
+/// Per-file newline-offset tables so Tier 0's line-number → line-text lookups
+/// skip rescanning file bytes on every query. Entries self-validate against
+/// the content slice (ptr+len) they were built from and are invalidated on
+/// reindex/remove. Guarded by its own mutex because searchContent runs under
+/// the Explorer's SHARED lock — concurrent readers may build entries.
+const LineOffsetCache = struct {
+    const Entry = struct {
+        content_ptr: usize,
+        content_len: usize,
+        offsets: []u32,
+    };
+    pub const Span = struct {
+        line: u32,
+        start: usize,
+        end: usize,
+    };
+
+    map: std.StringHashMap(Entry),
+    mu: cio.Mutex = .{},
+    total_bytes: usize = 0,
+
+    const MAX_BYTES: usize = 16 * 1024 * 1024;
+
+    fn init(allocator: std.mem.Allocator) LineOffsetCache {
+        return .{ .map = std.StringHashMap(Entry).init(allocator) };
+    }
+
+    fn deinit(self: *LineOffsetCache) void {
+        var iter = self.map.iterator();
+        while (iter.next()) |e| {
+            self.map.allocator.free(e.key_ptr.*);
+            self.map.allocator.free(e.value_ptr.offsets);
+        }
+        self.map.deinit();
+    }
+
+    fn clearLocked(self: *LineOffsetCache) void {
+        var iter = self.map.iterator();
+        while (iter.next()) |e| {
+            self.map.allocator.free(e.key_ptr.*);
+            self.map.allocator.free(e.value_ptr.offsets);
+        }
+        self.map.clearRetainingCapacity();
+        self.total_bytes = 0;
+    }
+
+    fn clear(self: *LineOffsetCache) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.clearLocked();
+    }
+
+    fn invalidate(self: *LineOffsetCache, path: []const u8) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.map.fetchRemove(path)) |kv| {
+            self.total_bytes -= kv.value.offsets.len * @sizeOf(u32);
+            self.map.allocator.free(kv.key);
+            self.map.allocator.free(kv.value.offsets);
+        }
+    }
+
+    fn buildOffsets(allocator: std.mem.Allocator, content: []const u8) ?[]u32 {
+        var offsets: std.ArrayList(u32) = .empty;
+        offsets.ensureTotalCapacity(allocator, @max(16, content.len / 32)) catch return null;
+        offsets.appendAssumeCapacity(0);
+        var pos: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, content, pos, '\n')) |nl| {
+            pos = nl + 1;
+            offsets.append(allocator, @intCast(pos)) catch {
+                offsets.deinit(allocator);
+                return null;
+            };
+        }
+        return offsets.toOwnedSlice(allocator) catch {
+            offsets.deinit(allocator);
+            return null;
+        };
+    }
+
+    /// Resolve ascending 1-based `target_lines` to byte spans in `content`,
+    /// building (and caching) the offset table for `path` on first touch.
+    /// Span semantics match std.mem.splitScalar(content, '\n'): a line ends
+    /// before its '\n'; the final line ends at content.len. Returns the
+    /// number of spans filled, or null when the table cannot be built (OOM)
+    /// — the caller falls back to the scanning path.
+    fn lineSpans(self: *LineOffsetCache, path: []const u8, content: []const u8, target_lines: []const u32, spans: []Span) ?usize {
+        self.mu.lock();
+        defer self.mu.unlock();
+        var offsets: []const u32 = undefined;
+        if (self.map.getPtr(path)) |e| {
+            if (e.content_ptr == @intFromPtr(content.ptr) and e.content_len == content.len) {
+                offsets = e.offsets;
+            } else {
+                const fresh = buildOffsets(self.map.allocator, content) orelse return null;
+                self.total_bytes -= e.offsets.len * @sizeOf(u32);
+                self.map.allocator.free(e.offsets);
+                e.* = .{ .content_ptr = @intFromPtr(content.ptr), .content_len = content.len, .offsets = fresh };
+                self.total_bytes += fresh.len * @sizeOf(u32);
+                offsets = fresh;
+            }
+        } else {
+            const fresh = buildOffsets(self.map.allocator, content) orelse return null;
+            const key = self.map.allocator.dupe(u8, path) catch {
+                self.map.allocator.free(fresh);
+                return null;
+            };
+            self.map.put(key, .{ .content_ptr = @intFromPtr(content.ptr), .content_len = content.len, .offsets = fresh }) catch {
+                self.map.allocator.free(fresh);
+                self.map.allocator.free(key);
+                return null;
+            };
+            self.total_bytes += fresh.len * @sizeOf(u32);
+            offsets = fresh;
+        }
+
+        var n: usize = 0;
+        for (target_lines) |ln| {
+            if (n >= spans.len) break;
+            if (ln == 0 or ln > offsets.len) continue;
+            const start: usize = offsets[ln - 1];
+            const end: usize = if (ln < offsets.len) offsets[ln] - 1 else content.len;
+            spans[n] = .{ .line = ln, .start = start, .end = end };
+            n += 1;
+        }
+
+        if (self.total_bytes > MAX_BYTES) self.clearLocked();
+        return n;
+    }
+};
 pub const Explorer = struct {
     outlines: std.StringHashMap(FileOutline),
     dep_graph: DependencyGraph,
     contents: ContentCache,
+    line_offsets: LineOffsetCache,
     symbol_index: std.StringHashMap(std.ArrayList(SymbolLocation)),
     /// False after a snapshot fast-load until ensureSymbolIndex runs (#564).
     symbol_index_complete: bool,
@@ -832,6 +1014,7 @@ pub const Explorer = struct {
             .outlines = std.StringHashMap(FileOutline).init(allocator),
             .dep_graph = DependencyGraph.init(allocator),
             .contents = try ContentCache.initAlloc(allocator, content_cache_capacity),
+            .line_offsets = LineOffsetCache.init(allocator),
             .symbol_index = std.StringHashMap(std.ArrayList(SymbolLocation)).init(allocator),
             .symbol_index_complete = true,
             .word_index = WordIndex.init(allocator),
@@ -859,6 +1042,7 @@ pub const Explorer = struct {
         self.symbol_index.deinit();
 
         self.contents.deinit();
+        self.line_offsets.deinit();
         if (self.call_centrality) |*c| c.deinit();
         if (self.call_graph) |*cg| cg.deinit(self.allocator);
         if (self.co_change) |*cc| git.freeCoChange(cc, self.allocator);
@@ -911,6 +1095,7 @@ pub const Explorer = struct {
         self.mu.lock();
         defer self.mu.unlock();
         self.contents.clear();
+        self.line_offsets.clear();
     }
 
     pub fn releaseSecondaryIndexes(self: *Explorer) void {
@@ -1028,6 +1213,7 @@ pub const Explorer = struct {
         // Last fallible step: put frees the prior cache value in place, so it
         // must run only once nothing after it can still need prior_content.
         try self.contents.put(stable_path, content);
+        self.line_offsets.invalidate(stable_path);
 
         outline_gop.value_ptr.* = persistent_outline;
         if (prior_outline) |*old_outline| old_outline.deinit();
@@ -1627,6 +1813,7 @@ pub const Explorer = struct {
         self.removeSymbolIndexFor(path);
         _ = self.skip_trigram_files.remove(path);
         self.contents.remove(path);
+        self.line_offsets.invalidate(path);
         self.word_index.removeFile(path);
         self.trigram_index.removeFile(path);
 
@@ -1891,6 +2078,7 @@ pub const Explorer = struct {
                 .line_end = sym.line_end,
                 .detail = copied_detail,
             });
+            dst.name_len_mask |= FileOutline.nameLenBit(copied_name.len);
         }
         for (src.imports.items) |imp| {
             const copied_import = try allocator.dupe(u8, imp);
@@ -2520,77 +2708,176 @@ pub const Explorer = struct {
         if (word_hits.len > 0) {
             const Tier0File = struct {
                 path: []const u8,
+                doc_id: u32,
                 count: u32,
                 first_seen: usize,
+                // One past the ordinal of this file's last hit. Together with
+                // first_seen it bounds the file's posting run, so per-file
+                // target-line collection slices word_hits[first_seen..hits_end]
+                // instead of filtering the whole hit list per file. The
+                // doc_id filter stays, so the bounds are correct even if a
+                // file's hits were ever non-contiguous.
+                hits_end: usize,
                 is_doc: bool,
                 defines: bool,
             };
 
-            var tier0_files_by_path = std.StringHashMap(Tier0File).init(allocator);
-            defer tier0_files_by_path.deinit();
-
-            for (word_hits, 0..) |hit, ordinal| {
-                const hit_path = self.word_index.hitPath(hit);
-                if (hit_path.len == 0) continue;
-                const gop = tier0_files_by_path.getOrPut(hit_path) catch continue;
-                if (!gop.found_existing) {
-                    const is_doc = isDocLanguage(detectLanguage(hit_path));
-                    const defines = !is_doc and self.fileDefinesSymbol(hit_path, query);
-                    gop.value_ptr.* = .{
-                        .path = hit_path,
-                        .count = 0,
-                        .first_seen = ordinal,
-                        .is_doc = is_doc,
-                        .defines = defines,
-                    };
-                }
-                gop.value_ptr.count +|= 1;
-            }
-
+            // Candidates append straight into this array; deduplication maps
+            // doc_id → array index. Small doc tables get a direct-address
+            // slot array (one indexed load per lookup, no hashing at all);
+            // big tables — or queries too small to amortize the memset —
+            // fall back to a u32-keyed hash map. SLOT_NONE = unseen,
+            // SLOT_INVALID = doc checked and skipped (freed doc_id slot).
             var tier0_files: std.ArrayList(Tier0File) = .empty;
             defer tier0_files.deinit(allocator);
-            try tier0_files.ensureTotalCapacity(allocator, tier0_files_by_path.count());
-            var tier0_iter = tier0_files_by_path.valueIterator();
-            while (tier0_iter.next()) |stats| {
-                tier0_files.appendAssumeCapacity(stats.*);
+            try tier0_files.ensureTotalCapacity(allocator, @min(word_hits.len, 1024));
+
+            const SLOT_NONE = std.math.maxInt(u32);
+            const SLOT_INVALID = SLOT_NONE - 1;
+            const ndocs = self.word_index.id_to_path.items.len;
+            const use_slots = ndocs > 0 and (ndocs <= 4096 or (ndocs <= 65536 and word_hits.len >= 512));
+            var slots: []u32 = &.{};
+            defer if (slots.len > 0) allocator.free(slots);
+            var idx_by_doc = std.AutoHashMap(u32, u32).init(allocator);
+            defer idx_by_doc.deinit();
+            if (use_slots) {
+                slots = try allocator.alloc(u32, ndocs);
+                @memset(slots, SLOT_NONE);
+            } else {
+                idx_by_doc.ensureTotalCapacity(@intCast(@min(word_hits.len, 1024))) catch {};
             }
 
-            if (tier0_files.items.len > 1) {
-                std.sort.block(Tier0File, tier0_files.items, {}, struct {
-                    pub fn lessThan(_: void, a: Tier0File, b: Tier0File) bool {
-                        if (a.is_doc != b.is_doc) return !a.is_doc;
-                        if (a.defines != b.defines) return a.defines;
-                        if (a.count != b.count) return a.count > b.count;
-                        if (a.first_seen != b.first_seen) return a.first_seen < b.first_seen;
-                        return std.mem.lessThan(u8, a.path, b.path);
+            // Postings for one file are appended contiguously (indexFile
+            // processes whole files), so the hit list decomposes into runs of
+            // one doc_id each — group run-at-a-time: scan to the run boundary
+            // first, then touch the slot table and the entry ONCE per run
+            // instead of once per hit. Indices (not pointers) into
+            // tier0_files stay valid across array growth.
+            var run_start: usize = 0;
+            while (run_start < word_hits.len) {
+                const doc_id = word_hits[run_start].doc_id;
+                var run_end = run_start + 1;
+                while (run_end < word_hits.len and word_hits[run_end].doc_id == doc_id) run_end += 1;
+                defer run_start = run_end;
+
+                var cur: u32 = blk: {
+                    if (use_slots) {
+                        if (doc_id >= ndocs) break :blk SLOT_INVALID;
+                        break :blk slots[doc_id];
                     }
-                }.lessThan);
+                    break :blk idx_by_doc.get(doc_id) orelse SLOT_NONE;
+                };
+                if (cur == SLOT_NONE) {
+                    const hit_path = self.word_index.hitPath(word_hits[run_start]);
+                    if (hit_path.len == 0) {
+                        cur = SLOT_INVALID;
+                    } else {
+                        // One outline fetch serves both signals: language is
+                        // detectLanguage(path) computed at outline init, and
+                        // the defines scan is gated by the symbol-name-length
+                        // mask — the old shape hashed the path twice
+                        // (detectLanguage + fileDefinesSymbol's own get).
+                        // Files with no outline never define (same as
+                        // fileDefinesSymbol's `orelse return false`).
+                        var is_doc = false;
+                        var defines = false;
+                        if (self.outlines.get(hit_path)) |o| {
+                            is_doc = isDocLanguage(o.language);
+                            if (!is_doc and o.name_len_mask & FileOutline.nameLenBit(query.len) != 0) {
+                                for (o.symbols.items) |sym| {
+                                    if (asciiEqlIgnoreCase(sym.name, query)) {
+                                        defines = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            is_doc = isDocLanguage(detectLanguage(hit_path));
+                        }
+                        cur = @intCast(tier0_files.items.len);
+                        tier0_files.append(allocator, .{
+                            .path = hit_path,
+                            .doc_id = doc_id,
+                            .count = 0,
+                            .first_seen = run_start,
+                            .hits_end = run_end,
+                            .is_doc = is_doc,
+                            .defines = defines,
+                        }) catch {
+                            cur = SLOT_INVALID;
+                        };
+                    }
+                    if (use_slots) {
+                        if (doc_id < ndocs) slots[doc_id] = cur;
+                    } else {
+                        idx_by_doc.put(doc_id, cur) catch {};
+                    }
+                }
+                if (cur != SLOT_INVALID) {
+                    const e = &tier0_files.items[cur];
+                    e.count +|= @intCast(@min(run_end - run_start, std.math.maxInt(u32)));
+                    e.hits_end = run_end;
+                }
             }
 
+            // Sort plain u64 keys instead of the 48-byte structs. The old
+            // comparator (is_doc asc, defines desc, count desc, first_seen
+            // asc, path asc) packs losslessly: entries were appended in
+            // first-seen order, so the array index doubles as the first_seen
+            // tiebreak (unique per file — the path tiebreak was unreachable)
+            // AND addresses the entry after sorting. count saturates at
+            // 2^30−1; beyond that ties fall to first_seen, same as before.
+            var tier0_order: std.ArrayList(u64) = .empty;
+            defer tier0_order.deinit(allocator);
+            try tier0_order.ensureTotalCapacity(allocator, tier0_files.items.len);
+            for (tier0_files.items, 0..) |stats, i| {
+                const cnt: u64 = @min(stats.count, (1 << 30) - 1);
+                const key = (@as(u64, @intFromBool(stats.is_doc)) << 63) |
+                    (@as(u64, @intFromBool(!stats.defines)) << 62) |
+                    ((((1 << 30) - 1) - cnt) << 32) |
+                    @as(u64, @as(u32, @intCast(i)));
+                tier0_order.appendAssumeCapacity(key);
+            }
+            if (tier0_order.items.len > 1) {
+                std.sort.pdq(u64, tier0_order.items, {}, std.sort.asc(u64));
+            }
             const tier0_per_file_cap: usize = if (tier0_files.items.len <= 1) max_results else @max(1, max_results / 5);
             var tier0_exact_capacity: usize = 0;
-            for (tier0_files.items) |stats| {
-                tier0_exact_capacity += @min(@as(usize, stats.count), tier0_per_file_cap);
+            for (tier0_order.items) |key| {
+                tier0_exact_capacity += @min(@as(usize, tier0_files.items[@as(u32, @truncate(key))].count), tier0_per_file_cap);
                 if (tier0_exact_capacity >= max_results) break;
             }
             const use_line_hits = tier0_exact_capacity >= max_results and tier0_per_file_cap <= 256;
-            for (tier0_files.items) |stats| {
+            for (tier0_order.items) |key| {
+                const stats = tier0_files.items[@as(u32, @truncate(key))];
                 if (result_list.items.len >= max_results) break;
                 const ref = self.readContentForSearch(stats.path, allocator) orelse continue;
                 defer ref.deinit();
                 if (use_line_hits) {
                     var target_lines: [256]u32 = undefined;
                     var target_count: usize = 0;
-                    for (word_hits) |hit| {
+                    for (word_hits[stats.first_seen..stats.hits_end]) |hit| {
                         if (target_count >= tier0_per_file_cap) break;
-                        const hit_path = self.word_index.hitPath(hit);
-                        if (!std.mem.eql(u8, hit_path, stats.path)) continue;
+                        if (hit.doc_id != stats.doc_id) continue;
                         if (target_count == 0 or target_lines[target_count - 1] != hit.line_num) {
                             target_lines[target_count] = hit.line_num;
                             target_count += 1;
                         }
                     }
-                    try appendTargetLineHits(stats.path, ref.data, allocator, target_lines[0..target_count], max_results, &result_list);
+                    var spans: [256]LineOffsetCache.Span = undefined;
+                    if (self.line_offsets.lineSpans(stats.path, ref.data, target_lines[0..target_count], &spans)) |n_spans| {
+                        result_list.ensureUnusedCapacity(allocator, @min(n_spans, max_results - result_list.items.len)) catch {};
+                        for (spans[0..n_spans]) |sp| {
+                            if (result_list.items.len >= max_results) break;
+                            const line_text = try allocator.dupe(u8, ref.data[sp.start..sp.end]);
+                            errdefer allocator.free(line_text);
+                            const path_copy = try allocator.dupe(u8, stats.path);
+                            errdefer allocator.free(path_copy);
+                            try result_list.append(allocator, .{ .path = path_copy, .line_num = sp.line, .line_text = line_text });
+                        }
+                    } else {
+                        try appendTargetLineHits(stats.path, ref.data, allocator, target_lines[0..target_count], max_results, &result_list);
+                    }
                     if (result_list.items.len < max_results) searched.put(stats.path, {}) catch {};
                 } else {
                     searched.put(stats.path, {}) catch {};
@@ -2659,12 +2946,22 @@ pub const Explorer = struct {
                 // file behind unrelated short files when max_per_file was 1.
                 var hits_per_file = std.StringHashMap(u32).init(allocator);
                 defer hits_per_file.deinit();
-                for (word_hits) |hit| {
-                    const hp = self.word_index.hitPath(hit);
+                hits_per_file.ensureTotalCapacity(@intCast(@min(word_hits.len, 1024))) catch {};
+                // Same contiguous-posting decomposition as Tier 0's grouping:
+                // the hit list is runs of one doc_id each, so hitPath + the
+                // string getOrPut run once per file run, not per hit.
+                var hpf_run_start: usize = 0;
+                while (hpf_run_start < word_hits.len) {
+                    const hpf_doc = word_hits[hpf_run_start].doc_id;
+                    var hpf_run_end = hpf_run_start + 1;
+                    while (hpf_run_end < word_hits.len and word_hits[hpf_run_end].doc_id == hpf_doc) hpf_run_end += 1;
+                    defer hpf_run_start = hpf_run_end;
+
+                    const hp = self.word_index.hitPath(word_hits[hpf_run_start]);
                     if (hp.len == 0) continue;
                     const gop_h = try hits_per_file.getOrPut(hp);
                     if (!gop_h.found_existing) gop_h.value_ptr.* = 0;
-                    gop_h.value_ptr.* += 1;
+                    gop_h.value_ptr.* += @intCast(@min(hpf_run_end - hpf_run_start, std.math.maxInt(u32)));
                 }
                 const SortCtx = struct {
                     contents: *ContentCache,
@@ -2790,31 +3087,67 @@ pub const Explorer = struct {
             path: []const u8,
             count: u32,
             first_seen: usize,
+            // One past the ordinal of this file's last hit — bounds the
+            // file's posting run for the per-file target-line collection
+            // below (the doc_id filter stays, so the bounds are correct even
+            // if a file's hits were ever non-contiguous).
+            hits_end: usize,
             is_doc: bool,
         };
 
         var tier0_files_buf: [512]Tier0File = undefined;
         var tier0_files_len: usize = 0;
-        for (word_hits, 0..) |hit, ordinal| {
-            const hit_path = self.word_index.hitPath(hit);
+        // Direct-address doc_id → entry-index slots replace the linear rescan
+        // (O(unique files²) on high-frequency words). Same gating as
+        // searchContent's grouping; when the table is too big to amortize the
+        // memset, the rescan path below still handles dedup.
+        const SLOT_NONE = std.math.maxInt(u32);
+        const ndocs = self.word_index.id_to_path.items.len;
+        const use_slots = ndocs > 0 and (ndocs <= 4096 or (ndocs <= 65536 and word_hits.len >= 512));
+        var slots: []u32 = &.{};
+        defer if (slots.len > 0) allocator.free(slots);
+        if (use_slots) {
+            slots = allocator.alloc(u32, ndocs) catch &.{};
+            if (slots.len > 0) @memset(slots, SLOT_NONE);
+        }
+        // Postings for one file are appended contiguously (indexFile
+        // processes whole files), so the hit list decomposes into runs of one
+        // doc_id each — group run-at-a-time: scan to the run boundary first,
+        // then touch the slots/rescan and the entry ONCE per run.
+        var run_start: usize = 0;
+        while (run_start < word_hits.len) {
+            const doc_id = word_hits[run_start].doc_id;
+            var run_end = run_start + 1;
+            while (run_end < word_hits.len and word_hits[run_end].doc_id == doc_id) run_end += 1;
+            defer run_start = run_end;
+
+            const hit_path = self.word_index.hitPath(word_hits[run_start]);
             if (hit_path.len == 0) continue;
 
             var found_i: ?usize = null;
-            for (tier0_files_buf[0..tier0_files_len], 0..) |stats, i| {
-                if (stats.doc_id == hit.doc_id) {
-                    found_i = i;
-                    break;
+            if (slots.len > 0) {
+                if (doc_id < slots.len and slots[doc_id] != SLOT_NONE) found_i = slots[doc_id];
+            } else {
+                for (tier0_files_buf[0..tier0_files_len], 0..) |stats, i| {
+                    if (stats.doc_id == doc_id) {
+                        found_i = i;
+                        break;
+                    }
                 }
             }
+            const run_count: u32 = @intCast(@min(run_end - run_start, std.math.maxInt(u32)));
             if (found_i) |i| {
-                tier0_files_buf[i].count +|= 1;
+                tier0_files_buf[i].count +|= run_count;
+                tier0_files_buf[i].hits_end = run_end;
             } else {
                 if (tier0_files_len >= tier0_files_buf.len) return false;
+                if (slots.len > 0 and doc_id < slots.len) slots[doc_id] = @intCast(tier0_files_len);
                 tier0_files_buf[tier0_files_len] = .{
-                    .doc_id = hit.doc_id,
+                    .doc_id = doc_id,
                     .path = hit_path,
-                    .count = 1,
-                    .first_seen = ordinal,
+                    .count = run_count,
+                    .first_seen = run_start,
+                    .hits_end = run_end,
                     .is_doc = isDocLanguage(detectLanguage(hit_path)),
                 };
                 tier0_files_len += 1;
@@ -2825,11 +3158,15 @@ pub const Explorer = struct {
         const tier0_files = tier0_files_buf[0..tier0_files_len];
         if (tier0_files.len > 1) {
             const RankCtx = struct {
-                query: []const u8,
+                priors: []const f32,
+                files: []const Tier0File,
                 // Path-prior portion of rerankSignalScore: the canonical-file signals
                 // (basename-stem match, path segment) and demotion penalties. Without it
                 // this fast-path rendered in raw hit-count order, so a high-frequency
                 // non-canonical file outranked the canonical basename match.
+                // Computed ONCE per file into `priors` — the old shape
+                // recomputed both priors (basename + ~10 path-segment scans)
+                // inside the comparator on every comparison.
                 fn prior(path: []const u8, q: []const u8) f32 {
                     const base = std.fs.path.basename(path);
                     const stem_end = std.mem.indexOfScalar(u8, base, '.') orelse base.len;
@@ -2848,17 +3185,31 @@ pub const Explorer = struct {
                         pathHasSegment(path, "third_party")) s *= 0.4;
                     return s;
                 }
-                pub fn lessThan(ctx: @This(), a: Tier0File, b: Tier0File) bool {
-                    const pa = prior(a.path, ctx.query);
-                    const pb = prior(b.path, ctx.query);
+                pub fn lessThan(ctx: @This(), ai: u32, bi: u32) bool {
+                    const pa = ctx.priors[ai];
+                    const pb = ctx.priors[bi];
                     if (pa != pb) return pa > pb;
+                    const a = ctx.files[ai];
+                    const b = ctx.files[bi];
                     if (a.is_doc != b.is_doc) return !a.is_doc;
                     if (a.count != b.count) return a.count > b.count;
                     if (a.first_seen != b.first_seen) return a.first_seen < b.first_seen;
                     return std.mem.lessThan(u8, a.path, b.path);
                 }
             };
-            std.sort.block(Tier0File, tier0_files, RankCtx{ .query = query }, RankCtx.lessThan);
+            var priors_buf: [512]f32 = undefined;
+            var order_buf: [512]u32 = undefined;
+            for (tier0_files, 0..) |stats, i| {
+                priors_buf[i] = RankCtx.prior(stats.path, query);
+                order_buf[i] = @intCast(i);
+            }
+            const order = order_buf[0..tier0_files.len];
+            std.sort.pdq(u32, order, RankCtx{ .priors = priors_buf[0..tier0_files.len], .files = tier0_files }, RankCtx.lessThan);
+            // Apply the permutation back into the value buffer so the render
+            // loops below keep iterating tier0_files directly.
+            var sorted_buf: [512]Tier0File = undefined;
+            for (order, 0..) |src, dst| sorted_buf[dst] = tier0_files[src];
+            @memcpy(tier0_files, sorted_buf[0..tier0_files.len]);
         }
 
         const tier0_per_file_cap: usize = if (tier0_files.len <= 1) max_results else @max(1, max_results / 5);
@@ -2895,7 +3246,7 @@ pub const Explorer = struct {
 
             var target_lines: [256]u32 = undefined;
             var target_count: usize = 0;
-            for (word_hits) |hit| {
+            for (word_hits[stats.first_seen..stats.hits_end]) |hit| {
                 if (target_count >= tier0_per_file_cap) break;
                 if (hit.doc_id != stats.doc_id) continue;
                 if (target_count == 0 or target_lines[target_count - 1] != hit.line_num) {
@@ -2915,17 +3266,11 @@ pub const Explorer = struct {
             }
 
             const content = self.contents.get(stats.path) orelse return false;
-            var target_i: usize = 0;
-            var line_num: u32 = 0;
-            var lines = std.mem.splitScalar(u8, content, '\n');
-            while (lines.next()) |line| {
-                line_num += 1;
-                while (target_i < target_count and target_lines[target_i] < line_num) {
-                    target_i += 1;
-                }
-                if (target_i >= target_count) break;
-                if (target_lines[target_i] != line_num) continue;
-                target_i += 1;
+            var spans: [256]LineOffsetCache.Span = undefined;
+            // OOM building the offset table → bail to the full searchContent
+            // path (caller falls through), which renders the same results.
+            const n_spans = self.line_offsets.lineSpans(stats.path, content, target_lines[0..target_count], &spans) orelse return false;
+            for (spans[0..n_spans]) |line_span| {
                 rendered += 1;
 
                 var count_idx: ?usize = null;
@@ -2948,7 +3293,7 @@ pub const Explorer = struct {
                     }
                 } else {
                     shown += 1;
-                    try w.print("  {s}:{d}: {s}\n", .{ stats.path, line_num, line });
+                    try w.print("  {s}:{d}: {s}\n", .{ stats.path, line_span.line, content[line_span.start..line_span.end] });
                 }
                 if (rendered >= max_results) break;
             }
@@ -2987,13 +3332,27 @@ pub const Explorer = struct {
         defer file_hit_counts.deinit();
         var max_file_hits: u32 = 0;
         if (lfp.enabled) {
+            // Results arrive grouped by file, so the consecutive-path fast
+            // path turns one string getOrPut per result into one per unique
+            // file. The cached pointer is only dereferenced immediately after
+            // being (re)set, so it cannot dangle across a rehash.
+            var last_path: []const u8 = "";
+            var last_count: ?*u32 = null;
             for (result_list.items) |r| {
+                if (last_count) |cnt| {
+                    if (std.mem.eql(u8, r.path, last_path)) {
+                        cnt.* += 1;
+                        if (cnt.* > max_file_hits) max_file_hits = cnt.*;
+                        continue;
+                    }
+                }
                 const gop = try file_hit_counts.getOrPut(r.path);
                 gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
                 if (gop.value_ptr.* > max_file_hits) max_file_hits = gop.value_ptr.*;
+                last_path = r.path;
+                last_count = gop.value_ptr;
             }
         }
-
         // #550: a single-token query that exactly names a known symbol gets the
         // call-graph distance boost here too (the multi-word BM25 path applies
         // it in searchContentRanked). The symbol_index gate keeps plain word
@@ -3012,107 +3371,245 @@ pub const Explorer = struct {
             graph_dist = self.queryGraphDistances(&gd_terms, ga);
         }
 
-        // #550 signal 2: git co-change. Seeds are the result files that
-        // DEFINE the queried symbol, so plain word queries never trigger the
-        // one-time `git log` shell-out.
+        // Per-unique-path rerank facts, computed ONCE per path instead of per
+        // result — every path-level signal (outline definition scan, path
+        // priors, boost multipliers) is identical for all hits in the same
+        // file. `defines` feeds the co-change seeds (#550 signal 2: seeds are
+        // the result files that DEFINE the queried symbol, so plain word
+        // queries never trigger the one-time `git log` shell-out).
+        // Results arrive grouped by file (every tier emits per-file), so a
+        // consecutive-path fast path resolves most results with one
+        // std.mem.eql instead of a string hash + probe.
+        var facts_by_path = std.StringHashMap(PathRerankFacts).init(allocator);
+        defer facts_by_path.deinit();
+        {
+            var last_path: []const u8 = "";
+            for (result_list.items) |r| {
+                if (last_path.len > 0 and std.mem.eql(u8, r.path, last_path)) continue;
+                last_path = r.path;
+                const gop = facts_by_path.getOrPut(r.path) catch continue;
+                if (gop.found_existing) continue;
+                gop.value_ptr.* = self.pathRerankFacts(r.path, query);
+            }
+        }
+
         var cc_seeds = std.StringHashMap(void).init(allocator);
         defer cc_seeds.deinit();
         if (cio.posixGetenv("CODEDB_NO_COCHANGE") == null) {
-            for (result_list.items) |r| {
-                if (cc_seeds.contains(r.path)) continue;
-                if (self.fileDefinesSymbol(r.path, query)) cc_seeds.put(r.path, {}) catch {};
+            var facts_iter = facts_by_path.iterator();
+            while (facts_iter.next()) |entry| {
+                if (entry.value_ptr.defines) cc_seeds.put(entry.key_ptr.*, {}) catch {};
             }
             if (cc_seeds.count() > 0) self.ensureCoChange();
         }
 
+        // The boost multipliers depend on graph_dist / cc_seeds / the hit
+        // tally, so they fill in a second pass over the deduped path set.
+        var boosts_iter = facts_by_path.iterator();
+        while (boosts_iter.next()) |entry| {
+            const path = entry.key_ptr.*;
+            entry.value_ptr.gd = graphDistanceBoost(graph_dist, path);
+            entry.value_ptr.cc = self.coChangeBoost(&cc_seeds, path);
+            if (lfp.enabled) entry.value_ptr.lfp_mult = lfp.multiplier(file_hit_counts.get(path) orelse 1, max_file_hits);
+            if (sp.enabled) entry.value_ptr.sp_mult = sp.multiplier(self, path);
+        }
+
+        // Same consecutive-path memoization as the facts pass. Holding a
+        // pointer (instead of copying the ~120-byte facts struct per result)
+        // is safe: the map is not mutated anywhere in this loop.
+        const no_facts = PathRerankFacts{};
+        var score_last_path: []const u8 = "";
+        var score_last_facts: *const PathRerankFacts = &no_facts;
         for (result_list.items) |*r| {
-            r.score = self.rerankSignalScore(r.*, query);
-            r.score *= graphDistanceBoost(graph_dist, r.path);
-            r.score *= self.coChangeBoost(&cc_seeds, r.path);
-            if (lfp.enabled) r.score *= lfp.multiplier(file_hit_counts.get(r.path) orelse 1, max_file_hits);
-            if (sp.enabled) r.score *= sp.multiplier(self, r.path);
+            if (score_last_path.len == 0 or !std.mem.eql(u8, r.path, score_last_path)) {
+                score_last_facts = facts_by_path.getPtr(r.path) orelse &no_facts;
+                score_last_path = r.path;
+            }
+            const facts = score_last_facts;
+            const def_line_match = blk: {
+                for (facts.def_lines[0..facts.def_count]) |ln| {
+                    if (ln == r.line_num) break :blk true;
+                }
+                if (facts.def_overflow) {
+                    if (self.outlines.get(r.path)) |outline| {
+                        for (outline.symbols.items) |sym| {
+                            if (sym.line_start == r.line_num and asciiEqlIgnoreCase(sym.name, query)) break :blk true;
+                        }
+                    }
+                }
+                break :blk false;
+            };
+            var score: f32 = countOccurrences(r.line_text, query);
+            if (facts.is_tooling) score = @min(score, 2.0);
+            if (def_line_match) score += 5.0;
+            score += facts.add_boost;
+            if (facts.is_test) score *= 0.6;
+            if (facts.is_example) score *= 0.6;
+            if (facts.is_tooling) score *= 0.5;
+            if (facts.is_vendor) score *= 0.4;
+            // Doc-language penalty: markdown / data files (CHANGELOG.md, design
+            // docs, benchmark logs) often mention an identifier many times in a
+            // single line, which lets per-line frequency dwarf code call sites.
+            // For doc files, more mentions don't reflect more code-relevance —
+            // they reflect prose density. Cap at 1.0 then halve so any code hit
+            // (score >= 1) outranks any doc hit. Symmetric with path-prior.
+            if (facts.is_doc) score = @min(score, 1.0) * 0.5;
+            score *= facts.gd;
+            score *= facts.cc;
+            score *= facts.lfp_mult;
+            score *= facts.sp_mult;
+            r.score = score;
         }
         if (result_list.items.len > 1) {
-            std.sort.block(SearchResult, result_list.items, {}, struct {
-                pub fn lessThan(_: void, a: SearchResult, b: SearchResult) bool {
-                    const sa = if (a.score == a.score) a.score else 0;
-                    const sb = if (b.score == b.score) b.score else 0;
-                    if (sa != sb) return sa > sb;
-                    const ord = std.mem.order(u8, a.path, b.path);
-                    if (ord != .eq) return ord == .lt;
-                    return a.line_num < b.line_num;
+            // The (score desc, path asc, line asc) order sorts via one
+            // precomputed u64 key per result — score as order-isomorphic
+            // descending bits, path as its lexicographic rank among the
+            // unique result paths — with line_num as the in-comparator
+            // tiebreak. No string compares or 40-byte struct moves inside
+            // the sort loop; the permutation applies in one scratch pass.
+            var unique_paths: std.ArrayList([]const u8) = .empty;
+            defer unique_paths.deinit(allocator);
+            try unique_paths.ensureTotalCapacity(allocator, facts_by_path.count());
+            var path_iter = facts_by_path.keyIterator();
+            while (path_iter.next()) |k| unique_paths.appendAssumeCapacity(k.*);
+            std.sort.pdq([]const u8, unique_paths.items, {}, struct {
+                pub fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                    return std.mem.lessThan(u8, a, b);
                 }
             }.lessThan);
+            for (unique_paths.items, 0..) |p, rank| {
+                if (facts_by_path.getPtr(p)) |f| f.path_rank = @intCast(rank);
+            }
+
+            const keys = try allocator.alloc(u64, result_list.items.len);
+            defer allocator.free(keys);
+            const order = try allocator.alloc(u32, result_list.items.len);
+            defer allocator.free(order);
+            {
+                var lp: []const u8 = "";
+                var lrank: u32 = std.math.maxInt(u32);
+                for (result_list.items, 0..) |r, ri| {
+                    if (lp.len == 0 or !std.mem.eql(u8, r.path, lp)) {
+                        lrank = if (facts_by_path.getPtr(r.path)) |f| f.path_rank else std.math.maxInt(u32);
+                        lp = r.path;
+                    }
+                    keys[ri] = (@as(u64, scoreDescBits(r.score)) << 32) | lrank;
+                    order[ri] = @intCast(ri);
+                }
+            }
+            const SortCtx = struct {
+                keys: []const u64,
+                items: []const SearchResult,
+                pub fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+                    if (ctx.keys[a] != ctx.keys[b]) return ctx.keys[a] < ctx.keys[b];
+                    return ctx.items[a].line_num < ctx.items[b].line_num;
+                }
+            };
+            std.sort.pdq(u32, order, SortCtx{ .keys = keys, .items = result_list.items }, SortCtx.lessThan);
+            const scratch = try allocator.alloc(SearchResult, result_list.items.len);
+            defer allocator.free(scratch);
+            @memcpy(scratch, result_list.items);
+            for (order, 0..) |src, dst| result_list.items[dst] = scratch[src];
         }
         self.appendRerankTrace(query, result_list.items);
         return result_list.toOwnedSlice(allocator);
     }
 
-    /// Compose the rerank signals for one search hit (issue #429).
-    fn rerankSignalScore(self: *const Explorer, r: SearchResult, query: []const u8) f32 {
-        var score: f32 = countOccurrences(r.line_text, query);
+    /// Path-level rerank signals (issue #429), computed once per UNIQUE path
+    /// by rerankAndFinalize — every field here is identical for all hits in
+    /// the same file, so recomputing per result (the pre-fix shape) only
+    /// burned time. Per-result composition stays in rerankAndFinalize.
+    const PathRerankFacts = struct {
+        defines: bool = false,
+        def_lines: [16]u32 = undefined,
+        def_count: u8 = 0,
+        def_overflow: bool = false,
+        is_tooling: bool = false,
+        is_test: bool = false,
+        is_example: bool = false,
+        is_vendor: bool = false,
+        is_doc: bool = false,
+        add_boost: f32 = 0,
+        gd: f32 = 1,
+        cc: f32 = 1,
+        lfp_mult: f32 = 1,
+        sp_mult: f32 = 1,
+        /// Lexicographic rank of this path among the result set's unique
+        /// paths — assigned by rerankAndFinalize just before the final sort
+        /// so the sort key replaces per-comparison string compares.
+        path_rank: u32 = 0,
+    };
 
-        // #598: mention-dense tooling files (a bench script repeating the term
-        // six times per line) saturate the per-line count and shrug off the
-        // ×0.5 path prior below. Cap the occurrence BASE for tooling paths
-        // before the stem/symbol boosts so density cannot dominate, while an
-        // eponymous lookup (query 'install' → install/install.sh) still wins
-        // through its +15 stem boost.
-        const is_tooling_path = pathHasSegment(r.path, "bench") or pathHasSegment(r.path, "benchmarks") or
-            pathHasSegment(r.path, "scripts") or pathHasSegment(r.path, "website") or
-            pathHasSegment(r.path, "install");
-        if (is_tooling_path) score = @min(score, 2.0);
+    /// Map a score to bits whose UNSIGNED ascending order equals descending
+    /// float order — the standard sign-flip trick, with NaN collapsed to 0
+    /// and -0.0 to +0.0 so it ties exactly like the float comparator it
+    /// replaces (`if (sa != sb) return sa > sb` with NaN already mapped).
+    fn scoreDescBits(score: f32) u32 {
+        var v: f32 = if (score == score) score else 0;
+        if (v == 0) v = 0;
+        const b: u32 = @bitCast(v);
+        const asc: u32 = if (b & 0x8000_0000 != 0) ~b else b | 0x8000_0000;
+        return ~asc;
+    }
 
-        if (self.outlines.get(r.path)) |outline| {
-            for (outline.symbols.items) |sym| {
-                if (sym.line_start == r.line_num and asciiEqlIgnoreCase(sym.name, query)) {
-                    score += 5.0;
-                    break;
+    fn pathRerankFacts(self: *const Explorer, path: []const u8, query: []const u8) PathRerankFacts {
+        var facts: PathRerankFacts = .{};
+
+        // Symbol-definition facts from the outline: which lines start a
+        // symbol named exactly like the query (case-insensitive). Feeds the
+        // +5 definition-line boost and the co-change seed set (#550).
+        // Path-prior classification (#598 tooling cap, #580 test detection,
+        // example/vendor demotion) is query-independent — read it from the
+        // outline, where it was computed once at init; only paths with no
+        // outline (not indexed) classify on the fly.
+        var class: PathClass = .{};
+        var is_doc_lang: bool = undefined;
+        if (self.outlines.get(path)) |outline| {
+            class = outline.path_class;
+            is_doc_lang = isDocLanguage(outline.language);
+            if (outline.name_len_mask & FileOutline.nameLenBit(query.len) != 0) {
+                for (outline.symbols.items) |sym| {
+                    if (!asciiEqlIgnoreCase(sym.name, query)) continue;
+                    facts.defines = true;
+                    if (facts.def_count < facts.def_lines.len) {
+                        facts.def_lines[facts.def_count] = sym.line_start;
+                        facts.def_count += 1;
+                    } else {
+                        facts.def_overflow = true;
+                    }
                 }
             }
+        } else {
+            class = classifyPath(path);
+            is_doc_lang = isDocLanguage(detectLanguage(path));
         }
+        facts.is_tooling = class.is_tooling;
+        facts.is_test = class.is_test;
+        facts.is_example = class.is_example;
+        facts.is_vendor = class.is_vendor;
+        facts.is_doc = is_doc_lang;
 
-        const basename = std.fs.path.basename(r.path);
+        const basename = std.fs.path.basename(path);
         const stem_end = std.mem.indexOfScalar(u8, basename, '.') orelse basename.len;
         const stem = basename[0..stem_end];
         const stem_contains_query = asciiContainsIgnoreCase(stem, query);
         const query_contains_stem = asciiContainsIgnoreCase(query, stem);
         const stem_related_to_query = stem_contains_query or query_contains_stem;
         if (asciiEqlIgnoreCase(stem, query)) {
-            score += 15.0;
+            facts.add_boost += 15.0;
         } else if (stem_related_to_query) {
-            score += 8.0;
+            facts.add_boost += 8.0;
         }
         // Path-segment match boost: query matches a directory segment in
         // the path (e.g. query="parser" boosts src/parser/foo.zig). Weaker
         // than basename match because the file's own name is a stronger
         // intent signal than the directory it lives in. Skip when basename
         // already matched to avoid double-counting.
-        if (!stem_related_to_query and pathHasSegmentIgnoreCase(r.path, query)) {
-            score += 6.0;
+        if (!stem_related_to_query and pathHasSegmentIgnoreCase(path, query)) {
+            facts.add_boost += 6.0;
         }
 
-        // #580: match BM25's pathRelevanceMultiplier — test files identified by
-        // BASENAME (tests.zig, test_*.zig, *_tests.zig) are tests even without
-        // a test/ directory segment.
-        const is_test_file = pathHasSegment(r.path, "tests") or pathHasSegment(r.path, "test") or
-            std.mem.startsWith(u8, basename, "test") or std.mem.indexOf(u8, basename, "_test") != null;
-        if (is_test_file) score *= 0.6;
-        if (pathHasSegment(r.path, "examples") or pathHasSegment(r.path, "example")) score *= 0.6;
-        if (is_tooling_path) score *= 0.5;
-        if (pathHasSegment(r.path, "vendor") or pathHasSegment(r.path, "node_modules") or
-            pathHasSegment(r.path, "third_party")) score *= 0.4;
-        // Doc-language penalty: markdown / data files (CHANGELOG.md, design
-        // docs, benchmark logs) often mention an identifier many times in a
-        // single line, which lets per-line frequency dwarf code call sites.
-        // For doc files, more mentions don't reflect more code-relevance —
-        // they reflect prose density. Cap at 1.0 then halve so any code hit
-        // (score >= 1) outranks any doc hit. Symmetric with path-prior.
-        if (isDocLanguage(detectLanguage(r.path))) {
-            score = @min(score, 1.0) * 0.5;
-        }
-
-        return score;
+        return facts;
     }
 
     /// Append one JSON line per searchContent invocation. v0 logger for the
@@ -3332,6 +3829,7 @@ pub const Explorer = struct {
     /// where symbol_index is deferred (#564).
     fn fileDefinesSymbol(self: *const Explorer, path: []const u8, name: []const u8) bool {
         const outline = self.outlines.get(path) orelse return false;
+        if (outline.name_len_mask & FileOutline.nameLenBit(name.len) == 0) return false;
         for (outline.symbols.items) |sym| {
             if (asciiEqlIgnoreCase(sym.name, name)) return true;
         }
@@ -5915,53 +6413,68 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
         query_lower_buf[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
     }
     const query_lower = query_lower_buf[0..query.len];
-    const first_lower: u8 = query_lower[0];
-    const first_upper: u8 = if (first_lower >= 'a' and first_lower <= 'z') first_lower - 32 else first_lower;
+    // Anchor the scan on the needle's RAREST byte (see code_char_freq) — for
+    // common-first-letter words this cuts verify calls by an order of
+    // magnitude versus always anchoring on byte 0. A match starting at s has
+    // its anchor at s + anchor, so candidate positions live in
+    // [anchor, end + anchor).
+    var anchor: usize = 0;
+    var anchor_rarity: u8 = std.math.maxInt(u8);
+    for (query_lower, 0..) |c, j| {
+        if (code_char_freq[c] < anchor_rarity) {
+            anchor_rarity = code_char_freq[c];
+            anchor = j;
+        }
+    }
+    const anchor_lower: u8 = query_lower[anchor];
+    const anchor_upper: u8 = if (anchor_lower >= 'a' and anchor_lower <= 'z') anchor_lower - 32 else anchor_lower;
     var file_hits: usize = 0;
-    var pos: usize = 0;
     const end = content.len - query.len + 1;
+    const scan_end = end + anchor;
+    var pos: usize = anchor;
 
     // Track line number incrementally.
     var current_line: u32 = 1;
     var current_line_start: usize = 0;
 
-    // SIMD constants — 16-byte NEON/SSE vectors.
-    const VW = 16;
+    // SIMD constants — 32-byte vectors (2x NEON / 1x AVX2 per compare).
+    const VW = 32;
     const Vec = @Vector(VW, u8);
-    const splat_lo: Vec = @splat(first_lower);
-    const splat_hi: Vec = @splat(first_upper);
+    const splat_lo: Vec = @splat(anchor_lower);
+    const splat_hi: Vec = @splat(anchor_upper);
 
-    scan: while (pos < end) {
-        // ── SIMD path: process full 16-byte chunks ──
-        if (pos + VW <= end) {
+    scan: while (pos < scan_end) {
+        // ── SIMD path: process full chunks ──
+        if (pos + VW <= scan_end) {
             const chunk: Vec = content[pos..][0..VW].*;
             const eq_lo: @Vector(VW, u1) = @bitCast(chunk == splat_lo);
             const eq_hi: @Vector(VW, u1) = @bitCast(chunk == splat_hi);
-            var mask: u16 = @bitCast(eq_lo | eq_hi);
+            var mask: u32 = @bitCast(eq_lo | eq_hi);
 
             if (mask == 0) {
                 pos += VW;
                 continue;
             }
 
-            // Process ALL first-byte candidates in this chunk without reloading.
+            // Process ALL anchor candidates in this chunk without reloading.
             while (mask != 0) {
                 const offset: usize = @ctz(mask);
                 const cand = pos + offset;
-                if (cand >= end) break;
+                if (cand >= scan_end) break;
+                const start = cand - anchor;
 
-                if (matchAtCaseInsensitive(content, cand, query_lower)) {
+                if (matchAtCaseInsensitive(content, start, query_lower)) {
                     // ── Match found ──
-                    while (current_line_start < cand) {
+                    while (current_line_start < start) {
                         if (simdIndexOfNewline(content, current_line_start)) |nl| {
-                            if (nl < cand) {
+                            if (nl < start) {
                                 current_line += 1;
                                 current_line_start = nl + 1;
                             } else break;
                         } else break;
                     }
                     const line_start = current_line_start;
-                    const line_end = simdIndexOfNewline(content, cand) orelse content.len;
+                    const line_end = simdIndexOfNewline(content, start) orelse content.len;
 
                     const line_text = try allocator.dupe(u8, content[line_start..line_end]);
                     errdefer allocator.free(line_text);
@@ -5973,8 +6486,10 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
 
                     current_line += 1;
                     current_line_start = line_end + 1;
-                    pos = line_end + 1;
-                    if (pos >= end) return;
+                    // One result per line: the next match must START after
+                    // the line, so its anchor sits at least `anchor` later.
+                    pos = line_end + 1 + anchor;
+                    if (pos >= scan_end) return;
                     continue :scan;
                 }
                 mask &= mask - 1; // clear lowest bit, try next candidate in chunk
@@ -5983,32 +6498,35 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
             continue;
         }
 
-        // ── Scalar tail for last <16 bytes ──
+        // ── Scalar tail for the last <VW bytes ──
         const c = content[pos];
-        if ((c == first_lower or c == first_upper) and matchAtCaseInsensitive(content, pos, query_lower)) {
-            while (current_line_start < pos) {
-                if (simdIndexOfNewline(content, current_line_start)) |nl| {
-                    if (nl < pos) {
-                        current_line += 1;
-                        current_line_start = nl + 1;
+        if (c == anchor_lower or c == anchor_upper) {
+            const start = pos - anchor;
+            if (matchAtCaseInsensitive(content, start, query_lower)) {
+                while (current_line_start < start) {
+                    if (simdIndexOfNewline(content, current_line_start)) |nl| {
+                        if (nl < start) {
+                            current_line += 1;
+                            current_line_start = nl + 1;
+                        } else break;
                     } else break;
-                } else break;
+                }
+                const line_start = current_line_start;
+                const line_end = simdIndexOfNewline(content, start) orelse content.len;
+
+                const line_text = try allocator.dupe(u8, content[line_start..line_end]);
+                errdefer allocator.free(line_text);
+                const path_copy = try allocator.dupe(u8, path);
+                errdefer allocator.free(path_copy);
+                try result_list.append(allocator, .{ .path = path_copy, .line_num = current_line, .line_text = line_text });
+                file_hits += 1;
+                if (file_hits >= max_per_file or result_list.items.len >= max_results) return;
+
+                current_line += 1;
+                current_line_start = line_end + 1;
+                pos = line_end + 1 + anchor;
+                continue;
             }
-            const line_start = current_line_start;
-            const line_end = simdIndexOfNewline(content, pos) orelse content.len;
-
-            const line_text = try allocator.dupe(u8, content[line_start..line_end]);
-            errdefer allocator.free(line_text);
-            const path_copy = try allocator.dupe(u8, path);
-            errdefer allocator.free(path_copy);
-            try result_list.append(allocator, .{ .path = path_copy, .line_num = current_line, .line_text = line_text });
-            file_hits += 1;
-            if (file_hits >= max_per_file or result_list.items.len >= max_results) return;
-
-            current_line += 1;
-            current_line_start = line_end + 1;
-            pos = line_end + 1;
-            continue;
         }
         pos += 1;
     }
@@ -6093,43 +6611,70 @@ pub fn regexMatch(haystack: []const u8, pattern: []const u8) bool {
     return false;
 }
 
+/// Rough frequency of each lowercase byte in source code, used only to pick
+/// the SIMD anchor inside indexOfCaseInsensitive — lower is rarer. Anchor
+/// choice never affects correctness, only how often candidates verify.
+const code_char_freq: [256]u8 = blk: {
+    var t = [_]u8{3} ** 256;
+    const ranks = "zqjxkvbywgpfmucdlhrsnioate";
+    for (ranks, 0..) |c, i| t[c] = @intCast(i + 4);
+    for ('0'..'9' + 1) |c| t[c] = 5;
+    t['_'] = 20;
+    t['.'] = 14;
+    break :blk t;
+};
+
 fn indexOfCaseInsensitive(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len == 0) return 0;
     if (needle.len > haystack.len) return null;
 
-    // Pre-compute lowered first byte + second byte for fast skip.
-    const first_lower: u8 = if (needle[0] >= 'A' and needle[0] <= 'Z') needle[0] + 32 else needle[0];
-    const first_upper: u8 = if (needle[0] >= 'a' and needle[0] <= 'z') needle[0] - 32 else needle[0];
     const end = haystack.len - needle.len + 1;
 
     if (needle.len == 1) {
-        // Single-char: use std.mem.indexOfAny for speed.
-        const chars = [2]u8{ first_lower, first_upper };
+        const c = needle[0];
+        const lower: u8 = if (c >= 'A' and c <= 'Z') c + 32 else c;
+        const upper: u8 = if (lower >= 'a' and lower <= 'z') lower - 32 else lower;
+        const chars = [2]u8{ lower, upper };
         return std.mem.indexOfAny(u8, haystack, &chars);
     }
 
-    const second_lower: u8 = if (needle[1] >= 'A' and needle[1] <= 'Z') needle[1] + 32 else needle[1];
+    // Jump between candidates of the needle's RAREST byte with the
+    // vectorized indexOfAnyPos instead of walking byte-by-byte — content
+    // scans (searchInContent, Tier 1 candidate verification) spend most of
+    // their time here, and anchoring on a rare letter (a 'k' or 'x') rather
+    // than position 0 keeps the verify rate low for common-first-letter words.
+    var anchor: usize = 0;
+    var anchor_freq: u8 = std.math.maxInt(u8);
+    for (needle, 0..) |c, j| {
+        const cl: u8 = if (c >= 'A' and c <= 'Z') c + 32 else c;
+        if (code_char_freq[cl] < anchor_freq) {
+            anchor_freq = code_char_freq[cl];
+            anchor = j;
+        }
+    }
+    const ac = needle[anchor];
+    const anchor_lower: u8 = if (ac >= 'A' and ac <= 'Z') ac + 32 else ac;
+    const anchor_upper: u8 = if (anchor_lower >= 'a' and anchor_lower <= 'z') anchor_lower - 32 else anchor_lower;
+    const anchor_chars = [2]u8{ anchor_lower, anchor_upper };
 
-    var i: usize = 0;
-    while (i < end) : (i += 1) {
-        // Fast reject: check first byte, then second byte before full compare.
-        const c0 = haystack[i];
-        if (c0 != first_lower and c0 != first_upper) continue;
-        const c1 = haystack[i + 1];
-        const c1_lower = if (c1 >= 'A' and c1 <= 'Z') c1 + 32 else c1;
-        if (c1_lower != second_lower) continue;
-
-        // First two bytes match — verify the rest.
+    // A match starting at s puts the anchor at s + anchor, so anchor
+    // candidates live in [anchor, end + anchor).
+    const scan = haystack[0 .. end - 1 + anchor + 1];
+    var i: usize = anchor;
+    while (std.mem.indexOfAnyPos(u8, scan, i, &anchor_chars)) |pos| {
+        i = pos + 1;
+        const start = pos - anchor;
         var match = true;
-        for (2..needle.len) |j| {
-            const hc = if (haystack[i + j] >= 'A' and haystack[i + j] <= 'Z') haystack[i + j] + 32 else haystack[i + j];
-            const nc = if (needle[j] >= 'A' and needle[j] <= 'Z') needle[j] + 32 else needle[j];
-            if (hc != nc) {
+        for (needle, 0..) |nc0, j| {
+            const hc = haystack[start + j];
+            const hl: u8 = if (hc >= 'A' and hc <= 'Z') hc + 32 else hc;
+            const nl: u8 = if (nc0 >= 'A' and nc0 <= 'Z') nc0 + 32 else nc0;
+            if (hl != nl) {
                 match = false;
                 break;
             }
         }
-        if (match) return i;
+        if (match) return start;
     }
     return null;
 }
@@ -6238,6 +6783,7 @@ fn appendOutlineSymbol(
         .line_end = line_num,
         .detail = detail_copy,
     });
+    outline.name_len_mask |= FileOutline.nameLenBit(name_copy.len);
 }
 
 inline fn resIsIdentStart(c: u8) bool {
