@@ -270,6 +270,11 @@ pub const SearchBreakdown = struct {
     tier_reached: u8 = 0,
     candidate_count: u32 = 0,
     result_count: u32 = 0,
+    /// True when the results were served from the whole-query result cache.
+    /// The tier/candidate/result fields then describe the search that
+    /// PRODUCED the cached entry; the *_ns timings are zeroed because the
+    /// hit did not pay them.
+    cache_hit: bool = false,
 };
 
 pub const DependencyGraph = struct {
@@ -948,6 +953,11 @@ const SearchResultCache = struct {
         gen: u64,
         env_fp: u64,
         results: []CachedResult,
+        /// Breakdown of the search that produced the entry (timings zeroed,
+        /// cache_hit set), restored into last_search_breakdown on a hit so
+        /// telemetry and the MCP provenance meta describe the results
+        /// actually served instead of whatever search ran last.
+        breakdown: SearchBreakdown,
         bytes: usize,
         last_used: u64,
     };
@@ -985,9 +995,10 @@ const SearchResultCache = struct {
     }
 
     /// On hit, returns results duped into `out_allocator` (caller owns each
-    /// path/line_text and the slice, same contract as a fresh search). A
-    /// stale same-key entry is dropped so the slot can refill.
-    fn get(self: *SearchResultCache, query: []const u8, max_results: usize, gen: u64, env_fp: u64, out_allocator: std.mem.Allocator) ?[]const SearchResult {
+    /// path/line_text and the slice, same contract as a fresh search) and
+    /// writes the producing search's breakdown to `out_breakdown`. A stale
+    /// same-key entry is dropped so the slot can refill.
+    fn get(self: *SearchResultCache, query: []const u8, max_results: usize, gen: u64, env_fp: u64, out_allocator: std.mem.Allocator, out_breakdown: *SearchBreakdown) ?[]const SearchResult {
         self.mu.lock();
         defer self.mu.unlock();
         var i: usize = 0;
@@ -1024,6 +1035,7 @@ const SearchResultCache = struct {
             self.tick += 1;
             e.last_used = self.tick;
             self.hits += 1;
+            out_breakdown.* = e.breakdown;
             return out;
         }
         self.misses += 1;
@@ -1031,7 +1043,7 @@ const SearchResultCache = struct {
     }
 
     /// Copies `results` into cache-owned memory. Any OOM just skips caching.
-    fn put(self: *SearchResultCache, query: []const u8, max_results: usize, gen: u64, env_fp: u64, results: []const SearchResult) void {
+    fn put(self: *SearchResultCache, query: []const u8, max_results: usize, gen: u64, env_fp: u64, results: []const SearchResult, breakdown: SearchBreakdown) void {
         var bytes: usize = query.len + @sizeOf(Entry);
         for (results) |r| bytes += r.path.len + r.line_text.len + @sizeOf(CachedResult);
         if (bytes > MAX_ENTRY_BYTES) return;
@@ -1090,6 +1102,7 @@ const SearchResultCache = struct {
             .gen = gen,
             .env_fp = env_fp,
             .results = owned,
+            .breakdown = sanitizeCachedBreakdown(breakdown),
             .bytes = bytes,
             .last_used = self.tick,
         }) catch {
@@ -1105,6 +1118,18 @@ const SearchResultCache = struct {
     }
 };
 
+/// Keep the producing search's provenance (tier/candidate/result counts) but
+/// zero the timings a hit never pays, and mark it as a hit. Stored at put
+/// time so a cache hit can restore an honest last_search_breakdown.
+fn sanitizeCachedBreakdown(bd: SearchBreakdown) SearchBreakdown {
+    return .{
+        .tier_reached = bd.tier_reached,
+        .candidate_count = bd.candidate_count,
+        .result_count = bd.result_count,
+        .cache_hit = true,
+    };
+}
+
 /// Rendered-output sibling of SearchResultCache for renderPlainSearch — the
 /// MCP fast path renders straight to text and never reaches searchContent,
 /// so it gets its own (query, max_results, paths_only) → bytes cache with
@@ -1117,6 +1142,8 @@ const PlainRenderCache = struct {
         gen: u64,
         env_fp: u64,
         bytes: []u8,
+        /// See SearchResultCache.Entry.breakdown.
+        breakdown: SearchBreakdown,
         last_used: u64,
     };
 
@@ -1147,8 +1174,9 @@ const PlainRenderCache = struct {
         self.entries.deinit(self.allocator);
     }
 
-    /// On hit, appends the cached rendering to `out` and returns true.
-    fn render(self: *PlainRenderCache, query: []const u8, max_results: usize, paths_only: bool, gen: u64, env_fp: u64, out_allocator: std.mem.Allocator, out: *std.ArrayList(u8)) bool {
+    /// On hit, appends the cached rendering to `out`, writes the producing
+    /// search's breakdown to `out_breakdown`, and returns true.
+    fn render(self: *PlainRenderCache, query: []const u8, max_results: usize, paths_only: bool, gen: u64, env_fp: u64, out_allocator: std.mem.Allocator, out: *std.ArrayList(u8), out_breakdown: *SearchBreakdown) bool {
         self.mu.lock();
         defer self.mu.unlock();
         var i: usize = 0;
@@ -1166,6 +1194,7 @@ const PlainRenderCache = struct {
             self.tick += 1;
             e.last_used = self.tick;
             self.hits += 1;
+            out_breakdown.* = e.breakdown;
             return true;
         }
         self.misses += 1;
@@ -1173,7 +1202,7 @@ const PlainRenderCache = struct {
     }
 
     /// Copies `bytes` into cache-owned memory. Any OOM just skips caching.
-    fn put(self: *PlainRenderCache, query: []const u8, max_results: usize, paths_only: bool, gen: u64, env_fp: u64, bytes: []const u8) void {
+    fn put(self: *PlainRenderCache, query: []const u8, max_results: usize, paths_only: bool, gen: u64, env_fp: u64, bytes: []const u8, breakdown: SearchBreakdown) void {
         if (bytes.len > MAX_ENTRY_BYTES) return;
         const bytes_copy = self.allocator.dupe(u8, bytes) catch return;
         const query_copy = self.allocator.dupe(u8, query) catch {
@@ -1213,6 +1242,7 @@ const PlainRenderCache = struct {
             .gen = gen,
             .env_fp = env_fp,
             .bytes = bytes_copy,
+            .breakdown = sanitizeCachedBreakdown(breakdown),
             .last_used = self.tick,
         }) catch {
             self.allocator.free(query_copy);
@@ -1451,7 +1481,6 @@ pub const Explorer = struct {
     }
 
     pub fn commitParsedFileOwnedOutline(self: *Explorer, path: []const u8, content: []const u8, outline: FileOutline, full_index: bool, skip_trigram: bool) !void {
-        self.bumpSearchGen();
         var owned_outline = outline;
         // One deinit only: an errdefer here would stack with the defer below
         // and double-free the parsed outline on any post-clone error.
@@ -1468,6 +1497,7 @@ pub const Explorer = struct {
 
         self.mu.lock();
         defer self.mu.unlock();
+        self.bumpSearchGen();
 
         const outline_gop = try self.outlines.getOrPut(path);
         const is_new = !outline_gop.found_existing;
@@ -1964,6 +1994,12 @@ pub const Explorer = struct {
     /// rebuilds, and the one-shot lazy ranking-signal builds (symbol index,
     /// call graph, co-change). Atomic because the lazy builds run under the
     /// SHARED lock.
+    ///
+    /// Ordering invariant: never bump BEFORE a mutation outside the
+    /// exclusive lock — a search could load the new generation, win the
+    /// shared lock, and cache pre-mutation results under the post-mutation
+    /// generation. Bump while holding the exclusive lock, or (for the lazy
+    /// shared-lock builds) only after the mutation is visible.
     fn bumpSearchGen(self: *Explorer) void {
         _ = self.search_gen.fetchAdd(1, .release);
     }
@@ -1989,7 +2025,6 @@ pub const Explorer = struct {
     /// by streaming source files from the project root when the content cache
     /// was capped during fast snapshot restore.
     pub fn rebuildWordIndex(self: *Explorer) !void {
-        self.bumpSearchGen();
         const source_paths = blk: {
             self.mu.lockShared();
             defer self.mu.unlockShared();
@@ -2037,6 +2072,7 @@ pub const Explorer = struct {
 
         self.mu.lock();
         defer self.mu.unlock();
+        self.bumpSearchGen();
         self.word_index.deinit();
         self.word_index = rebuilt;
         self.word_index_generation +%= 1;
@@ -2147,9 +2183,9 @@ pub const Explorer = struct {
     }
 
     pub fn removeFile(self: *Explorer, path: []const u8) void {
-        self.bumpSearchGen();
         self.mu.lock();
         defer self.mu.unlock();
+        self.bumpSearchGen();
         if (!self.word_index_complete) {
             self.word_index_can_load_from_disk = false;
         } else {
@@ -3012,9 +3048,9 @@ pub const Explorer = struct {
         if (!cacheable) return self.searchContentUncached(query, allocator, max_results);
         const gen = self.search_gen.load(.acquire);
         const env_fp = rankingEnvFingerprint();
-        if (self.search_cache.get(query, max_results, gen, env_fp, allocator)) |hit| return hit;
+        if (self.search_cache.get(query, max_results, gen, env_fp, allocator, &self.last_search_breakdown)) |hit| return hit;
         const res = try self.searchContentUncached(query, allocator, max_results);
-        self.search_cache.put(query, max_results, gen, env_fp, res);
+        self.search_cache.put(query, max_results, gen, env_fp, res, self.last_search_breakdown);
         return res;
     }
 
@@ -3446,12 +3482,12 @@ pub const Explorer = struct {
             cio.posixGetenv("CODEDB_NO_SEARCH_CACHE") == null;
         const cache_gen = self.search_gen.load(.acquire);
         const cache_fp = if (cacheable) rankingEnvFingerprint() else 0;
-        if (cacheable and self.plain_render_cache.render(query, max_results, paths_only, cache_gen, cache_fp, allocator, out)) return true;
+        if (cacheable and self.plain_render_cache.render(query, max_results, paths_only, cache_gen, cache_fp, allocator, out, &self.last_search_breakdown)) return true;
         const out_start = out.items.len;
 
         const rendered = try self.renderPlainSearchUncached(query, allocator, out, max_results, paths_only);
         if (rendered and cacheable) {
-            self.plain_render_cache.put(query, max_results, paths_only, cache_gen, cache_fp, out.items[out_start..]);
+            self.plain_render_cache.put(query, max_results, paths_only, cache_gen, cache_fp, out.items[out_start..], self.last_search_breakdown);
         }
         return rendered;
     }

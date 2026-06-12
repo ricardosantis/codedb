@@ -2462,3 +2462,56 @@ test "search-cache: renderPlainSearch cache is invalidated by indexFile" {
     _ = try explorer.renderPlainSearch("lemurtok", testing.allocator, &out2, 1, false);
     try testing.expectEqual(@as(u64, 0), explorer.plain_render_cache.hits);
 }
+
+test "search-cache: hit restores the producing search's breakdown provenance" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/bd.zig", "const a = 1; // pandatok\nconst b = 2; // pandatok\n");
+
+    const r1 = try explorer.searchContent("pandatok", testing.allocator, 10);
+    freeSearchResults(r1);
+    const fresh = explorer.last_search_breakdown;
+    try testing.expect(!fresh.cache_hit);
+
+    // Clobber the breakdown with a different query so the hit must restore
+    // it, not inherit whatever search ran last (mcp.zig's telemetry and the
+    // provenance meta both read last_search_breakdown after the call).
+    const other = try explorer.searchContent("nosuchtok", testing.allocator, 10);
+    freeSearchResults(other);
+
+    const r2 = try explorer.searchContent("pandatok", testing.allocator, 10);
+    defer freeSearchResults(r2);
+    const restored = explorer.last_search_breakdown;
+    try testing.expectEqual(@as(u64, 1), explorer.search_cache.hits);
+    try testing.expect(restored.cache_hit);
+    try testing.expectEqual(fresh.tier_reached, restored.tier_reached);
+    try testing.expectEqual(fresh.candidate_count, restored.candidate_count);
+    try testing.expectEqual(fresh.result_count, restored.result_count);
+    // A hit pays none of the tier timings.
+    try testing.expectEqual(@as(i128, 0), restored.tier0_ns);
+    try testing.expectEqual(@as(i128, 0), restored.rerank_ns);
+}
+
+test "search-cache: renderPlainSearch hit restores the producing search's breakdown" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFile("src/rbd.zig", "const a = 1; // foxtok\nconst b = 2; // foxtok\n");
+
+    var out1: std.ArrayList(u8) = .empty;
+    defer out1.deinit(testing.allocator);
+    try testing.expect(try explorer.renderPlainSearch("foxtok", testing.allocator, &out1, 2, false));
+    const fresh = explorer.last_search_breakdown;
+    try testing.expect(!fresh.cache_hit);
+
+    explorer.last_search_breakdown = .{ .tier_reached = 7 };
+
+    var out2: std.ArrayList(u8) = .empty;
+    defer out2.deinit(testing.allocator);
+    try testing.expect(try explorer.renderPlainSearch("foxtok", testing.allocator, &out2, 2, false));
+    const restored = explorer.last_search_breakdown;
+    try testing.expectEqual(@as(u64, 1), explorer.plain_render_cache.hits);
+    try testing.expect(restored.cache_hit);
+    try testing.expectEqual(fresh.tier_reached, restored.tier_reached);
+    try testing.expectEqual(fresh.result_count, restored.result_count);
+    try testing.expectEqual(@as(i128, 0), restored.tier0_ns);
+}
