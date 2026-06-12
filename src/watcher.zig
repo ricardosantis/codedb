@@ -408,6 +408,17 @@ const FilteredWalker = struct {
     }
 };
 
+/// Files beyond this count are indexed without trigrams and land in
+/// skip_trigram_files, which tier 3 of searchContent linearly content-scans
+/// on every query that falls through the earlier tiers — on a corpus well
+/// past the cap that scan dominates zero-hit query latency. The cap bounds
+/// trigram-index RSS; CODEDB_TRIGRAM_CAP overrides it for corpora where the
+/// memory trade is worth it.
+pub fn trigramFileCap() usize {
+    const raw = cio.posixGetenv("CODEDB_TRIGRAM_CAP") orelse return 15_000;
+    return std.fmt.parseInt(usize, raw, 10) catch 15_000;
+}
+
 fn collectInitialScanEntries(io: std.Io, store: *Store, dir: std.Io.Dir, allocator: std.mem.Allocator, skip_trigram: bool) !std.ArrayList(InitialScanEntry) {
     var walker = try FilteredWalker.init(io, dir, allocator);
     defer walker.deinit();
@@ -418,7 +429,7 @@ fn collectInitialScanEntries(io: std.Io, store: *Store, dir: std.Io.Dir, allocat
         entries.deinit(allocator);
     }
 
-    const max_trigram_files: usize = 15_000;
+    const max_trigram_files = trigramFileCap();
     var file_count: usize = 0;
     while (try walker.next()) |entry| {
         const stat = dir.statFile(io, entry.path, .{}) catch continue;
@@ -1022,7 +1033,7 @@ pub fn incrementalLoop(io: std.Io, store: *Store, explorer: *Explorer, queue: *E
             defer dir.close(io);
             var walker = FilteredWalker.init(io, dir, tmp) catch continue;
             defer walker.deinit();
-            const max_trigram_files: usize = 15_000;
+            const max_trigram_files = trigramFileCap();
             var file_count: usize = 0;
             while (walker.next() catch null) |entry| {
                 const stat = dir.statFile(io, entry.path, .{}) catch continue;

@@ -2443,7 +2443,7 @@ pub const AnyTrigramIndex = union(enum) {
         masked: std.StringHashMap(void),
         masked_in_base: u32 = 0,
 
-        fn mask(self: *MmapOverlay, path: []const u8) void {
+        pub fn mask(self: *MmapOverlay, path: []const u8) void {
             if (self.masked.contains(path)) return;
             const key = self.overlay.allocator.dupe(u8, path) catch return;
             self.masked.put(key, {}) catch {

@@ -7,6 +7,7 @@ const Explorer = @import("explore.zig").Explorer;
 const SearchResult = @import("explore.zig").SearchResult;
 const WordIndex = @import("index.zig").WordIndex;
 const TrigramIndex = @import("index.zig").TrigramIndex;
+const MmapTrigramIndex = @import("index.zig").MmapTrigramIndex;
 const SparseNgramIndex = @import("index.zig").SparseNgramIndex;
 const explore = @import("explore.zig");
 const Language = explore.Language;
@@ -2550,6 +2551,93 @@ test "search-cache: ranked cache is invalidated by indexFile" {
         if (std.mem.eql(u8, res.path, "src/rb.zig")) saw_new = true;
     }
     try testing.expect(saw_new);
+}
+
+test "skip-trigram: adoptTrigramIndex prunes covered files from the tier-3 scan set" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    // Outline-only indexing mirrors snapshot restore: files land in
+    // skip_trigram_files with no trigram coverage.
+    try explorer.indexFileSkipTrigram("src/cov.zig", "const a = 1; // ocelottok\n");
+    try explorer.indexFileSkipTrigram("src/uncov.zig", "const b = 2; // ocelottok\n");
+    try testing.expectEqual(@as(usize, 2), explorer.skipTrigramFileCount());
+
+    // Build a trigram index covering only ONE of the two files and adopt it
+    // (stands in for the mmap disk load all server modes perform).
+    var tri = TrigramIndex.init(testing.allocator);
+    try tri.indexFile("src/cov.zig", "const a = 1; // ocelottok\n");
+    explorer.adoptTrigramIndex(.{ .heap = tri });
+
+    // The covered file must leave the scan set; the uncovered one must stay.
+    try testing.expectEqual(@as(usize, 1), explorer.skipTrigramFileCount());
+    try testing.expect(explorer.skip_trigram_files.contains("src/uncov.zig"));
+    try testing.expect(!explorer.skip_trigram_files.contains("src/cov.zig"));
+
+    // Recall must be intact: tier 1 serves the covered file, tier 3 the rest.
+    const r = try explorer.searchContent("ocelottok", testing.allocator, 10);
+    defer freeSearchResults(r);
+    try testing.expectEqual(@as(usize, 2), r.len);
+}
+
+test "skip-trigram: adoptTrigramBase keeps freshness-reindexed files as a masking overlay" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp_dir.dir.realPathFile(io, ".", &path_buf);
+    const tmp_path = path_buf[0..tmp_path_len];
+
+    // On-disk index: stale content for changed.zig, current for stable.zig.
+    {
+        var seed = TrigramIndex.init(testing.allocator);
+        defer seed.deinit();
+        try seed.indexFile("src/changed.zig", "const old = 1; // staletok\n");
+        try seed.indexFile("src/stable.zig", "const s = 2; // stabletok\n");
+        try seed.writeToDisk(io, tmp_path, null);
+    }
+
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    // Mirror snapshot load: the unchanged file restores outline-only (skip
+    // set), the changed file gets a full freshness reindex into the heap
+    // trigram BEFORE the disk index is adopted.
+    try explorer.indexFileSkipTrigram("src/stable.zig", "const s = 2; // stabletok\n");
+    try explorer.indexFile("src/changed.zig", "const new = 1; // freshtok\n");
+
+    const base = MmapTrigramIndex.initFromDisk(io, tmp_path, testing.allocator) orelse
+        return error.MmapInitFailed;
+    explorer.adoptTrigramBase(base);
+
+    // Both files are now trigram-covered: the scan set must be empty.
+    try testing.expectEqual(@as(usize, 0), explorer.skipTrigramFileCount());
+
+    // The overlay's NEW content wins for the reindexed file...
+    const fresh = try explorer.searchContent("freshtok", testing.allocator, 10);
+    defer freeSearchResults(fresh);
+    try testing.expectEqual(@as(usize, 1), fresh.len);
+    try testing.expectEqualStrings("src/changed.zig", fresh[0].path);
+    // ...its stale base entry is masked...
+    const stale = try explorer.searchContent("staletok", testing.allocator, 10);
+    defer freeSearchResults(stale);
+    try testing.expectEqual(@as(usize, 0), stale.len);
+    // ...and base-only files still resolve through the adopted mmap.
+    const stable = try explorer.searchContent("stabletok", testing.allocator, 10);
+    defer freeSearchResults(stable);
+    try testing.expectEqual(@as(usize, 1), stable.len);
+    try testing.expectEqualStrings("src/stable.zig", stable[0].path);
+}
+
+test "skip-trigram: rebuildTrigrams prunes the files it just covered" {
+    var explorer = Explorer.init(testing.allocator, Explorer.DEFAULT_CONTENT_CACHE_CAPACITY);
+    defer explorer.deinit();
+    try explorer.indexFileSkipTrigram("src/rt.zig", "const a = 1; // marmottok\n");
+    try testing.expectEqual(@as(usize, 1), explorer.skipTrigramFileCount());
+
+    try explorer.rebuildTrigrams();
+    try testing.expectEqual(@as(usize, 0), explorer.skipTrigramFileCount());
+
+    const r = try explorer.searchContent("marmottok", testing.allocator, 10);
+    defer freeSearchResults(r);
+    try testing.expectEqual(@as(usize, 1), r.len);
 }
 
 // ── warmup: queries.log replay ───────────────────────────────────────────────
